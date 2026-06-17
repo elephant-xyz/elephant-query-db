@@ -1,0 +1,70 @@
+{
+  "name": "@elephant-xyz/query-db",
+  "version": "0.1.0",
+  "description": "Type-safe Drizzle schema package for the Elephant query database.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "migrations",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema/index.d.ts",
+      "default": "./dist/schema/index.js"
+    },
+    "./lexicon": {
+      "types": "./dist/lexicon/index.d.ts",
+      "default": "./dist/lexicon/index.js"
+    },
+    "./loader": {
+      "types": "./dist/loader/index.d.ts",
+      "default": "./dist/loader/index.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    }
+  },
+  "scripts": {
+    "generate:lexicon": "tsx scripts/generate-lexicon-metadata.ts",
+    "generate:migrations": "drizzle-kit generate",
+    "appraisal:alternate-search-seeds": "tsx scripts/build-curated-appraisal-alternate-search-seeds.ts",
+    "appraisal:detail-seeds": "tsx scripts/build-curated-appraisal-detail-seeds.ts",
+    "appraisal:media": "tsx scripts/enrich-appraisal-media-files.ts",
+    "appraisal:prepare": "tsx scripts/run-curated-appraisal-prepare.ts",
+    "appraisal:transform-data": "tsx scripts/run-lee-appraisal-transform-data-only.ts",
+    "load:bulk": "tsx scripts/run-bulk-data-load.ts",
+    "load:data": "tsx scripts/run-data-load.ts",
+    "load:link-scoped-permits": "tsx scripts/link-scoped-permits-to-appraisals.ts",
+    "load:select-appraisal-first-industrial-scope": "tsx scripts/select-appraisal-first-industrial-scope.ts",
+    "load:select-industrial-scope": "tsx scripts/select-incremental-industrial-scope.ts",
+    "permits:documents": "tsx scripts/upload-permit-link-documents.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1054.0",
+    "@vercel/blob": "^2.4.0",
+    "adm-zip": "^0.5.17",
+    "drizzle-orm": "^0.45.2",
+    "pg": "^8.21.0",
+    "pg-copy-streams": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/node": "^24.10.1",
+    "@types/pg": "^8.20.0",
+    "drizzle-kit": "^0.31.7",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.14"
+  }
+}
