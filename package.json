@@ -45,6 +45,7 @@
     "load:select-appraisal-first-industrial-scope": "tsx scripts/select-appraisal-first-industrial-scope.ts",
     "load:select-industrial-scope": "tsx scripts/select-incremental-industrial-scope.ts",
     "permits:documents": "tsx scripts/upload-permit-link-documents.ts",
+    "export:property-consolidation": "tsx scripts/run-property-consolidation-export.ts",
     "snapshot:export": "tsx scripts/run-snapshot-export.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
@@ -64,6 +65,7 @@
     "@types/node": "^24.10.1",
     "@types/pg": "^8.20.0",
     "drizzle-kit": "^0.31.7",
+    "ipfs-only-hash": "^4.0.0",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vitest": "^4.0.14"
