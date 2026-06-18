@@ -46,7 +46,6 @@
     "load:select-industrial-scope": "tsx scripts/select-incremental-industrial-scope.ts",
     "permits:documents": "tsx scripts/upload-permit-link-documents.ts",
     "export:property-consolidation": "tsx scripts/run-property-consolidation-export.ts",
-    "snapshot:export": "tsx scripts/run-snapshot-export.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
