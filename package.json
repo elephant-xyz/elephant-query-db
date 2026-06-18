@@ -45,6 +45,7 @@
     "load:select-appraisal-first-industrial-scope": "tsx scripts/select-appraisal-first-industrial-scope.ts",
     "load:select-industrial-scope": "tsx scripts/select-incremental-industrial-scope.ts",
     "permits:documents": "tsx scripts/upload-permit-link-documents.ts",
+    "snapshot:export": "tsx scripts/run-snapshot-export.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
