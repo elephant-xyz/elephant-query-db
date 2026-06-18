@@ -12,10 +12,13 @@ import { Pool } from "pg";
 
 export type PropertyConsolidationOptions = {
   readonly limit: number | null;
+  readonly batchSize: number;
   readonly outDir: string;
   readonly county: string;
   readonly envFile: string;
 };
+
+export const DEFAULT_BATCH_SIZE = 250;
 
 type AddressShape = {
   readonly street: string | null;
@@ -624,8 +627,16 @@ export function parseOptions(argv: readonly string[]): PropertyConsolidationOpti
   const limitRaw = values.get("limit");
   const limit = limitRaw !== undefined ? Number.parseInt(limitRaw, 10) : null;
 
+  const batchSizeRaw = values.get("batch-size");
+  const parsedBatchSize = batchSizeRaw !== undefined ? Number.parseInt(batchSizeRaw, 10) : null;
+  const batchSize =
+    parsedBatchSize !== null && Number.isFinite(parsedBatchSize) && parsedBatchSize > 0
+      ? parsedBatchSize
+      : DEFAULT_BATCH_SIZE;
+
   return {
     limit: limit !== null && !Number.isNaN(limit) ? limit : null,
+    batchSize,
     outDir: values.get("out-dir") ?? ".property-consolidation-export",
     county: values.get("county") ?? "lee",
     envFile: values.get("env-file") ?? ".env.local",
@@ -1056,7 +1067,38 @@ export function buildManifestEntry(params: {
 }
 
 /**
+ * Running stats accumulator for incremental min/max/total tracking.
+ * Safe at any entry count — no spread-based Math.min/max.
+ */
+export type ManifestStats = {
+  readonly count: number;
+  readonly totalBytes: number;
+  readonly minBytes: number;
+  readonly maxBytes: number;
+};
+
+export const EMPTY_MANIFEST_STATS: ManifestStats = {
+  count: 0,
+  totalBytes: 0,
+  minBytes: Number.MAX_SAFE_INTEGER,
+  maxBytes: 0,
+};
+
+/**
+ * Fold one file size into a running ManifestStats accumulator.
+ */
+export function accumulateManifestStats(stats: ManifestStats, fileSizeBytes: number): ManifestStats {
+  return {
+    count: stats.count + 1,
+    totalBytes: stats.totalBytes + fileSizeBytes,
+    minBytes: fileSizeBytes < stats.minBytes ? fileSizeBytes : stats.minBytes,
+    maxBytes: fileSizeBytes > stats.maxBytes ? fileSizeBytes : stats.maxBytes,
+  };
+}
+
+/**
  * Build the manifest summary from all entries and timing info.
+ * Stats are computed with a running fold — safe at 300k+ entries.
  */
 export function buildManifestSummary(
   entries: readonly ManifestEntry[],
@@ -1064,10 +1106,14 @@ export function buildManifestSummary(
   completedAt: string,
   county: string,
 ): ManifestSummary {
-  const count = entries.length;
-  const totalBytes = entries.reduce((sum, e) => sum + e.fileSizeBytes, 0);
-  const minBytes = count > 0 ? Math.min(...entries.map((e) => e.fileSizeBytes)) : 0;
-  const maxBytes = count > 0 ? Math.max(...entries.map((e) => e.fileSizeBytes)) : 0;
+  const stats = entries.reduce(
+    (acc, e) => accumulateManifestStats(acc, e.fileSizeBytes),
+    EMPTY_MANIFEST_STATS,
+  );
+  const count = stats.count;
+  const totalBytes = stats.totalBytes;
+  const minBytes = count > 0 ? stats.minBytes : 0;
+  const maxBytes = count > 0 ? stats.maxBytes : 0;
   const avgBytes = count > 0 ? Math.round(totalBytes / count) : 0;
   const projectedBytes300k = count > 0 ? Math.round((totalBytes / count) * 300_000) : 0;
 
@@ -1422,6 +1468,7 @@ async function main(): Promise<void> {
     event: "property_consolidation_export_started",
     county: options.county,
     limit: options.limit,
+    batchSize: options.batchSize,
     outDir: options.outDir,
     startedAt,
   }));
@@ -1443,11 +1490,15 @@ async function main(): Promise<void> {
     const propertiesDir = join(options.outDir, "properties");
     await mkdir(propertiesDir, { recursive: true });
 
-    // 1. Fetch all properties
-    const properties = await fetchProperties(pg, options.limit);
-    const propertyCount = properties.length;
+    // 1. Fetch all property rows (lightweight — only scalar columns, no related data)
+    const allProperties = await fetchProperties(pg, options.limit);
+    const propertyCount = allProperties.length;
 
-    console.log(JSON.stringify({ event: "properties_fetched", count: propertyCount }));
+    console.log(JSON.stringify({
+      event: "properties_fetched",
+      count: propertyCount,
+      batchSize: options.batchSize,
+    }));
 
     if (propertyCount === 0) {
       const completedAt = new Date().toISOString();
@@ -1457,237 +1508,249 @@ async function main(): Promise<void> {
       return;
     }
 
-    const propertyIds = properties.map((p) => p.property_id);
-    const parcelIdSet = new Set(properties.map((p) => p.parcel_id).filter((id): id is string => id !== null));
-    const addressIdSet = new Set(properties.map((p) => p.address_id).filter((id): id is string => id !== null));
-    const rawParcelIdentifiers = [...new Set(properties.map((p) => p.parcel_identifier))];
-    const normalizedParcelIdentifiers = [...new Set(rawParcelIdentifiers.map(normalizeParcelIdentifier))];
-
-    // 2. Bulk fetch all related data in parallel where possible
-    const [
-      parcels,
-      addresses,
-      taxes,
-      salesHistories,
-      structures,
-      layouts,
-      lots,
-      floodStorm,
-      utilities,
-      ownerships,
-      deeds,
-      files,
-      geometries,
-      valuations,
-      permits,
-    ] = await Promise.all([
-      fetchParcels(pg, [...parcelIdSet]),
-      fetchAddresses(pg, [...addressIdSet]),
-      fetchTaxes(pg, propertyIds),
-      fetchSalesHistories(pg, propertyIds),
-      fetchStructures(pg, propertyIds),
-      fetchLayouts(pg, propertyIds),
-      fetchLots(pg, propertyIds),
-      fetchFloodStorm(pg, propertyIds),
-      fetchUtilities(pg, propertyIds),
-      fetchOwnerships(pg, propertyIds),
-      fetchDeeds(pg, propertyIds),
-      fetchFiles(pg, propertyIds),
-      fetchGeometries(pg, propertyIds),
-      fetchValuations(pg, propertyIds),
-      fetchPermits(pg, normalizedParcelIdentifiers),
-    ]);
-
-    // 3. Fetch permit children and Sunbiz/BBB data
-    const permitIds = permits.map((p) => p.property_improvement_id);
-    const companyIds = [
-      ...new Set(permits.map((p) => p.contractor_company_id).filter((id): id is string => id !== null)),
-    ];
-
-    const addressMap = new Map(addresses.map((a) => [a.address_id, a]));
-    const normalizedAddressKeys = [
-      ...new Set(
-        properties
-          .map((p) => (p.address_id !== null ? addressMap.get(p.address_id)?.normalized_address_key : null))
-          .filter((key): key is string => key !== null && key !== undefined && key.length > 0),
-      ),
-    ];
-
-    const [
-      permitContacts,
-      permitCustomFields,
-      permitEvents,
-      permitFees,
-      permitLinks,
-      inspections,
-      sunbizRegistrations,
-      bbbProfiles,
-    ] = await Promise.all([
-      fetchPermitContacts(pg, permitIds),
-      fetchPermitCustomFields(pg, permitIds),
-      fetchPermitEvents(pg, permitIds),
-      fetchPermitFees(pg, permitIds),
-      fetchPermitLinks(pg, permitIds),
-      fetchInspections(pg, permitIds),
-      fetchSunbizRegistrations(pg, normalizedAddressKeys),
-      fetchBbbProfiles(pg, companyIds),
-    ]);
-
-    const sunbizRegistrationIds = sunbizRegistrations.map((r) => r.business_registration_id);
-    const bbbProfileIds = bbbProfiles.map((p) => p.business_reputation_profile_id);
-
-    const [
-      sunbizAddresses,
-      sunbizParties,
-      sunbizAnnualReports,
-      bbbQualityScores,
-      bbbReviews,
-      bbbComplaints,
-    ] = await Promise.all([
-      fetchSunbizAddresses(pg, sunbizRegistrationIds),
-      fetchSunbizParties(pg, sunbizRegistrationIds),
-      fetchSunbizAnnualReports(pg, sunbizRegistrationIds),
-      fetchBbbQualityScores(pg, bbbProfileIds),
-      fetchBbbReviews(pg, bbbProfileIds),
-      fetchBbbComplaints(pg, bbbProfileIds),
-    ]);
-
-    // 4. Build in-memory lookup maps
-    const parcelMap = new Map(parcels.map((p) => [p.parcel_id, p]));
-    const taxMap = groupBy(taxes, (r) => r.property_id);
-    const salesMap = groupBy(salesHistories, (r) => r.property_id);
-    const structureMap = groupBy(structures, (r) => r.property_id);
-    const layoutMap = groupBy(layouts, (r) => r.property_id);
-    const lotMap = groupBy(lots, (r) => r.property_id);
-    const floodMap = groupBy(floodStorm, (r) => r.property_id);
-    const utilityMap = groupBy(utilities, (r) => r.property_id);
-    const ownershipMap = groupBy(ownerships, (r) => r.property_id);
-    const deedMap = groupBy(deeds, (r) => r.property_id);
-    const fileMap = groupBy(files, (r) => r.property_id);
-    const geometryMap = groupBy(geometries, (r) => r.property_id);
-    const valuationMap = groupBy(valuations, (r) => r.property_id);
-
-    // Permit maps: keyed by normalized parcel_identifier
-    const permitsByNormalizedParcel = groupBy(permits, (r) =>
-      r.parcel_identifier !== null ? r.parcel_identifier : "",
-    );
-    const permitContactMap = groupBy(permitContacts, (r) => r.property_improvement_id);
-    const permitCustomFieldMap = groupBy(permitCustomFields, (r) => r.property_improvement_id);
-    const permitEventMap = groupBy(permitEvents, (r) => r.property_improvement_id);
-    const permitFeeMap = groupBy(permitFees, (r) => r.property_improvement_id);
-    const permitLinkMap = groupBy(permitLinks, (r) => r.property_improvement_id);
-    const inspectionMap = groupBy(inspections, (r) => r.property_improvement_id);
-
-    // Sunbiz maps: keyed by normalized_address_key
-    const sunbizByAddressKey = groupBy(sunbizRegistrations, (r) => r.normalized_address_key ?? "");
-    const sunbizAddressMap = groupBy(sunbizAddresses, (r) => r.business_registration_id);
-    const sunbizPartyMap = groupBy(sunbizParties, (r) => r.business_registration_id);
-    const sunbizAnnualReportMap = groupBy(sunbizAnnualReports, (r) => r.business_registration_id);
-
-    // BBB maps: keyed by company_id and profile_id
-    const bbbProfilesByCompany = groupBy(bbbProfiles, (r) => r.company_id ?? "");
-    const bbbQualityScoreMap = new Map(bbbQualityScores.map((s) => [s.business_reputation_profile_id, s]));
-    const bbbReviewMap = groupBy(bbbReviews, (r) => r.business_reputation_profile_id);
-    const bbbComplaintMap = groupBy(bbbComplaints, (r) => r.business_reputation_profile_id);
-
-    // 5. Assemble and write each property file
+    // 2. Process properties in batches. Related rows are fetched and discarded
+    //    per batch so peak memory = one batch's data, not the full dataset.
     const collectedAt = new Date().toISOString();
     const manifestEntries: ManifestEntry[] = [];
-    let processedCount = 0;
+    let runningStats = EMPTY_MANIFEST_STATS;
+    let totalWritten = 0;
 
-    for (const property of properties) {
-      const parcel = property.parcel_id !== null ? (parcelMap.get(property.parcel_id) ?? null) : null;
-      const address = property.address_id !== null ? (addressMap.get(property.address_id) ?? null) : null;
-      const propertyNormalizedParcel = normalizeParcelIdentifier(property.parcel_identifier);
-      const propertyPermits = permitsByNormalizedParcel.get(propertyNormalizedParcel) ?? [];
+    for (let batchStart = 0; batchStart < propertyCount; batchStart += options.batchSize) {
+      const batchIndex = Math.floor(batchStart / options.batchSize);
+      const batchProperties = allProperties.slice(batchStart, batchStart + options.batchSize);
 
-      const permitsWithChildren: PermitWithChildren[] = propertyPermits.map((permit) => ({
-        permit,
-        contacts: permitContactMap.get(permit.property_improvement_id) ?? [],
-        customFields: permitCustomFieldMap.get(permit.property_improvement_id) ?? [],
-        events: permitEventMap.get(permit.property_improvement_id) ?? [],
-        fees: permitFeeMap.get(permit.property_improvement_id) ?? [],
-        links: permitLinkMap.get(permit.property_improvement_id) ?? [],
-        inspections: inspectionMap.get(permit.property_improvement_id) ?? [],
-      }));
+      const propertyIds = batchProperties.map((p) => p.property_id);
+      const parcelIdSet = new Set(batchProperties.map((p) => p.parcel_id).filter((id): id is string => id !== null));
+      const addressIdSet = new Set(batchProperties.map((p) => p.address_id).filter((id): id is string => id !== null));
+      const rawParcelIdentifiers = [...new Set(batchProperties.map((p) => p.parcel_identifier))];
+      const normalizedParcelIdentifiers = [...new Set(rawParcelIdentifiers.map(normalizeParcelIdentifier))];
 
-      const addressKey = address?.normalized_address_key ?? null;
-      const sunbizRegs = addressKey !== null ? (sunbizByAddressKey.get(addressKey) ?? []) : [];
-      const sunbizTenantsWithChildren: SunbizTenantWithChildren[] = sunbizRegs.map((reg) => ({
-        registration: reg,
-        addresses: sunbizAddressMap.get(reg.business_registration_id) ?? [],
-        parties: sunbizPartyMap.get(reg.business_registration_id) ?? [],
-        annualReports: sunbizAnnualReportMap.get(reg.business_registration_id) ?? [],
-      }));
+      // Round 1: fetch all appraisal-track data for this batch in parallel
+      const [
+        parcels,
+        addresses,
+        taxes,
+        salesHistories,
+        structures,
+        layouts,
+        lots,
+        floodStorm,
+        utilities,
+        ownerships,
+        deeds,
+        files,
+        geometries,
+        valuations,
+        permits,
+      ] = await Promise.all([
+        fetchParcels(pg, [...parcelIdSet]),
+        fetchAddresses(pg, [...addressIdSet]),
+        fetchTaxes(pg, propertyIds),
+        fetchSalesHistories(pg, propertyIds),
+        fetchStructures(pg, propertyIds),
+        fetchLayouts(pg, propertyIds),
+        fetchLots(pg, propertyIds),
+        fetchFloodStorm(pg, propertyIds),
+        fetchUtilities(pg, propertyIds),
+        fetchOwnerships(pg, propertyIds),
+        fetchDeeds(pg, propertyIds),
+        fetchFiles(pg, propertyIds),
+        fetchGeometries(pg, propertyIds),
+        fetchValuations(pg, propertyIds),
+        fetchPermits(pg, normalizedParcelIdentifiers),
+      ]);
 
-      const propertyCompanyIds = [...new Set(propertyPermits.map((p) => p.contractor_company_id).filter((id): id is string => id !== null))];
-      const bbbProfilesForProperty = propertyCompanyIds.flatMap((cid) => bbbProfilesByCompany.get(cid) ?? []);
-      const bbbProfilesWithChildren: BbbProfileWithChildren[] = bbbProfilesForProperty.map((profile) => ({
-        profile,
-        qualityScore: bbbQualityScoreMap.get(profile.business_reputation_profile_id) ?? null,
-        reviews: bbbReviewMap.get(profile.business_reputation_profile_id) ?? [],
-        complaints: bbbComplaintMap.get(profile.business_reputation_profile_id) ?? [],
-      }));
+      // Round 2: fetch permit children + Sunbiz/BBB data for this batch
+      const permitIds = permits.map((p) => p.property_improvement_id);
+      const companyIds = [
+        ...new Set(permits.map((p) => p.contractor_company_id).filter((id): id is string => id !== null)),
+      ];
 
-      const consolidated = assemblePropertyRecord({
-        property,
-        parcel,
-        address,
-        taxes: taxMap.get(property.property_id) ?? [],
-        salesHistories: salesMap.get(property.property_id) ?? [],
-        structures: structureMap.get(property.property_id) ?? [],
-        layouts: layoutMap.get(property.property_id) ?? [],
-        lots: lotMap.get(property.property_id) ?? [],
-        floodStorm: floodMap.get(property.property_id) ?? [],
-        utilities: utilityMap.get(property.property_id) ?? [],
-        ownerships: ownershipMap.get(property.property_id) ?? [],
-        deeds: deedMap.get(property.property_id) ?? [],
-        files: fileMap.get(property.property_id) ?? [],
-        geometries: geometryMap.get(property.property_id) ?? [],
-        valuations: valuationMap.get(property.property_id) ?? [],
-        permits: permitsWithChildren,
-        sunbizTenants: sunbizTenantsWithChildren,
-        bbbProfiles: bbbProfilesWithChildren,
-        county: options.county,
-        collectedAt,
-      });
+      const addressMap = new Map(addresses.map((a) => [a.address_id, a]));
+      const normalizedAddressKeys = [
+        ...new Set(
+          batchProperties
+            .map((p) => (p.address_id !== null ? addressMap.get(p.address_id)?.normalized_address_key : null))
+            .filter((key): key is string => key !== null && key !== undefined && key.length > 0),
+        ),
+      ];
 
-      const json = `${JSON.stringify(consolidated, null, 2)}\n`;
-      const buffer = Buffer.from(json, "utf8");
-      const safeParcelIdentifier = property.parcel_identifier.replace(/[^a-zA-Z0-9_-]/g, "_");
-      const filePath = join(propertiesDir, `${safeParcelIdentifier}.json`);
+      const [
+        permitContacts,
+        permitCustomFields,
+        permitEvents,
+        permitFees,
+        permitLinks,
+        inspections,
+        sunbizRegistrations,
+        bbbProfiles,
+      ] = await Promise.all([
+        fetchPermitContacts(pg, permitIds),
+        fetchPermitCustomFields(pg, permitIds),
+        fetchPermitEvents(pg, permitIds),
+        fetchPermitFees(pg, permitIds),
+        fetchPermitLinks(pg, permitIds),
+        fetchInspections(pg, permitIds),
+        fetchSunbizRegistrations(pg, normalizedAddressKeys),
+        fetchBbbProfiles(pg, companyIds),
+      ]);
 
-      await writeFile(filePath, buffer);
+      const sunbizRegistrationIds = sunbizRegistrations.map((r) => r.business_registration_id);
+      const bbbProfileIds = bbbProfiles.map((p) => p.business_reputation_profile_id);
 
-      const sha256 = createHash("sha256").update(buffer).digest("hex");
-      const cid = await computeIpfsCid(buffer);
+      const [
+        sunbizAddresses,
+        sunbizParties,
+        sunbizAnnualReports,
+        bbbQualityScores,
+        bbbReviews,
+        bbbComplaints,
+      ] = await Promise.all([
+        fetchSunbizAddresses(pg, sunbizRegistrationIds),
+        fetchSunbizParties(pg, sunbizRegistrationIds),
+        fetchSunbizAnnualReports(pg, sunbizRegistrationIds),
+        fetchBbbQualityScores(pg, bbbProfileIds),
+        fetchBbbReviews(pg, bbbProfileIds),
+        fetchBbbComplaints(pg, bbbProfileIds),
+      ]);
 
-      manifestEntries.push(buildManifestEntry({
-        parcelIdentifier: property.parcel_identifier,
-        filePath,
-        fileSizeBytes: buffer.length,
-        sha256,
-        cid,
-      }));
+      // Build in-memory lookup maps scoped to this batch
+      const parcelMap = new Map(parcels.map((p) => [p.parcel_id, p]));
+      const taxMap = groupBy(taxes, (r) => r.property_id);
+      const salesMap = groupBy(salesHistories, (r) => r.property_id);
+      const structureMap = groupBy(structures, (r) => r.property_id);
+      const layoutMap = groupBy(layouts, (r) => r.property_id);
+      const lotMap = groupBy(lots, (r) => r.property_id);
+      const floodMap = groupBy(floodStorm, (r) => r.property_id);
+      const utilityMap = groupBy(utilities, (r) => r.property_id);
+      const ownershipMap = groupBy(ownerships, (r) => r.property_id);
+      const deedMap = groupBy(deeds, (r) => r.property_id);
+      const fileMap = groupBy(files, (r) => r.property_id);
+      const geometryMap = groupBy(geometries, (r) => r.property_id);
+      const valuationMap = groupBy(valuations, (r) => r.property_id);
 
-      processedCount += 1;
-      if (processedCount % 100 === 0) {
-        console.log(JSON.stringify({
-          event: "property_consolidation_progress",
-          processed: processedCount,
-          total: propertyCount,
+      const permitsByNormalizedParcel = groupBy(permits, (r) =>
+        r.parcel_identifier !== null ? r.parcel_identifier : "",
+      );
+      const permitContactMap = groupBy(permitContacts, (r) => r.property_improvement_id);
+      const permitCustomFieldMap = groupBy(permitCustomFields, (r) => r.property_improvement_id);
+      const permitEventMap = groupBy(permitEvents, (r) => r.property_improvement_id);
+      const permitFeeMap = groupBy(permitFees, (r) => r.property_improvement_id);
+      const permitLinkMap = groupBy(permitLinks, (r) => r.property_improvement_id);
+      const inspectionMap = groupBy(inspections, (r) => r.property_improvement_id);
+
+      const sunbizByAddressKey = groupBy(sunbizRegistrations, (r) => r.normalized_address_key ?? "");
+      const sunbizAddressMap = groupBy(sunbizAddresses, (r) => r.business_registration_id);
+      const sunbizPartyMap = groupBy(sunbizParties, (r) => r.business_registration_id);
+      const sunbizAnnualReportMap = groupBy(sunbizAnnualReports, (r) => r.business_registration_id);
+
+      const bbbProfilesByCompany = groupBy(bbbProfiles, (r) => r.company_id ?? "");
+      const bbbQualityScoreMap = new Map(bbbQualityScores.map((s) => [s.business_reputation_profile_id, s]));
+      const bbbReviewMap = groupBy(bbbReviews, (r) => r.business_reputation_profile_id);
+      const bbbComplaintMap = groupBy(bbbComplaints, (r) => r.business_reputation_profile_id);
+
+      // Assemble and write each property in this batch
+      let batchWritten = 0;
+
+      for (const property of batchProperties) {
+        const parcel = property.parcel_id !== null ? (parcelMap.get(property.parcel_id) ?? null) : null;
+        const address = property.address_id !== null ? (addressMap.get(property.address_id) ?? null) : null;
+        const propertyNormalizedParcel = normalizeParcelIdentifier(property.parcel_identifier);
+        const propertyPermits = permitsByNormalizedParcel.get(propertyNormalizedParcel) ?? [];
+
+        const permitsWithChildren: PermitWithChildren[] = propertyPermits.map((permit) => ({
+          permit,
+          contacts: permitContactMap.get(permit.property_improvement_id) ?? [],
+          customFields: permitCustomFieldMap.get(permit.property_improvement_id) ?? [],
+          events: permitEventMap.get(permit.property_improvement_id) ?? [],
+          fees: permitFeeMap.get(permit.property_improvement_id) ?? [],
+          links: permitLinkMap.get(permit.property_improvement_id) ?? [],
+          inspections: inspectionMap.get(permit.property_improvement_id) ?? [],
         }));
+
+        const addressKey = address?.normalized_address_key ?? null;
+        const sunbizRegs = addressKey !== null ? (sunbizByAddressKey.get(addressKey) ?? []) : [];
+        const sunbizTenantsWithChildren: SunbizTenantWithChildren[] = sunbizRegs.map((reg) => ({
+          registration: reg,
+          addresses: sunbizAddressMap.get(reg.business_registration_id) ?? [],
+          parties: sunbizPartyMap.get(reg.business_registration_id) ?? [],
+          annualReports: sunbizAnnualReportMap.get(reg.business_registration_id) ?? [],
+        }));
+
+        const propertyCompanyIds = [...new Set(propertyPermits.map((p) => p.contractor_company_id).filter((id): id is string => id !== null))];
+        const bbbProfilesForProperty = propertyCompanyIds.flatMap((cid) => bbbProfilesByCompany.get(cid) ?? []);
+        const bbbProfilesWithChildren: BbbProfileWithChildren[] = bbbProfilesForProperty.map((profile) => ({
+          profile,
+          qualityScore: bbbQualityScoreMap.get(profile.business_reputation_profile_id) ?? null,
+          reviews: bbbReviewMap.get(profile.business_reputation_profile_id) ?? [],
+          complaints: bbbComplaintMap.get(profile.business_reputation_profile_id) ?? [],
+        }));
+
+        const consolidated = assemblePropertyRecord({
+          property,
+          parcel,
+          address,
+          taxes: taxMap.get(property.property_id) ?? [],
+          salesHistories: salesMap.get(property.property_id) ?? [],
+          structures: structureMap.get(property.property_id) ?? [],
+          layouts: layoutMap.get(property.property_id) ?? [],
+          lots: lotMap.get(property.property_id) ?? [],
+          floodStorm: floodMap.get(property.property_id) ?? [],
+          utilities: utilityMap.get(property.property_id) ?? [],
+          ownerships: ownershipMap.get(property.property_id) ?? [],
+          deeds: deedMap.get(property.property_id) ?? [],
+          files: fileMap.get(property.property_id) ?? [],
+          geometries: geometryMap.get(property.property_id) ?? [],
+          valuations: valuationMap.get(property.property_id) ?? [],
+          permits: permitsWithChildren,
+          sunbizTenants: sunbizTenantsWithChildren,
+          bbbProfiles: bbbProfilesWithChildren,
+          county: options.county,
+          collectedAt,
+        });
+
+        const json = `${JSON.stringify(consolidated, null, 2)}\n`;
+        const buffer = Buffer.from(json, "utf8");
+        const safeParcelIdentifier = property.parcel_identifier.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const filePath = join(propertiesDir, `${safeParcelIdentifier}.json`);
+
+        await writeFile(filePath, buffer);
+
+        const sha256 = createHash("sha256").update(buffer).digest("hex");
+        const cid = await computeIpfsCid(buffer);
+
+        const entry = buildManifestEntry({
+          parcelIdentifier: property.parcel_identifier,
+          filePath,
+          fileSizeBytes: buffer.length,
+          sha256,
+          cid,
+        });
+        manifestEntries.push(entry);
+        runningStats = accumulateManifestStats(runningStats, buffer.length);
+        batchWritten += 1;
       }
+
+      // All batch-scoped variables (parcels, taxes, permits, etc.) go out of
+      // scope here — GC can reclaim them before the next iteration begins.
+      totalWritten += batchWritten;
+      console.log(JSON.stringify({
+        event: "batch_done",
+        batchIndex,
+        written: batchWritten,
+        totalWritten,
+        totalProperties: propertyCount,
+      }));
     }
 
-    // 6. Write manifest
+    // 3. Write manifest — entries array is small (one slim object per property)
     const completedAt = new Date().toISOString();
     const manifest = buildManifestSummary(manifestEntries, startedAt, completedAt, options.county);
     await writeFile(join(options.outDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
     console.log(JSON.stringify({
       event: "property_consolidation_export_finished",
-      count: processedCount,
+      count: totalWritten,
       totalBytes: manifest.totalBytes,
       minBytes: manifest.minBytes,
       avgBytes: manifest.avgBytes,
