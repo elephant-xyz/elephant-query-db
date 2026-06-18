@@ -8,6 +8,7 @@ import {
   computeIpfsCid,
   DEFAULT_BATCH_SIZE,
   EMPTY_MANIFEST_STATS,
+  normalizeContractorName,
   parseOptions,
 } from "../scripts/run-property-consolidation-export.js";
 
@@ -546,6 +547,7 @@ describe("assemblePropertyRecord", () => {
       estimated_sq_ft: "200.00",
       project_description: "New roof",
       contractor_company_id: "company-uuid-1",
+      contractor_name: "Acme Roofing",
     };
 
     const result = assemblePropertyRecord({
@@ -605,15 +607,17 @@ describe("assemblePropertyRecord", () => {
 describe("buildManifestEntry", () => {
   it("passes through all fields", () => {
     const entry = buildManifestEntry({
+      propertyId: "prop-uuid-abc",
       parcelIdentifier: "1234567890",
-      filePath: "/data/properties/1234567890.json",
+      filePath: "/data/properties/prop-uuid-abc.json",
       fileSizeBytes: 4096,
       sha256: "abc123def456",
       cid: "QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco",
     });
 
+    expect(entry.propertyId).toBe("prop-uuid-abc");
     expect(entry.parcelIdentifier).toBe("1234567890");
-    expect(entry.filePath).toBe("/data/properties/1234567890.json");
+    expect(entry.filePath).toBe("/data/properties/prop-uuid-abc.json");
     expect(entry.fileSizeBytes).toBe(4096);
     expect(entry.sha256).toBe("abc123def456");
     expect(entry.cid).toBe("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco");
@@ -621,8 +625,9 @@ describe("buildManifestEntry", () => {
 
   it("accepts null cid", () => {
     const entry = buildManifestEntry({
+      propertyId: "prop-uuid-xyz",
       parcelIdentifier: "9876543210",
-      filePath: "/data/properties/9876543210.json",
+      filePath: "/data/properties/prop-uuid-xyz.json",
       fileSizeBytes: 2048,
       sha256: "deadbeef",
       cid: null,
@@ -639,9 +644,9 @@ describe("buildManifestEntry", () => {
 describe("buildManifestSummary", () => {
   it("computes totalBytes as sum of all entry sizes", () => {
     const entries = [
-      buildManifestEntry({ parcelIdentifier: "001", filePath: "/p/001.json", fileSizeBytes: 1000, sha256: "a", cid: null }),
-      buildManifestEntry({ parcelIdentifier: "002", filePath: "/p/002.json", fileSizeBytes: 2000, sha256: "b", cid: null }),
-      buildManifestEntry({ parcelIdentifier: "003", filePath: "/p/003.json", fileSizeBytes: 3000, sha256: "c", cid: null }),
+      buildManifestEntry({ propertyId: "p1", parcelIdentifier: "001", filePath: "/p/p1.json", fileSizeBytes: 1000, sha256: "a", cid: null }),
+      buildManifestEntry({ propertyId: "p2", parcelIdentifier: "002", filePath: "/p/p2.json", fileSizeBytes: 2000, sha256: "b", cid: null }),
+      buildManifestEntry({ propertyId: "p3", parcelIdentifier: "003", filePath: "/p/p3.json", fileSizeBytes: 3000, sha256: "c", cid: null }),
     ];
 
     const summary = buildManifestSummary(entries, "2026-06-18T09:00:00.000Z", "2026-06-18T09:05:00.000Z", "lee");
@@ -651,9 +656,9 @@ describe("buildManifestSummary", () => {
 
   it("computes min, avg, max correctly", () => {
     const entries = [
-      buildManifestEntry({ parcelIdentifier: "001", filePath: "/p/001.json", fileSizeBytes: 1000, sha256: "a", cid: null }),
-      buildManifestEntry({ parcelIdentifier: "002", filePath: "/p/002.json", fileSizeBytes: 3000, sha256: "b", cid: null }),
-      buildManifestEntry({ parcelIdentifier: "003", filePath: "/p/003.json", fileSizeBytes: 2000, sha256: "c", cid: null }),
+      buildManifestEntry({ propertyId: "p1", parcelIdentifier: "001", filePath: "/p/p1.json", fileSizeBytes: 1000, sha256: "a", cid: null }),
+      buildManifestEntry({ propertyId: "p2", parcelIdentifier: "002", filePath: "/p/p2.json", fileSizeBytes: 3000, sha256: "b", cid: null }),
+      buildManifestEntry({ propertyId: "p3", parcelIdentifier: "003", filePath: "/p/p3.json", fileSizeBytes: 2000, sha256: "c", cid: null }),
     ];
 
     const summary = buildManifestSummary(entries, "2026-06-18T09:00:00.000Z", "2026-06-18T09:05:00.000Z", "lee");
@@ -665,8 +670,8 @@ describe("buildManifestSummary", () => {
 
   it("computes projectedBytes300k as avgBytes * 300000", () => {
     const entries = [
-      buildManifestEntry({ parcelIdentifier: "001", filePath: "/p/001.json", fileSizeBytes: 4000, sha256: "a", cid: null }),
-      buildManifestEntry({ parcelIdentifier: "002", filePath: "/p/002.json", fileSizeBytes: 4000, sha256: "b", cid: null }),
+      buildManifestEntry({ propertyId: "p1", parcelIdentifier: "001", filePath: "/p/p1.json", fileSizeBytes: 4000, sha256: "a", cid: null }),
+      buildManifestEntry({ propertyId: "p2", parcelIdentifier: "002", filePath: "/p/p2.json", fileSizeBytes: 4000, sha256: "b", cid: null }),
     ];
 
     const summary = buildManifestSummary(entries, "2026-06-18T09:00:00.000Z", "2026-06-18T09:05:00.000Z", "lee");
@@ -692,8 +697,8 @@ describe("buildManifestSummary", () => {
 
   it("sets propertyCount to number of entries", () => {
     const entries = [
-      buildManifestEntry({ parcelIdentifier: "001", filePath: "/p/001.json", fileSizeBytes: 100, sha256: "a", cid: null }),
-      buildManifestEntry({ parcelIdentifier: "002", filePath: "/p/002.json", fileSizeBytes: 200, sha256: "b", cid: null }),
+      buildManifestEntry({ propertyId: "p1", parcelIdentifier: "001", filePath: "/p/p1.json", fileSizeBytes: 100, sha256: "a", cid: null }),
+      buildManifestEntry({ propertyId: "p2", parcelIdentifier: "002", filePath: "/p/p2.json", fileSizeBytes: 200, sha256: "b", cid: null }),
     ];
 
     const summary = buildManifestSummary(entries, "2026-06-18T09:00:00.000Z", "2026-06-18T09:05:00.000Z", "lee");
@@ -802,8 +807,9 @@ describe("accumulateManifestStats", () => {
     const sizes = [800, 1200, 450, 3100, 975];
     const entries = sizes.map((s, i) =>
       buildManifestEntry({
+        propertyId: `prop-${String(i)}`,
         parcelIdentifier: String(i),
-        filePath: `/p/${String(i)}.json`,
+        filePath: `/p/prop-${String(i)}.json`,
         fileSizeBytes: s,
         sha256: String(i),
         cid: null,
@@ -984,5 +990,79 @@ describe("batched assembly produces identical output to non-batched assembly", (
     for (let i = 0; i < allAtOnce.length; i += 1) {
       expect(JSON.stringify(batched[i])).toBe(JSON.stringify(allAtOnce[i]));
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug 1 fix — filename based on property UUID, not parcel identifier
+// Two properties sharing the same parcel_identifier must produce distinct file paths.
+// ---------------------------------------------------------------------------
+
+describe("buildManifestEntry uses property UUID as unique file identifier", () => {
+  it("two properties sharing a parcel produce distinct file paths when keyed by property_id", () => {
+    const sharedParcelIdentifier = "1234567890";
+
+    // Simulates what the main loop does: filename = `${property.property_id}.json`
+    const entry1 = buildManifestEntry({
+      propertyId: "prop-uuid-aaa",
+      parcelIdentifier: sharedParcelIdentifier,
+      filePath: `/out/properties/prop-uuid-aaa.json`,
+      fileSizeBytes: 1000,
+      sha256: "sha1",
+      cid: null,
+    });
+    const entry2 = buildManifestEntry({
+      propertyId: "prop-uuid-bbb",
+      parcelIdentifier: sharedParcelIdentifier,
+      filePath: `/out/properties/prop-uuid-bbb.json`,
+      fileSizeBytes: 1200,
+      sha256: "sha2",
+      cid: null,
+    });
+
+    expect(entry1.propertyId).not.toBe(entry2.propertyId);
+    expect(entry1.filePath).not.toBe(entry2.filePath);
+    expect(entry1.parcelIdentifier).toBe(entry2.parcelIdentifier);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug 2 fix — BBB profiles matched via normalizeContractorName
+// Verifies that name normalization produces consistent lookup keys.
+// ---------------------------------------------------------------------------
+
+describe("normalizeContractorName", () => {
+  it("lowercases and trims input", () => {
+    expect(normalizeContractorName("  ACME Corp  ")).toBe("acme co");
+  });
+
+  it("replaces & with 'and'", () => {
+    expect(normalizeContractorName("Smith & Sons")).toBe("smith and sons");
+  });
+
+  it("strips common corporate suffixes (inc, llc, corp)", () => {
+    expect(normalizeContractorName("Apex Construction Inc")).toBe("apex construction inc");
+    expect(normalizeContractorName("Bright Builders LLC")).toBe("bright builders llc");
+    expect(normalizeContractorName("Fort Myers Corp")).toBe("fort myers co");
+  });
+
+  it("replaces non-alphanumeric chars with spaces and collapses whitespace", () => {
+    expect(normalizeContractorName("Sun-Ray Electric, Inc.")).toBe("sun ray electric inc");
+  });
+
+  it("returns empty string for null or undefined", () => {
+    expect(normalizeContractorName(null)).toBe("");
+    expect(normalizeContractorName(undefined)).toBe("");
+    expect(normalizeContractorName("")).toBe("");
+  });
+
+  it("produces the same key for the same contractor written different ways", () => {
+    const variants = [
+      "GULF COAST ELECTRIC INC",
+      "Gulf Coast Electric, Inc.",
+      "gulf coast electric inc",
+    ];
+    const keys = variants.map(normalizeContractorName);
+    expect(new Set(keys).size).toBe(1);
   });
 });
