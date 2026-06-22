@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, readFileSync, writeFileSync } from "node:fs";
+import { createReadStream, createWriteStream, readFileSync, unlink, writeFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { Writable } from "node:stream";
@@ -53,6 +53,8 @@ type BulkLoaderPhase = "all" | "stage" | "load";
 
 type BulkLoaderOptions = {
   readonly appraisalPrefix: string;
+  /** Artifacts per batch for disk-bounded appraisal loading. 0 = single-batch (legacy). */
+  readonly batchSize: number;
   readonly bbbPrefix: string;
   readonly bucket: string;
   readonly concurrency: number;
@@ -211,11 +213,20 @@ async function main(): Promise<void> {
     throw new Error(`DATABASE_URL is required; expected it in ${options.envFile} or the environment`);
   }
 
-  const stageFile = options.stageFile ?? buildDefaultStageFile(options.stageDir);
   const scopeSelection = options.scopeManifest === null
     ? null
     : loadScopedSelection(options.scopeManifest);
   const counters = emptyCounters();
+
+  // Batched appraisal mode: stage + merge each batch atomically so peak disk usage
+  // equals ONE batch CSV (~few GB) rather than all 501k artifacts at once (~106 GB).
+  const useAppraisalBatchMode =
+    options.batchSize > 0 &&
+    options.tracks.includes("appraisal") &&
+    options.phase !== "load"; // --phase load resumes via --stage-table; skip batch routing
+
+  const stageFile = options.stageFile ?? buildDefaultStageFile(options.stageDir);
+
   console.log(JSON.stringify({
     event: "bulk_loader_started",
     options: redactedOptions(options),
@@ -227,24 +238,50 @@ async function main(): Promise<void> {
           parcelIdentifierCount: scopeSelection.parcelIdentifiers.size,
           sourceCandidateCount: scopeSelection.sourceCandidateCount,
         },
-    stageFile,
+    batchMode: useAppraisalBatchMode,
+    stageFile: useAppraisalBatchMode ? "(per-batch)" : stageFile,
   }));
 
-  if (options.phase === "all" || options.phase === "stage") {
-    await stageSelectedTracks({ counters, options, scopeSelection, stageFile });
-  }
-  if (options.phase === "all" || options.phase === "load") {
-    const mergeResults = await copyAndMergeStageFile({
-      databaseUrl,
-      stageDir: options.stageDir,
-      stageFile,
-      stageTable: options.stageTable,
-      tableOrder: tableOrderForTracks(options.tracks),
-    });
-    console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
+  if (useAppraisalBatchMode) {
+    // Batched path: appraisal is processed batch-by-batch inline; remaining tracks
+    // (permits, sunbiz, bbb) are processed together in a single staging pass afterward.
+    await stageAndMergeAppraisalBatched({ counters, databaseUrl, options, scopeSelection });
+
+    const remainingTracks = options.tracks.filter((t) => t !== "appraisal");
+    if (remainingTracks.length > 0) {
+      const remainingOptions = { ...options, tracks: remainingTracks };
+      if (remainingOptions.phase === "all" || remainingOptions.phase === "stage") {
+        await stageSelectedTracks({ counters, options: remainingOptions, scopeSelection, stageFile });
+      }
+      if (remainingOptions.phase === "all" || remainingOptions.phase === "load") {
+        const mergeResults = await copyAndMergeStageFile({
+          databaseUrl,
+          stageDir: options.stageDir,
+          stageFile,
+          stageTable: options.stageTable,
+          tableOrder: tableOrderForTracks(remainingTracks),
+        });
+        console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
+      }
+    }
+  } else {
+    // Legacy single-batch path (used for sunbiz/bbb/permits standalone, or explicit --batch-size 0).
+    if (options.phase === "all" || options.phase === "stage") {
+      await stageSelectedTracks({ counters, options, scopeSelection, stageFile });
+    }
+    if (options.phase === "all" || options.phase === "load") {
+      const mergeResults = await copyAndMergeStageFile({
+        databaseUrl,
+        stageDir: options.stageDir,
+        stageFile,
+        stageTable: options.stageTable,
+        tableOrder: tableOrderForTracks(options.tracks),
+      });
+      console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
+    }
   }
 
-  console.log(JSON.stringify({ event: "bulk_loader_finished", counters, stageFile }));
+  console.log(JSON.stringify({ event: "bulk_loader_finished", counters, stageFile: useAppraisalBatchMode ? "(batched)" : stageFile }));
 }
 
 /**
@@ -369,6 +406,264 @@ async function stageAppraisal(params: {
     },
   );
   console.log(JSON.stringify({ event: "bulk_track_finished", track: "appraisal", artifactCount }));
+}
+
+/**
+ * Process appraisal artifacts in disk-bounded batches.
+ *
+ * For each batch of `options.batchSize` artifacts:
+ *   1. Stage the batch into a fresh per-batch CSV.
+ *   2. COPY the CSV into a new permanent stage table.
+ *   3. Merge all appraisal logical tables from the stage table.
+ *   4. Drop the stage table.
+ *   5. Delete the batch CSV from disk.
+ *
+ * Peak local disk usage = ONE batch CSV (a few GB), never the full 106 GB.
+ * A JSON checkpoint file records completed batch indices so a re-run resumes
+ * from the first incomplete batch without re-processing committed data.
+ *
+ * @param params - Database URL, loader options, scope selection, and mutable counters.
+ * @returns Promise that resolves after all batches have been processed.
+ */
+async function stageAndMergeAppraisalBatched(params: {
+  readonly counters: MutableBulkCounters;
+  readonly databaseUrl: string;
+  readonly options: BulkLoaderOptions;
+  readonly scopeSelection: ScopedLoadSelection | null;
+}): Promise<void> {
+  const { counters, databaseUrl, options, scopeSelection } = params;
+  const s3 = new S3Client({});
+
+  assertAppraisalPrefixIsScoped(options.appraisalPrefix);
+  await mkdir(options.stageDir, { recursive: true });
+
+  const batchCheckpointPath = join(options.stageDir, "appraisal-batch-checkpoint.json");
+  const completedBatches = await readBatchCheckpoint(batchCheckpointPath);
+
+  console.log(JSON.stringify({
+    event: "appraisal_batch_mode_started",
+    batchSize: options.batchSize,
+    completedBatches: [...completedBatches],
+  }));
+
+  const artifactIterator = listAppraisalArtifacts({
+    bucket: options.bucket,
+    limit: options.limit,
+    prefix: options.appraisalPrefix,
+    s3,
+  });
+
+  let batchIndex = 0;
+  let batchBuffer: S3ObjectListing[] = [];
+
+  const flushBatch = async (artifacts: readonly S3ObjectListing[]): Promise<void> => {
+    const currentBatch = batchIndex;
+    batchIndex += 1;
+
+    if (completedBatches.has(currentBatch)) {
+      console.log(JSON.stringify({
+        event: "appraisal_batch_skipped",
+        batchIndex: currentBatch,
+        artifactCount: artifacts.length,
+      }));
+      return;
+    }
+
+    const batchStageFile = join(
+      options.stageDir,
+      `appraisal-batch-${String(currentBatch).padStart(6, "0")}.csv`,
+    );
+    const stageTableName = buildPermanentStageTableName();
+
+    console.log(JSON.stringify({
+      event: "appraisal_batch_started",
+      batchIndex: currentBatch,
+      artifactCount: artifacts.length,
+      batchStageFile,
+      stageTableName,
+    }));
+
+    // Stage this batch into its own CSV.
+    const batchCounters = emptyCounters();
+    const writer = createWriteStream(batchStageFile, { encoding: "utf8", flags: "w" });
+    let nextRowIndex = 1;
+
+    const writeRows = async (rows: readonly PreparedRow[]): Promise<void> => {
+      let chunk = "";
+      for (const row of rows) {
+        chunk += serializeBulkStageCsvRow({ rowIndex: nextRowIndex, row });
+        nextRowIndex += 1;
+        batchCounters.stagedRows += 1;
+      }
+      if (chunk.length > 0 && !writer.write(chunk)) await onceDrain(writer);
+    };
+
+    try {
+      writer.write(serializeBulkStageCsvHeader());
+      await processIterable(artifacts, options.concurrency, async (artifact) => {
+        await stageArtifact({ counters: batchCounters }, artifact.uri, async () => {
+          const buffer = await readS3ObjectBuffer(s3, artifact.uri);
+          const zip = new AdmZip(buffer);
+          const rows: PreparedRow[] = [];
+          let skippedRecords = 0;
+          const entries = zip
+            .getEntries()
+            .filter((entry) => entry.isDirectory === false && /^data\/.+\.json$/.test(entry.entryName))
+            .sort((left, right) => left.entryName.localeCompare(right.entryName));
+
+          for (const entry of entries) {
+            const text = entry.getData().toString("utf8");
+            const record: unknown = JSON.parse(text);
+            const bundle = mapAppraisalTransformedFile({
+              artifactUri: artifact.uri,
+              filePath: entry.entryName,
+              record,
+            });
+            rows.push(...bundle.rows);
+            skippedRecords += bundle.skippedRecords.length;
+            batchCounters.inputRecords += 1;
+          }
+
+          if (
+            scopeSelection !== null &&
+            !preparedRowsContainSelectedParcel(rows, scopeSelection)
+          ) {
+            batchCounters.filteredRecords += entries.length;
+            batchCounters.skippedRecords += skippedRecords;
+            return {
+              filteredRecords: entries.length,
+              inputRecords: entries.length,
+              preparedRows: 0,
+              skippedRecords,
+            };
+          }
+
+          const sortedRows = sortRows(rows, APPRAISAL_TABLE_ORDER);
+          await writeRows(sortedRows);
+          batchCounters.preparedRows += rows.length;
+          batchCounters.skippedRecords += skippedRecords;
+          return {
+            filteredRecords: 0,
+            inputRecords: entries.length,
+            preparedRows: rows.length,
+            skippedRecords,
+          };
+        });
+      });
+    } finally {
+      writer.end();
+      await onceFinish(writer);
+    }
+
+    // Accumulate batch counters into the shared run counters.
+    counters.inputRecords += batchCounters.inputRecords;
+    counters.preparedRows += batchCounters.preparedRows;
+    counters.skippedRecords += batchCounters.skippedRecords;
+    counters.stagedRows += batchCounters.stagedRows;
+    counters.completedArtifacts += batchCounters.completedArtifacts;
+    counters.failedArtifacts += batchCounters.failedArtifacts;
+    counters.filteredRecords += batchCounters.filteredRecords;
+    counters.missingArtifacts += batchCounters.missingArtifacts;
+
+    console.log(JSON.stringify({
+      event: "appraisal_batch_staged",
+      batchIndex: currentBatch,
+      batchCounters,
+      batchStageFile,
+    }));
+
+    // COPY → merge → drop stage table → delete CSV.
+    await copyToStagingTable({ databaseUrl, stageFile: batchStageFile, stageTableName, stageDir: options.stageDir });
+
+    const batchCheckpoint = join(options.stageDir, `${stageTableName}-checkpoint.json`);
+    const alreadyMerged = await readCheckpoint(batchCheckpoint);
+    const metaClient = await createKeepaliveClient(databaseUrl);
+    let columnsByTable: ReadonlyMap<LogicalTableName, readonly BulkTableColumn[]>;
+    try {
+      columnsByTable = await readBulkTableColumns(createQueryClient(metaClient), APPRAISAL_TABLE_ORDER);
+    } finally {
+      await metaClient.end();
+    }
+
+    const committed = new Set(alreadyMerged);
+    for (const tableName of APPRAISAL_TABLE_ORDER) {
+      if (committed.has(tableName)) {
+        console.log(JSON.stringify({ event: "bulk_table_skipped_already_merged", tableName, batchIndex: currentBatch }));
+        continue;
+      }
+      const columns = columnsByTable.get(tableName);
+      if (columns === undefined) throw new Error(`Missing columns for ${tableName}`);
+      const result = await mergeOneTable({ databaseUrl, stageTableName, tableName, columns });
+      committed.add(tableName);
+      writeCheckpoint(batchCheckpoint, committed);
+      console.log(JSON.stringify({ event: "bulk_table_merged", ...result, batchIndex: currentBatch }));
+    }
+
+    await dropStagingTable(databaseUrl, stageTableName);
+
+    // Delete the batch CSV now that it is fully merged — keeps disk usage flat.
+    unlink(batchStageFile, (err) => {
+      if (err !== null) {
+        console.error(JSON.stringify({ event: "appraisal_batch_csv_delete_failed", batchStageFile, error: err.message }));
+      } else {
+        console.log(JSON.stringify({ event: "appraisal_batch_csv_deleted", batchStageFile }));
+      }
+    });
+
+    completedBatches.add(currentBatch);
+    writeBatchCheckpoint(batchCheckpointPath, completedBatches);
+
+    console.log(JSON.stringify({
+      event: "appraisal_batch_completed",
+      batchIndex: currentBatch,
+      stageTableName,
+    }));
+  };
+
+  // Collect artifacts into batches and flush each one.
+  for await (const artifact of artifactIterator) {
+    batchBuffer.push(artifact);
+    if (batchBuffer.length >= options.batchSize) {
+      await flushBatch(batchBuffer);
+      batchBuffer = [];
+    }
+  }
+  // Flush any remaining artifacts as a final (possibly smaller) batch.
+  if (batchBuffer.length > 0) {
+    await flushBatch(batchBuffer);
+  }
+
+  console.log(JSON.stringify({
+    event: "appraisal_batch_mode_finished",
+    totalBatches: batchIndex,
+  }));
+}
+
+/**
+ * Read completed batch indices from the appraisal batch checkpoint file.
+ *
+ * @param checkpointPath - Path to the JSON batch checkpoint file.
+ * @returns Mutable set of completed batch indices.
+ */
+async function readBatchCheckpoint(checkpointPath: string): Promise<Set<number>> {
+  try {
+    const text = await readFile(checkpointPath, "utf8");
+    const parsed: unknown = JSON.parse(text);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((item): item is number => typeof item === "number"));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Persist completed batch indices to the batch checkpoint file.
+ *
+ * @param checkpointPath - Path to the JSON batch checkpoint file.
+ * @param completed - Set of completed batch indices.
+ */
+function writeBatchCheckpoint(checkpointPath: string, completed: ReadonlySet<number>): void {
+  writeFileSync(checkpointPath, JSON.stringify([...completed]), "utf8");
 }
 
 /**
@@ -1307,6 +1602,7 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
 
   return {
     appraisalPrefix: values.get("appraisal-prefix") ?? DEFAULT_APPRAISAL_PREFIX,
+    batchSize: parseBatchSize(values.get("batch-size")),
     bbbPrefix: values.get("bbb-prefix") ?? DEFAULT_BBB_PREFIX,
     bucket: values.get("bucket") ?? DEFAULT_BUCKET,
     concurrency: parseConcurrency(values.get("concurrency")),
@@ -1380,6 +1676,27 @@ function parseConcurrency(value: string | undefined): number {
 }
 
 /**
+ * Parse the appraisal batch size for disk-bounded loading.
+ *
+ * A value of 0 disables batching (legacy single-CSV path). Any positive integer
+ * N causes appraisal artifacts to be processed in groups of N, each staged to its
+ * own temporary CSV that is deleted after merging to keep peak disk usage bounded.
+ *
+ * Defaults to 20000 when the flag is omitted.
+ *
+ * @param value - Raw batch-size string from the CLI.
+ * @returns Non-negative batch size.
+ */
+function parseBatchSize(value: string | undefined): number {
+  if (value === undefined || value.trim().length === 0) return 20_000;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`Invalid --batch-size value: ${value} (must be a non-negative integer; 0 = disable batching)`);
+  }
+  return parsed;
+}
+
+/**
  * Create a timestamped default staging file path.
  *
  * @param stageDir - Directory where bulk staging files should live.
@@ -1417,6 +1734,7 @@ function emptyCounters(): MutableBulkCounters {
 function redactedOptions(options: BulkLoaderOptions): JsonObject {
   return {
     appraisalPrefix: options.appraisalPrefix,
+    batchSize: options.batchSize,
     bbbPrefix: options.bbbPrefix,
     bucket: options.bucket,
     concurrency: options.concurrency,
