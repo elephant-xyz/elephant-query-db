@@ -1079,19 +1079,20 @@ async function copyAndMergeStageFile(params: {
 }
 
 /**
- * List transformed appraisal artifact URIs, descending two levels below the prefix.
+ * List transformed appraisal artifact URIs via a single flat recursive listing.
  *
  * The lee-fullcounty run stores artifacts at:
  *   `<prefix>/row-<N>-folio-<folio>-parcel-<id>/<uuid>/transformed_output.zip`
  *
- * That is TWO child levels below the jobId prefix — `row-N/` then `<uuid>/`. The
- * previous implementation only descended one level (producing a path like
- * `row-.../transformed_output.zip` that does not exist), so it found zero artifacts.
+ * The previous two-level delimiter approach required ~501k individual
+ * ListObjectsV2 calls (one per parcel), capping throughput at ~6–7 artifacts/sec
+ * regardless of --concurrency. This implementation issues a single flat listing
+ * (no Delimiter) and yields an artifact URI for every key that ends with
+ * `/transformed_output.zip`, producing ~2,500 paginated API calls total and
+ * saturating the concurrency pool within seconds.
  *
- * This implementation:
- *   1. Lists immediate children of `prefix` with Delimiter="/" → row-* prefixes.
- *   2. For each row prefix, lists its immediate children → uuid prefixes.
- *   3. Yields an artifact URI for each `<uuid>/transformed_output.zip`.
+ * The artifact URI shape is identical to the previous implementation:
+ *   `s3://<bucket>/<key-without-filename>/transformed_output.zip`
  *
  * @param params - S3 client, bucket, prefix, and optional artifact limit.
  * @yields Appraisal transformed artifact URI listings in S3 listing order.
@@ -1102,54 +1103,33 @@ async function* listAppraisalArtifacts(params: {
   readonly prefix: string;
   readonly s3: S3Client;
 }): AsyncGenerator<S3ObjectListing> {
+  const ARTIFACT_FILENAME = "transformed_output.zip";
+  const artifactSuffix = `/${ARTIFACT_FILENAME}`;
   let yielded = 0;
+  let continuationToken: string | undefined;
 
-  // Level 1: row-* prefixes immediately under the jobId prefix.
-  let rowContinuationToken: string | undefined;
   do {
-    const rowResponse = await params.s3.send(new ListObjectsV2Command({
+    const response = await params.s3.send(new ListObjectsV2Command({
       Bucket: params.bucket,
       Prefix: params.prefix,
-      Delimiter: "/",
-      ContinuationToken: rowContinuationToken,
+      ContinuationToken: continuationToken,
       MaxKeys: 1000,
     }));
 
-    for (const rowCommonPrefix of rowResponse.CommonPrefixes ?? []) {
-      const rowPrefix = rowCommonPrefix.Prefix;
-      if (rowPrefix === undefined || rowPrefix.length === 0) continue;
+    for (const object of response.Contents ?? []) {
+      const key = object.Key;
+      if (key === undefined || !key.endsWith(artifactSuffix)) continue;
 
-      // Level 2: uuid prefixes immediately under the row-* prefix.
-      let uuidContinuationToken: string | undefined;
-      do {
-        const uuidResponse = await params.s3.send(new ListObjectsV2Command({
-          Bucket: params.bucket,
-          Prefix: rowPrefix,
-          Delimiter: "/",
-          ContinuationToken: uuidContinuationToken,
-          MaxKeys: 10, // each row prefix holds exactly one uuid child
-        }));
-
-        for (const uuidCommonPrefix of uuidResponse.CommonPrefixes ?? []) {
-          const artifactUri = buildAppraisalTransformedArtifactUri({
-            bucket: params.bucket,
-            commonPrefix: uuidCommonPrefix.Prefix,
-          });
-          if (artifactUri === null) continue;
-          yield {
-            uri: artifactUri,
-            size: null,
-          };
-          yielded += 1;
-          if (params.limit !== null && yielded >= params.limit) return;
-        }
-
-        uuidContinuationToken = uuidResponse.NextContinuationToken;
-      } while (uuidContinuationToken !== undefined);
+      yield {
+        uri: `s3://${params.bucket}/${key}`,
+        size: object.Size ?? null,
+      };
+      yielded += 1;
+      if (params.limit !== null && yielded >= params.limit) return;
     }
 
-    rowContinuationToken = rowResponse.NextContinuationToken;
-  } while (rowContinuationToken !== undefined);
+    continuationToken = response.NextContinuationToken;
+  } while (continuationToken !== undefined);
 }
 
 /**
