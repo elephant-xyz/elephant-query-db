@@ -437,7 +437,9 @@ async function stageAndMergeAppraisalBatched(params: {
   assertAppraisalPrefixIsScoped(options.appraisalPrefix);
   await mkdir(options.stageDir, { recursive: true });
 
-  const batchCheckpointPath = join(options.stageDir, "appraisal-batch-checkpoint.json");
+  // Include batch-size in the checkpoint filename so runs with different batch
+  // sizes don't cross-contaminate each other's resume state.
+  const batchCheckpointPath = join(options.stageDir, `appraisal-batch-checkpoint-n${options.batchSize}.json`);
   const completedBatches = await readBatchCheckpoint(batchCheckpointPath);
 
   console.log(JSON.stringify({
