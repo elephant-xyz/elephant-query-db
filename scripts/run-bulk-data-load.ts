@@ -1079,12 +1079,19 @@ async function copyAndMergeStageFile(params: {
 }
 
 /**
- * List transformed appraisal artifact URIs from immediate `.csv/` child prefixes.
+ * List transformed appraisal artifact URIs, descending two levels below the prefix.
  *
- * The appraiser workflow stores query-db-ready artifacts at
- * `<outputs>/<parcel>.csv/transformed_output.zip`. This generator uses S3
- * delimiter pagination so it does not recurse into every object below each
- * parcel folder while discovering candidate artifacts.
+ * The lee-fullcounty run stores artifacts at:
+ *   `<prefix>/row-<N>-folio-<folio>-parcel-<id>/<uuid>/transformed_output.zip`
+ *
+ * That is TWO child levels below the jobId prefix — `row-N/` then `<uuid>/`. The
+ * previous implementation only descended one level (producing a path like
+ * `row-.../transformed_output.zip` that does not exist), so it found zero artifacts.
+ *
+ * This implementation:
+ *   1. Lists immediate children of `prefix` with Delimiter="/" → row-* prefixes.
+ *   2. For each row prefix, lists its immediate children → uuid prefixes.
+ *   3. Yields an artifact URI for each `<uuid>/transformed_output.zip`.
  *
  * @param params - S3 client, bucket, prefix, and optional artifact limit.
  * @yields Appraisal transformed artifact URI listings in S3 listing order.
@@ -1095,31 +1102,54 @@ async function* listAppraisalArtifacts(params: {
   readonly prefix: string;
   readonly s3: S3Client;
 }): AsyncGenerator<S3ObjectListing> {
-  let continuationToken: string | undefined;
   let yielded = 0;
+
+  // Level 1: row-* prefixes immediately under the jobId prefix.
+  let rowContinuationToken: string | undefined;
   do {
-    const response = await params.s3.send(new ListObjectsV2Command({
+    const rowResponse = await params.s3.send(new ListObjectsV2Command({
       Bucket: params.bucket,
       Prefix: params.prefix,
       Delimiter: "/",
-      ContinuationToken: continuationToken,
+      ContinuationToken: rowContinuationToken,
       MaxKeys: 1000,
     }));
-    for (const commonPrefix of response.CommonPrefixes ?? []) {
-      const artifactUri = buildAppraisalTransformedArtifactUri({
-        bucket: params.bucket,
-        commonPrefix: commonPrefix.Prefix,
-      });
-      if (artifactUri === null) continue;
-      yield {
-        uri: artifactUri,
-        size: null,
-      };
-      yielded += 1;
-      if (params.limit !== null && yielded >= params.limit) return;
+
+    for (const rowCommonPrefix of rowResponse.CommonPrefixes ?? []) {
+      const rowPrefix = rowCommonPrefix.Prefix;
+      if (rowPrefix === undefined || rowPrefix.length === 0) continue;
+
+      // Level 2: uuid prefixes immediately under the row-* prefix.
+      let uuidContinuationToken: string | undefined;
+      do {
+        const uuidResponse = await params.s3.send(new ListObjectsV2Command({
+          Bucket: params.bucket,
+          Prefix: rowPrefix,
+          Delimiter: "/",
+          ContinuationToken: uuidContinuationToken,
+          MaxKeys: 10, // each row prefix holds exactly one uuid child
+        }));
+
+        for (const uuidCommonPrefix of uuidResponse.CommonPrefixes ?? []) {
+          const artifactUri = buildAppraisalTransformedArtifactUri({
+            bucket: params.bucket,
+            commonPrefix: uuidCommonPrefix.Prefix,
+          });
+          if (artifactUri === null) continue;
+          yield {
+            uri: artifactUri,
+            size: null,
+          };
+          yielded += 1;
+          if (params.limit !== null && yielded >= params.limit) return;
+        }
+
+        uuidContinuationToken = uuidResponse.NextContinuationToken;
+      } while (uuidContinuationToken !== undefined);
     }
-    continuationToken = response.NextContinuationToken;
-  } while (continuationToken !== undefined);
+
+    rowContinuationToken = rowResponse.NextContinuationToken;
+  } while (rowContinuationToken !== undefined);
 }
 
 /**
