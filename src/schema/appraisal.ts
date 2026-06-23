@@ -27,7 +27,7 @@ export const parcels = pgTable(
   "parcels",
   {
     parcelId: uuid("parcel_id").primaryKey().defaultRandom(),
-    requestIdentifier: text("request_identifier"),
+    requestIdentifier: text("request_identifier").notNull(),
     parcelIdentifier: text("parcel_identifier").notNull(),
     countyName: text("county_name"),
     stateCode: text("state_code"),
@@ -40,9 +40,9 @@ export const parcels = pgTable(
   },
   (table) => [
     uniqueIndex("parcels_source_record_idx").on(table.sourceSystem, table.sourceRecordKey),
-    unique("parcels_jurisdiction_key_parcel_identifier_unique").on(
+    unique("parcels_jurisdiction_key_request_identifier_unique").on(
       table.jurisdictionKey,
-      table.parcelIdentifier,
+      table.requestIdentifier,
     ),
     index("parcels_identifier_idx").on(table.parcelIdentifier),
   ],

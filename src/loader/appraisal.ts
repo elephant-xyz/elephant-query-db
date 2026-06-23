@@ -489,7 +489,12 @@ function mapParcel(
     values: compactObject({
       ...metadata(sourceRecordKey, record, artifactUri),
       request_identifier: requestIdentifier,
-      parcel_identifier: normalizeParcelIdentifier(record.parcel_id ?? requestIdentifier),
+      // Store the RAW STRAP so letters (e.g. condo units `…0001A`) are preserved
+      // for display/reference. Parcel dedup keys on `request_identifier` (folio),
+      // NOT this column, so the raw value never collapses distinct parcels. The
+      // digits-only `normalizeParcelIdentifier` form is still used for cross-source
+      // matching at read time (see scoped-load.ts).
+      parcel_identifier: readString(record.parcel_id) ?? requestIdentifier,
       county_name: readCountyName(record),
       state_code: "FL",
       jurisdiction_key: "lee_appraiser",

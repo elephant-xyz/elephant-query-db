@@ -189,7 +189,7 @@ export const DEFAULT_TABLE_WRITE_SPECS: ReadonlyMap<LogicalTableName, TableWrite
       "parcels",
       {
         ...defaultSpec("parcels", ["parcel_id"]),
-        conflictColumns: ["jurisdiction_key", "parcel_identifier"],
+        conflictColumns: ["jurisdiction_key", "request_identifier"],
       },
     ],
     ["people", defaultSpec("people", ["person_id"])],
