@@ -181,29 +181,12 @@ async function putObjectAndCaptureCid(
     readonly contentType: string;
   }
 ): Promise<string | undefined> {
-  let capturedHeaders: Record<string, string> | undefined;
-
-  const captureMiddleware: DeserializeMiddleware<ServiceInputTypes, ServiceOutputTypes> =
-    (
-      next: DeserializeHandler<ServiceInputTypes, ServiceOutputTypes>,
-      _context: HandlerExecutionContext
-    ) =>
-    async (
-      args: DeserializeHandlerArguments<ServiceInputTypes>
-    ): Promise<DeserializeHandlerOutput<ServiceOutputTypes>> => {
-      const result = await next(args);
-      if (isRawHttpResponse(result.response)) {
-        capturedHeaders = result.response.headers;
-      }
-      return result;
-    };
-
-  client.middlewareStack.add(captureMiddleware, {
-    step: "deserialize",
-    name: "captureFilebaseCidHeader",
-    priority: "low",
-  });
-
+  // NOTE: we no longer read Filebase's x-amz-meta-cid per file. Capturing it required a
+  // shared-client deserialize middleware that is NOT concurrency-safe — at high --concurrency
+  // the same-named middleware is added repeatedly ("Duplicate middleware name") and its closure
+  // cross-contaminates across in-flight requests. The pre-computed CID (ipfs-only-hash, the same
+  // algorithm Filebase uses) is authoritative and is what the index/IPNS reference, so we trust
+  // it instead. (A separate sampled audit can confirm Filebase pins match, if ever needed.)
   const command = new PutObjectCommand({
     Bucket: params.bucket,
     Key: params.key,
@@ -212,9 +195,7 @@ async function putObjectAndCaptureCid(
   });
 
   await client.send(command);
-  client.middlewareStack.remove("captureFilebaseCidHeader");
-
-  return capturedHeaders?.["x-amz-meta-cid"];
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,30 +214,19 @@ async function uploadFile(
   expectedCid: string | null
 ): Promise<UploadResult> {
   const body = await readFile(absolutePath);
-  const filebaseCid = await putObjectAndCaptureCid(client, {
+  await putObjectAndCaptureCid(client, {
     bucket: options.bucket,
     key,
     body,
     contentType: "application/json",
   });
 
-  if (filebaseCid === undefined) {
-    return { ok: false, key, error: "Filebase did not return x-amz-meta-cid header" };
+  if (expectedCid === null) {
+    return { ok: false, key, error: "Missing pre-computed CID for entry" };
   }
 
-  if (expectedCid !== null && filebaseCid !== expectedCid) {
-    console.error(
-      JSON.stringify({
-        event: "cid_mismatch",
-        key,
-        expectedCid,
-        filebaseCid,
-        message: "Pre-computed CID is authoritative — Filebase CID differs. Investigate before trusting the upload.",
-      })
-    );
-  }
-
-  return { ok: true, key, cid: filebaseCid };
+  // Pre-computed CID (ipfs-only-hash == Filebase's CID algorithm) is authoritative.
+  return { ok: true, key, cid: expectedCid };
 }
 
 // ---------------------------------------------------------------------------
