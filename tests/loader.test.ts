@@ -1338,12 +1338,13 @@ describe("loader SQL helpers", () => {
     );
   });
 
-  it("upserts parcels by jurisdiction and parcel identifier", () => {
+  it("upserts parcels by jurisdiction and folio (request_identifier)", () => {
     const statement = buildUpsertStatement({
       tableName: "parcels",
       values: {
         jurisdiction_key: "lee_appraiser",
-        parcel_identifier: "00000000540000",
+        request_identifier: "00000000540000",
+        parcel_identifier: "00-00-00-00-0540.0000",
         source_system: "lee_appraiser",
         source_record_key: "lee_appraiser:00000000540000:parcel:property_seed",
         source_record_hash: "hash-1",
@@ -1351,8 +1352,11 @@ describe("loader SQL helpers", () => {
       },
     });
 
+    // Parcels must dedup on the folio, NOT the digits-only parcel_identifier,
+    // so STRAPs that differ only by letters (e.g. condo units `…0001A`) stay
+    // distinct instead of collapsing into one row.
     expect(statement.text).toContain(
-      "ON CONFLICT (\"jurisdiction_key\", \"parcel_identifier\")",
+      "ON CONFLICT (\"jurisdiction_key\", \"request_identifier\")",
     );
   });
 
