@@ -1257,6 +1257,16 @@ async function mergeOneTable(params: {
   try {
     // Ensure the permanent stage table is visible via its plain name in the merge SQL.
     await client.query("SET search_path TO public", []);
+    // Increase per-session memory for hash joins. The merge queries build large hash tables
+    // from parent tables (addresses: ~1M rows, parcels: ~200k). With the default 4MB
+    // work_mem, the planner spills to disk across 16 batches, adding tens of seconds per
+    // merge. 128MB lets most hash tables fit in memory and eliminates the disk spill.
+    await client.query("SET work_mem TO '128MB'", []);
+    // Neon runs on NVMe SSD. The default random_page_cost=4 (spinning disk) causes the
+    // planner to prefer hash joins over index-nested-loop joins even when index scans are
+    // much faster on flash storage. Lowering to 1.1 lets the planner pick NL index joins
+    // for the reference-resolution lookups against parent tables.
+    await client.query("SET random_page_cost TO 1.1", []);
     await client.query("BEGIN");
     const result = await mergeBulkStageTable(queryClient, {
       stageTableName: params.stageTableName,
