@@ -198,6 +198,46 @@ async function putObjectAndCaptureCid(
   return undefined;
 }
 
+// Sequential CID capture — for the single index.json + manifest.json uploads only.
+// These run one-at-a-time (after all parallel file uploads finish), so the named
+// deserialize middleware is safe here (no duplicate-name / cross-request race).
+async function putObjectCaptureCidSequential(
+  client: S3Client,
+  params: {
+    readonly bucket: string;
+    readonly key: string;
+    readonly body: Buffer;
+    readonly contentType: string;
+  }
+): Promise<string | undefined> {
+  let capturedHeaders: Record<string, string> | undefined;
+  const captureMiddleware: DeserializeMiddleware<ServiceInputTypes, ServiceOutputTypes> =
+    (next: DeserializeHandler<ServiceInputTypes, ServiceOutputTypes>, _context: HandlerExecutionContext) =>
+    async (args: DeserializeHandlerArguments<ServiceInputTypes>): Promise<DeserializeHandlerOutput<ServiceOutputTypes>> => {
+      const result = await next(args);
+      if (isRawHttpResponse(result.response)) capturedHeaders = result.response.headers;
+      return result;
+    };
+  client.middlewareStack.add(captureMiddleware, {
+    step: "deserialize",
+    name: "captureFilebaseCidHeaderSeq",
+    priority: "low",
+  });
+  try {
+    await client.send(
+      new PutObjectCommand({
+        Bucket: params.bucket,
+        Key: params.key,
+        Body: params.body,
+        ContentType: params.contentType,
+      })
+    );
+  } finally {
+    client.middlewareStack.remove("captureFilebaseCidHeaderSeq");
+  }
+  return capturedHeaders?.["x-amz-meta-cid"];
+}
+
 // ---------------------------------------------------------------------------
 // Upload a single file
 // ---------------------------------------------------------------------------
@@ -627,7 +667,7 @@ async function main(): Promise<void> {
       console.log(JSON.stringify({ event: "index_already_uploaded", cid: indexCid }));
     } else {
       const indexBody = await readFile(indexPath);
-      const filebaseCid = await putObjectAndCaptureCid(client, {
+      const filebaseCid = await putObjectCaptureCidSequential(client, {
         bucket: options.bucket,
         key: indexKey,
         body: indexBody,
@@ -668,7 +708,7 @@ async function main(): Promise<void> {
     console.log(JSON.stringify({ event: "manifest_already_uploaded", cid: manifestCid }));
   } else {
     const manifestBody = await readFile(manifestPath);
-    const filebaseCid = await putObjectAndCaptureCid(client, {
+    const filebaseCid = await putObjectCaptureCidSequential(client, {
       bucket: options.bucket,
       key: manifestKey,
       body: manifestBody,
