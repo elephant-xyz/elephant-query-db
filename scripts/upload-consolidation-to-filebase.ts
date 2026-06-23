@@ -576,7 +576,11 @@ async function main(): Promise<void> {
   // 1. Upload property files in parallel
   const uploadTasks = entries.map((entry) => {
     const key = `properties/${entry.propertyId}.json`;
-    const absolutePath = join(options.exportDir, entry.filePath);
+    // entry.filePath may already be exportDir-relative-from-cwd (e.g. ".property-consolidation-export/properties/x.json")
+    // or relative-to-exportDir ("properties/x.json"); handle both so we don't double the prefix.
+    const absolutePath = entry.filePath.startsWith(options.exportDir)
+      ? entry.filePath
+      : join(options.exportDir, entry.filePath);
 
     if (alreadyUploaded.has(key)) {
       progress.skipped += 1;
