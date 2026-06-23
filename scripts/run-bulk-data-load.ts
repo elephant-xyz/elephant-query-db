@@ -352,6 +352,7 @@ async function stageAppraisal(params: {
       limit: params.options.limit,
       prefix: params.options.appraisalPrefix,
       s3: params.s3,
+      selectedArtifactUris: params.scopeSelection?.appraisalArtifactUris,
     }),
     params.options.concurrency,
     async (artifact) => {
@@ -446,6 +447,12 @@ async function stageAndMergeAppraisalBatched(params: {
     event: "appraisal_batch_mode_started",
     batchSize: options.batchSize,
     completedBatches: [...completedBatches],
+    // When a scope manifest provides artifact URIs, the listing is pre-filtered
+    // to exactly this many artifacts before any download/unzip happens.
+    scopedArtifactPrefilterCount:
+      scopeSelection !== null && scopeSelection.appraisalArtifactUris.size > 0
+        ? scopeSelection.appraisalArtifactUris.size
+        : null,
   }));
 
   const artifactIterator = listAppraisalArtifacts({
@@ -453,6 +460,7 @@ async function stageAndMergeAppraisalBatched(params: {
     limit: options.limit,
     prefix: options.appraisalPrefix,
     s3,
+    selectedArtifactUris: scopeSelection?.appraisalArtifactUris,
   });
 
   let batchIndex = 0;
@@ -1401,7 +1409,15 @@ async function copyAndMergeStageFile(params: {
  * The artifact URI shape is identical to the previous implementation:
  *   `s3://<bucket>/<key-without-filename>/transformed_output.zip`
  *
- * @param params - S3 client, bucket, prefix, and optional artifact limit.
+ * When `selectedArtifactUris` is a non-empty set, listed keys are intersected
+ * with it BEFORE any download/unzip/prepare happens. A scoped re-load (e.g. the
+ * gap re-load of ~30,852 of ~511k artifacts) therefore downloads and batches
+ * only the in-scope artifacts instead of re-scanning every artifact and
+ * filtering at the row level. The row-level filter in
+ * `preparedRowsContainSelectedParcel` is retained as a safety net. When the set
+ * is empty or undefined (e.g. a parcel-id-only scope), listing is unchanged.
+ *
+ * @param params - S3 client, bucket, prefix, optional artifact limit, and optional scope set.
  * @yields Appraisal transformed artifact URI listings in S3 listing order.
  */
 async function* listAppraisalArtifacts(params: {
@@ -1409,9 +1425,14 @@ async function* listAppraisalArtifacts(params: {
   readonly limit: number | null;
   readonly prefix: string;
   readonly s3: S3Client;
+  readonly selectedArtifactUris?: ReadonlySet<string> | undefined;
 }): AsyncGenerator<S3ObjectListing> {
   const ARTIFACT_FILENAME = "transformed_output.zip";
   const artifactSuffix = `/${ARTIFACT_FILENAME}`;
+  const selectedArtifactUris =
+    params.selectedArtifactUris !== undefined && params.selectedArtifactUris.size > 0
+      ? params.selectedArtifactUris
+      : null;
   let yielded = 0;
   let continuationToken: string | undefined;
 
@@ -1427,8 +1448,13 @@ async function* listAppraisalArtifacts(params: {
       const key = object.Key;
       if (key === undefined || !key.endsWith(artifactSuffix)) continue;
 
+      const uri = `s3://${params.bucket}/${key}`;
+      // Pre-filter: when a scope artifact-URI set is present, skip any listed
+      // artifact that is not in scope before it is ever downloaded/unzipped.
+      if (selectedArtifactUris !== null && !selectedArtifactUris.has(uri)) continue;
+
       yield {
-        uri: `s3://${params.bucket}/${key}`,
+        uri,
         size: object.Size ?? null,
       };
       yielded += 1;
