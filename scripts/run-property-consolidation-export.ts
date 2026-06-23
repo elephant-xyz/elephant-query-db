@@ -16,6 +16,7 @@ export type PropertyConsolidationOptions = {
   readonly outDir: string;
   readonly county: string;
   readonly envFile: string;
+  readonly shardSize: number;
 };
 
 export const DEFAULT_BATCH_SIZE = 250;
@@ -315,6 +316,45 @@ export type ManifestSummary = {
   readonly maxBytes: number;
   readonly projectedBytes300k: number;
   readonly entries: readonly ManifestEntry[];
+};
+
+// ---------------------------------------------------------------------------
+// Sharded index types
+// ---------------------------------------------------------------------------
+
+export type ShardEntry = {
+  readonly propertyId: string;
+  readonly parcelIdentifier: string;
+  readonly cid: string | null;
+  readonly fileSizeBytes: number;
+};
+
+export type ShardFile = {
+  readonly schemaVersion: "1";
+  readonly shardIndex: number;
+  readonly fromParcel: string;
+  readonly toParcel: string;
+  readonly count: number;
+  readonly entries: ShardEntry[];
+};
+
+export type ShardRef = {
+  readonly shardIndex: number;
+  readonly fromParcel: string;
+  readonly toParcel: string;
+  readonly count: number;
+  readonly shardCid: string | null;
+};
+
+export type IndexFile = {
+  readonly schemaVersion: "1";
+  readonly county: string;
+  readonly exportedAt: string;
+  readonly completedAt: string;
+  readonly propertyCount: number;
+  readonly shardSize: number;
+  readonly totalBytes: number;
+  readonly shards: ShardRef[];
 };
 
 // ---------------------------------------------------------------------------
@@ -637,12 +677,20 @@ export function parseOptions(argv: readonly string[]): PropertyConsolidationOpti
       ? parsedBatchSize
       : DEFAULT_BATCH_SIZE;
 
+  const shardSizeRaw = values.get("shard-size");
+  const parsedShardSize = shardSizeRaw !== undefined ? Number.parseInt(shardSizeRaw, 10) : null;
+  const shardSize =
+    parsedShardSize !== null && Number.isFinite(parsedShardSize) && parsedShardSize > 0
+      ? parsedShardSize
+      : 10_000;
+
   return {
     limit: limit !== null && !Number.isNaN(limit) ? limit : null,
     batchSize,
     outDir: values.get("out-dir") ?? ".property-consolidation-export",
     county: values.get("county") ?? "lee",
     envFile: values.get("env-file") ?? ".env.local",
+    shardSize,
   };
 }
 
@@ -1153,6 +1201,106 @@ export function buildManifestSummary(
 }
 
 // ---------------------------------------------------------------------------
+// Sharded index writer
+// ---------------------------------------------------------------------------
+
+/**
+ * Write sharded index files alongside the flat manifest.
+ *
+ * Sorts all entries by parcelIdentifier (lexicographic), splits into chunks of
+ * shardSize, writes each chunk as shards/shard-NNNN.json, then writes an
+ * index.json that lists all shards with their CIDs.
+ *
+ * This is additive — the flat manifest.json is still written by the caller.
+ */
+export async function writeShardedIndex(
+  entries: ManifestEntry[],
+  outDir: string,
+  shardSize: number,
+  county: string,
+  exportedAt: string,
+  completedAt: string,
+  totalBytes: number,
+): Promise<IndexFile> {
+  const shardsDir = join(outDir, "shards");
+  await mkdir(shardsDir, { recursive: true });
+
+  // Sort by parcelIdentifier ascending (lexicographic)
+  const sorted = [...entries].sort((a, b) => a.parcelIdentifier.localeCompare(b.parcelIdentifier));
+
+  // Split into chunks of shardSize
+  const chunks: ManifestEntry[][] = [];
+  for (let i = 0; i < sorted.length; i += shardSize) {
+    chunks.push(sorted.slice(i, i + shardSize));
+  }
+
+  const shardRefs: ShardRef[] = [];
+
+  for (let shardIndex = 0; shardIndex < chunks.length; shardIndex += 1) {
+    const chunk = chunks[shardIndex];
+    if (chunk === undefined || chunk.length === 0) continue;
+
+    const firstEntry = chunk[0];
+    const lastEntry = chunk[chunk.length - 1];
+
+    // Both are defined since chunk.length > 0; narrowing for strictness
+    if (firstEntry === undefined || lastEntry === undefined) continue;
+
+    const shardFile: ShardFile = {
+      schemaVersion: "1",
+      shardIndex,
+      fromParcel: firstEntry.parcelIdentifier,
+      toParcel: lastEntry.parcelIdentifier,
+      count: chunk.length,
+      entries: chunk.map((e) => ({
+        propertyId: e.propertyId,
+        parcelIdentifier: e.parcelIdentifier,
+        cid: e.cid,
+        fileSizeBytes: e.fileSizeBytes,
+      })),
+    };
+
+    const shardJson = `${JSON.stringify(shardFile, null, 2)}\n`;
+    const shardBuffer = Buffer.from(shardJson, "utf8");
+    const paddedIndex = String(shardIndex).padStart(4, "0");
+    const shardFileName = `shard-${paddedIndex}.json`;
+    const shardPath = join(shardsDir, shardFileName);
+
+    await writeFile(shardPath, shardBuffer);
+
+    const shardCid = await computeIpfsCid(shardBuffer);
+
+    shardRefs.push({
+      shardIndex,
+      fromParcel: firstEntry.parcelIdentifier,
+      toParcel: lastEntry.parcelIdentifier,
+      count: chunk.length,
+      shardCid,
+    });
+  }
+
+  const indexFile: IndexFile = {
+    schemaVersion: "1",
+    county,
+    exportedAt,
+    completedAt,
+    propertyCount: sorted.length,
+    shardSize,
+    totalBytes,
+    shards: shardRefs,
+  };
+
+  const indexJson = `${JSON.stringify(indexFile, null, 2)}\n`;
+  const indexBuffer = Buffer.from(indexJson, "utf8");
+  await writeFile(join(outDir, "index.json"), indexBuffer);
+
+  const indexCid = await computeIpfsCid(indexBuffer);
+  console.log(`Index CID: ${indexCid ?? "null"}`);
+
+  return indexFile;
+}
+
+// ---------------------------------------------------------------------------
 // Bulk DB query helpers
 // ---------------------------------------------------------------------------
 
@@ -1553,6 +1701,7 @@ async function main(): Promise<void> {
       const completedAt = new Date().toISOString();
       const manifest = buildManifestSummary([], startedAt, completedAt, options.county);
       await writeFile(join(options.outDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+      await writeShardedIndex([], options.outDir, options.shardSize, options.county, startedAt, completedAt, 0);
       console.log(JSON.stringify({ event: "property_consolidation_export_finished", count: 0 }));
       return;
     }
@@ -1847,6 +1996,17 @@ async function main(): Promise<void> {
     const completedAt = new Date().toISOString();
     const manifest = buildManifestSummary(manifestEntries, startedAt, completedAt, options.county);
     await writeFile(join(options.outDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+
+    // 4. Write sharded index (additive — manifest.json is kept for back-compat)
+    await writeShardedIndex(
+      manifestEntries,
+      options.outDir,
+      options.shardSize,
+      options.county,
+      startedAt,
+      completedAt,
+      manifest.totalBytes,
+    );
 
     console.log(JSON.stringify({
       event: "property_consolidation_export_finished",
