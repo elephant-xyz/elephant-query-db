@@ -1,6 +1,7 @@
 import { createReadStream, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   PutObjectCommand,
@@ -31,7 +32,7 @@ type UploadOptions = {
   readonly bucket: string;
   readonly accessKeyId: string;
   readonly secretAccessKey: string;
-  readonly filebaseApiToken: string | null;
+  readonly filebaseApiToken: string;
   readonly filebaseIpnsLabel: string | null;
 };
 
@@ -47,15 +48,12 @@ type Checkpoint = {
   readonly entries: CheckpointRecord[];
 };
 
-type FilebaseIpnsItem = {
-  readonly _id: string;
+type FilebaseIpnsName = {
   readonly label: string;
+  readonly network_key: string;
+  readonly cid: string;
   readonly sequence: number;
-  readonly record?: string;
-};
-
-type FilebaseIpnsListResponse = {
-  readonly items: FilebaseIpnsItem[];
+  readonly enabled: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -291,76 +289,86 @@ function logProgress(state: ProgressState): void {
 }
 
 // ---------------------------------------------------------------------------
-// Filebase IPNS REST API helpers
+// Filebase IPNS REST API helpers (Names API: https://api.filebase.io/v1/names)
+//
+// Auth: Authorization: Bearer base64(S3_ACCESS_KEY_ID:S3_SECRET_ACCESS_KEY).
+// Names are keyed by their `label` in the URL path. The resolvable IPNS name
+// is the `network_key` (k51…) returned by every endpoint.
 // ---------------------------------------------------------------------------
 
-async function listIpnsNames(apiToken: string): Promise<FilebaseIpnsItem[]> {
-  const response = await fetch("https://api.filebase.io/v1/ipns", {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      "Content-Type": "application/json",
-    },
-  });
+const FILEBASE_NAMES_API = "https://api.filebase.io/v1/names";
 
-  if (!response.ok) {
-    throw new Error(`Filebase IPNS list failed: ${response.status} ${response.statusText}`);
-  }
-
-  const body = (await response.json()) as FilebaseIpnsListResponse;
-  return body.items;
+function ipnsHeaders(apiToken: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${apiToken}`,
+    "Content-Type": "application/json",
+  };
 }
 
-async function createIpnsName(apiToken: string, label: string): Promise<FilebaseIpnsItem> {
-  const response = await fetch("https://api.filebase.io/v1/ipns", {
+export async function getIpnsName(apiToken: string, label: string): Promise<FilebaseIpnsName | null> {
+  const response = await fetch(`${FILEBASE_NAMES_API}/${encodeURIComponent(label)}`, {
+    method: "GET",
+    headers: ipnsHeaders(apiToken),
+  });
+
+  if (response.status === 404) {
+    return null;
+  }
+
+  if (!response.ok) {
+    throw new Error(`Filebase IPNS get failed: ${response.status} ${response.statusText}`);
+  }
+
+  return (await response.json()) as FilebaseIpnsName;
+}
+
+async function createIpnsName(apiToken: string, label: string, cid: string): Promise<FilebaseIpnsName> {
+  const response = await fetch(FILEBASE_NAMES_API, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ name: label, enabled: true }),
+    headers: ipnsHeaders(apiToken),
+    body: JSON.stringify({ label, cid }),
   });
 
   if (!response.ok) {
     throw new Error(`Filebase IPNS create failed: ${response.status} ${response.statusText}`);
   }
 
-  return (await response.json()) as FilebaseIpnsItem;
+  return (await response.json()) as FilebaseIpnsName;
 }
 
-async function updateIpnsName(apiToken: string, id: string, label: string, cid: string): Promise<void> {
-  const response = await fetch(`https://api.filebase.io/v1/ipns/${id}`, {
+async function updateIpnsName(apiToken: string, label: string, cid: string): Promise<FilebaseIpnsName> {
+  const response = await fetch(`${FILEBASE_NAMES_API}/${encodeURIComponent(label)}`, {
     method: "PUT",
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ name: label, cid, enabled: true }),
+    headers: ipnsHeaders(apiToken),
+    body: JSON.stringify({ cid }),
   });
 
   if (!response.ok) {
     throw new Error(`Filebase IPNS update failed: ${response.status} ${response.statusText}`);
   }
+
+  return (await response.json()) as FilebaseIpnsName;
 }
 
-async function upsertIpnsPointer(apiToken: string, label: string, indexCid: string): Promise<string> {
-  const items = await listIpnsNames(apiToken);
-  let existing = items.find((item) => item.label === label);
+export async function upsertIpnsPointer(apiToken: string, label: string, indexCid: string): Promise<string> {
+  const existing = await getIpnsName(apiToken, label);
 
-  if (existing === undefined) {
-    console.log(JSON.stringify({ event: "ipns_creating", label }));
-    existing = await createIpnsName(apiToken, label);
-  }
+  const name =
+    existing === null
+      ? (console.log(JSON.stringify({ event: "ipns_creating", label })),
+        await createIpnsName(apiToken, label, indexCid))
+      : await updateIpnsName(apiToken, label, indexCid);
 
-  await updateIpnsName(apiToken, existing._id, label, indexCid);
-
-  // Use the record field (the actual IPNS name like k51q...) if available, else _id
-  const ipnsName = (existing.record !== undefined && existing.record.length > 0)
-    ? existing.record
-    : existing._id;
-
-  console.log(JSON.stringify({ event: "ipns_updated", label, id: existing._id, ipnsName, indexCid }));
-  return ipnsName;
+  console.log(
+    JSON.stringify({
+      event: "ipns_updated",
+      label,
+      ipnsName: name.network_key,
+      sequence: name.sequence,
+      indexCid,
+    })
+  );
+  return name.network_key;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +415,16 @@ function parseOptions(argv: readonly string[]): UploadOptions {
   const parsedLimit = limitRaw !== undefined ? Number.parseInt(limitRaw, 10) : null;
   const limit = parsedLimit !== null && Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
 
-  const filebaseApiToken = resolveOptionalEnvVar("FILEBASE_API_TOKEN");
+  const accessKeyId = resolveEnvVar("S3_ACCESS_KEY_ID");
+  const secretAccessKey = resolveEnvVar("S3_SECRET_ACCESS_KEY");
+
+  // The Filebase Names (IPNS) API authenticates with the same S3 keys:
+  // Authorization: Bearer base64(ACCESS_KEY:SECRET_KEY). Auto-derive the
+  // token from the S3 keys so IPNS works with only S3 keys + an IPNS label.
+  // FILEBASE_API_TOKEN remains an optional explicit override.
+  const filebaseApiToken =
+    resolveOptionalEnvVar("FILEBASE_API_TOKEN") ??
+    Buffer.from(`${accessKeyId}:${secretAccessKey}`).toString("base64");
   const filebaseIpnsLabel = resolveOptionalEnvVar("FILEBASE_IPNS_LABEL");
 
   return {
@@ -417,8 +434,8 @@ function parseOptions(argv: readonly string[]): UploadOptions {
     limit,
     endpoint: process.env["S3_ENDPOINT"] ?? "https://s3.filebase.io",
     bucket: resolveEnvVar("S3_BUCKET"),
-    accessKeyId: resolveEnvVar("S3_ACCESS_KEY_ID"),
-    secretAccessKey: resolveEnvVar("S3_SECRET_ACCESS_KEY"),
+    accessKeyId,
+    secretAccessKey,
     filebaseApiToken,
     filebaseIpnsLabel,
   };
@@ -699,22 +716,18 @@ async function main(): Promise<void> {
     }
   }
 
-  // 5. IPNS upsert (if API token is set and index was uploaded)
+  // 5. IPNS upsert (token is auto-derived from S3 keys; only needs a label)
   let ipnsName: string | undefined;
   if (hasShardedIndex && indexCid !== undefined) {
-    if (options.filebaseApiToken !== null) {
-      if (options.filebaseIpnsLabel === null) {
-        console.warn("[ipns] FILEBASE_IPNS_LABEL is not set — skipping IPNS update. Set it to a label like \"oracle-open-data-lee\".");
-      } else {
-        try {
-          ipnsName = await upsertIpnsPointer(options.filebaseApiToken, options.filebaseIpnsLabel, indexCid);
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          console.error(JSON.stringify({ event: "ipns_update_failed", error: message }));
-        }
-      }
+    if (options.filebaseIpnsLabel === null) {
+      console.warn("[ipns] FILEBASE_IPNS_LABEL is not set — skipping IPNS update. Set it to a label like \"oracle-open-data-lee\".");
     } else {
-      console.log("[ipns] FILEBASE_API_TOKEN not set — skipping IPNS update.");
+      try {
+        ipnsName = await upsertIpnsPointer(options.filebaseApiToken, options.filebaseIpnsLabel, indexCid);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(JSON.stringify({ event: "ipns_update_failed", error: message }));
+      }
     }
   }
 
@@ -750,9 +763,9 @@ async function main(): Promise<void> {
     console.log(`\n=== IPNS ===`);
     console.log(`IPNS name: ${ipnsName}`);
     console.log(`Set ORACLE_OPEN_DATA_IPNS=${ipnsName} in your MCP/NEO environment.\n`);
-  } else if (hasShardedIndex && indexCid !== undefined && options.filebaseApiToken === null) {
+  } else if (hasShardedIndex && indexCid !== undefined && options.filebaseIpnsLabel === null) {
     console.log(`\n=== IPNS ===`);
-    console.log(`IPNS update skipped: FILEBASE_API_TOKEN not set.\n`);
+    console.log(`IPNS update skipped: FILEBASE_IPNS_LABEL not set.\n`);
   }
 
   if (failures.length > 0) {
@@ -761,8 +774,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  const message = err instanceof Error ? err.message : String(err);
-  console.error(JSON.stringify({ event: "upload_failed_fatal", error: message }));
-  process.exit(1);
-});
+const isDirectRun = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (isDirectRun) {
+  main().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(JSON.stringify({ event: "upload_failed_fatal", error: message }));
+    process.exit(1);
+  });
+}

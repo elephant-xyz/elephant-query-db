@@ -6,7 +6,7 @@
 
 - The `export:property-consolidation` run has completed and `.property-consolidation-export/` is present with `manifest.json`, `index.json`, `shards/shard-NNNN.json`, and all `properties/<uuid>.json` files.
 - Filebase S3 credentials are in the vault at `Credentials/filebase-oracle-open-data.md`.
-- (Optional) Filebase API token for IPNS: see [IPNS One-Time Setup](#ipns-one-time-setup).
+- For IPNS, set a label (`FILEBASE_IPNS_LABEL`) — no separate token is needed. The IPNS bearer token is auto-derived from the S3 keys. See [IPNS One-Time Setup](#ipns-one-time-setup).
 - Working directory: `elephant-query-db/`.
 
 ---
@@ -101,20 +101,21 @@ export S3_BUCKET="elephant-oracle-open-data"
 export S3_ENDPOINT="https://s3.filebase.io"   # default; change only if instructed
 ```
 
-### IPNS credentials (optional)
+### IPNS label (recommended)
 
-If you want to update the IPNS mutable pointer after each publish (recommended for production):
+To update the IPNS mutable pointer after each publish (recommended for production), set a label. **No separate token is required** — the IPNS bearer token is auto-derived from the S3 keys above (`base64(S3_ACCESS_KEY_ID:S3_SECRET_ACCESS_KEY)`):
 
 ```bash
-export FILEBASE_API_TOKEN="<api-token from vault>"
 export FILEBASE_IPNS_LABEL="oracle-open-data-lee"   # or your chosen label
 ```
+
+`FILEBASE_API_TOKEN` remains an optional override if you ever need a different token; leave it unset to use the auto-derived one.
 
 Verify all vars are set:
 
 ```bash
 echo "KEY=${S3_ACCESS_KEY_ID:0:8}... BUCKET=${S3_BUCKET} ENDPOINT=${S3_ENDPOINT}"
-echo "IPNS_LABEL=${FILEBASE_IPNS_LABEL} API_TOKEN=${FILEBASE_API_TOKEN:0:8}..."
+echo "IPNS_LABEL=${FILEBASE_IPNS_LABEL}"
 ```
 
 ---
@@ -155,7 +156,7 @@ npm run publish:ipfs-upload 2>&1 | tee .upload-runs/publish-$(date +%Y%m%d-%H%M%
 2. All `shards/shard-NNNN.json` files — in parallel (same semaphore)
 3. `index.json` — only after all shards succeed
 4. `manifest.json` — last, after index.json (back-compat)
-5. IPNS pointer update — only after index.json is uploaded (if `FILEBASE_API_TOKEN` is set)
+5. IPNS pointer update — only after index.json is uploaded (if `FILEBASE_IPNS_LABEL` is set; token auto-derived from S3 keys)
 
 If any step fails, the subsequent steps are skipped. Re-run to resume — the checkpoint skips already-uploaded keys.
 
@@ -234,10 +235,10 @@ The legacy `ORACLE_OPEN_DATA_MANIFEST_CID` is still supported for back-compat bu
 | `S3_SECRET_ACCESS_KEY` | Yes | Filebase S3 secret key |
 | `S3_BUCKET` | Yes | Filebase bucket name (e.g. `elephant-oracle-open-data`) |
 | `S3_ENDPOINT` | No | Filebase S3 endpoint (default: `https://s3.filebase.io`) |
-| `FILEBASE_API_TOKEN` | No* | Filebase REST API bearer token — required for IPNS update |
-| `FILEBASE_IPNS_LABEL` | No* | Label for the IPNS name (e.g. `oracle-open-data-lee`) — required if `FILEBASE_API_TOKEN` is set |
+| `FILEBASE_IPNS_LABEL` | No* | Label for the IPNS name (e.g. `oracle-open-data-lee`) — set this to enable IPNS updates |
+| `FILEBASE_API_TOKEN` | No | Override for the IPNS bearer token. If unset, it is auto-derived as `base64(S3_ACCESS_KEY_ID:S3_SECRET_ACCESS_KEY)` |
 
-*Optional but strongly recommended for production publishes — without IPNS, consumers must track the raw CID manually.
+*Optional but strongly recommended for production publishes — without IPNS, consumers must track the raw CID manually. IPNS needs **only** the S3 keys plus this label; the token is auto-derived.
 
 ---
 
@@ -245,18 +246,21 @@ The legacy `ORACLE_OPEN_DATA_MANIFEST_CID` is still supported for back-compat bu
 
 IPNS (InterPlanetary Name System) provides a **mutable pointer** to the latest index CID. Instead of hardcoding a CID in downstream configs, consumers resolve an IPNS name which always points to the current index.
 
-### Get a Filebase API token
+### Authentication — no extra token needed
 
-1. Log in to [app.filebase.io](https://app.filebase.io)
-2. Navigate to **Settings → API Keys**
-3. Create a new key and copy it
-4. Save it to the vault: `Credentials/filebase-oracle-open-data.md`
+The Filebase IPNS API (`https://api.filebase.io/v1/names`) authenticates with the **same S3 keys** used for uploads:
+
+```
+Authorization: Bearer base64(S3_ACCESS_KEY_ID:S3_SECRET_ACCESS_KEY)
+```
+
+The script derives this automatically. There is **no separate API token to create** — just set `FILEBASE_IPNS_LABEL`. `FILEBASE_API_TOKEN` exists only as an optional override.
 
 ### How IPNS works in this publish flow
 
-- On the **first publish**: the script creates a new IPNS name with the label from `FILEBASE_IPNS_LABEL` and points it at the uploaded `index.json` CID.
-- On **subsequent publishes**: the script finds the existing IPNS name by label and updates the pointer to the new `index.json` CID.
-- The returned IPNS name (e.g. `k51q...`) is stable across publishes — only the target CID changes.
+- On the **first publish**: the script `GET`s `/v1/names/{label}` (404 → not found), then `POST`s `/v1/names` with `{label, cid}` to create the name pointing at the uploaded `index.json` CID.
+- On **subsequent publishes**: the script finds the existing name by label and `PUT`s `/v1/names/{label}` with `{cid}` to update the pointer to the new `index.json` CID (the API bumps the record `sequence`).
+- The returned IPNS name — the `network_key` (e.g. `k51q...`) — is stable across publishes; only the target CID changes.
 
 ### Downstream consumption
 
