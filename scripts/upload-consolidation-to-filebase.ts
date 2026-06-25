@@ -400,7 +400,16 @@ function parseOptions(argv: readonly string[]): UploadOptions {
   const parsedLimit = limitRaw !== undefined ? Number.parseInt(limitRaw, 10) : null;
   const limit = parsedLimit !== null && Number.isFinite(parsedLimit) && parsedLimit > 0 ? parsedLimit : null;
 
-  const filebaseApiToken = resolveOptionalEnvVar("FILEBASE_API_TOKEN");
+  const accessKeyId = resolveEnvVar("S3_ACCESS_KEY_ID");
+  const secretAccessKey = resolveEnvVar("S3_SECRET_ACCESS_KEY");
+
+  // The Filebase Names (IPNS) API bearer is base64("ACCESS_KEY:SECRET_KEY"). Derive it
+  // from the S3 keys when FILEBASE_API_TOKEN is unset so IPNS publishing needs only the
+  // S3 keys + a label — otherwise the run silently skips the IPNS pointer update and
+  // consumers keep resolving the previous CID.
+  const filebaseApiToken =
+    resolveOptionalEnvVar("FILEBASE_API_TOKEN") ??
+    Buffer.from(`${accessKeyId}:${secretAccessKey}`).toString("base64");
   const filebaseIpnsLabel = resolveOptionalEnvVar("FILEBASE_IPNS_LABEL");
 
   return {
@@ -410,8 +419,8 @@ function parseOptions(argv: readonly string[]): UploadOptions {
     limit,
     endpoint: process.env["S3_ENDPOINT"] ?? "https://s3.filebase.io",
     bucket: resolveEnvVar("S3_BUCKET"),
-    accessKeyId: resolveEnvVar("S3_ACCESS_KEY_ID"),
-    secretAccessKey: resolveEnvVar("S3_SECRET_ACCESS_KEY"),
+    accessKeyId,
+    secretAccessKey,
     filebaseApiToken,
     filebaseIpnsLabel,
   };
