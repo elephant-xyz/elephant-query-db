@@ -1,0 +1,22 @@
+# Container image for the serial appraisal re-load Fargate task.
+# Wraps the EXISTING bulk loader (unchanged) plus the migrate/clear/validate steps.
+FROM node:22-bookworm-slim
+
+WORKDIR /app
+
+# Copy source BEFORE install: the repo's `prepare` lifecycle runs `tsc` during
+# `npm ci`, so tsconfig + src must be present or the install fails.
+COPY package.json package-lock.json tsconfig.json tsconfig.build.json drizzle.config.ts ./
+COPY src ./src
+COPY scripts ./scripts
+COPY migrations ./migrations
+
+# Install deps (incl. tsx, a devDependency used to run the TS scripts directly).
+# Uses `npm install` (not `npm ci`) because the committed package-lock.json is out of
+# sync with package.json (missing esbuild@0.28.1); ci would refuse. install reconciles it.
+RUN npm install --no-audit --no-fund
+
+RUN chmod +x scripts/reload-appraisal-entrypoint.sh
+
+# DATABASE_URL, APPRAISAL_PREFIX, etc. are injected by the task definition / Step Functions.
+ENTRYPOINT ["sh", "scripts/reload-appraisal-entrypoint.sh"]
