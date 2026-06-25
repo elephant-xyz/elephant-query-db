@@ -4,9 +4,9 @@ import { dirname, join } from "node:path";
 
 import {
   PutObjectCommand,
+  type PutObjectCommandInput,
+  type PutObjectCommandOutput,
   S3Client,
-  type ServiceInputTypes,
-  type ServiceOutputTypes,
 } from "@aws-sdk/client-s3";
 import type {
   DeserializeHandler,
@@ -48,14 +48,11 @@ type Checkpoint = {
 };
 
 type FilebaseIpnsItem = {
-  readonly _id: string;
   readonly label: string;
-  readonly sequence: number;
-  readonly record?: string;
-};
-
-type FilebaseIpnsListResponse = {
-  readonly items: FilebaseIpnsItem[];
+  readonly network_key: string;
+  readonly cid?: string;
+  readonly sequence?: number;
+  readonly enabled?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -185,26 +182,20 @@ async function putObjectAndCaptureCid(
 ): Promise<string | undefined> {
   let capturedHeaders: Record<string, string> | undefined;
 
-  const captureMiddleware: DeserializeMiddleware<ServiceInputTypes, ServiceOutputTypes> =
+  const captureMiddleware: DeserializeMiddleware<PutObjectCommandInput, PutObjectCommandOutput> =
     (
-      next: DeserializeHandler<ServiceInputTypes, ServiceOutputTypes>,
+      next: DeserializeHandler<PutObjectCommandInput, PutObjectCommandOutput>,
       _context: HandlerExecutionContext
     ) =>
     async (
-      args: DeserializeHandlerArguments<ServiceInputTypes>
-    ): Promise<DeserializeHandlerOutput<ServiceOutputTypes>> => {
+      args: DeserializeHandlerArguments<PutObjectCommandInput>
+    ): Promise<DeserializeHandlerOutput<PutObjectCommandOutput>> => {
       const result = await next(args);
       if (isRawHttpResponse(result.response)) {
         capturedHeaders = result.response.headers;
       }
       return result;
     };
-
-  client.middlewareStack.add(captureMiddleware, {
-    step: "deserialize",
-    name: "captureFilebaseCidHeader",
-    priority: "low",
-  });
 
   const command = new PutObjectCommand({
     Bucket: params.bucket,
@@ -213,8 +204,16 @@ async function putObjectAndCaptureCid(
     ContentType: params.contentType,
   });
 
+  // Attach the capture middleware to THIS command's stack, not the shared client's.
+  // Each command instance has its own stack, so concurrent uploads (concurrency > 1)
+  // don't collide on the fixed middleware name (was: "Duplicate middleware name").
+  command.middlewareStack.add(captureMiddleware, {
+    step: "deserialize",
+    name: "captureFilebaseCidHeader",
+    priority: "low",
+  });
+
   await client.send(command);
-  client.middlewareStack.remove("captureFilebaseCidHeader");
 
   return capturedHeaders?.["x-amz-meta-cid"];
 }
@@ -294,72 +293,66 @@ function logProgress(state: ProgressState): void {
 // Filebase IPNS REST API helpers
 // ---------------------------------------------------------------------------
 
-async function listIpnsNames(apiToken: string): Promise<FilebaseIpnsItem[]> {
-  const response = await fetch("https://api.filebase.io/v1/ipns", {
+// Filebase mutable IPNS pointers live under the Names API: /v1/names, keyed by
+// label in the URL path (NOT /v1/ipns with an _id — that path 404s). The IPNS
+// name consumers resolve is the record's `network_key` (k51q…).
+const FILEBASE_NAMES_API = "https://api.filebase.io/v1/names";
+
+async function getIpnsName(apiToken: string, label: string): Promise<FilebaseIpnsItem | null> {
+  const response = await fetch(`${FILEBASE_NAMES_API}/${encodeURIComponent(label)}`, {
     method: "GET",
-    headers: {
-      Authorization: `Bearer ${apiToken}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${apiToken}` },
   });
-
+  if (response.status === 404) return null;
   if (!response.ok) {
-    throw new Error(`Filebase IPNS list failed: ${response.status} ${response.statusText}`);
+    throw new Error(`Filebase IPNS get failed: ${response.status} ${response.statusText}`);
   }
-
-  const body = (await response.json()) as FilebaseIpnsListResponse;
-  return body.items;
+  return (await response.json()) as FilebaseIpnsItem;
 }
 
-async function createIpnsName(apiToken: string, label: string): Promise<FilebaseIpnsItem> {
-  const response = await fetch("https://api.filebase.io/v1/ipns", {
+async function createIpnsName(apiToken: string, label: string, cid: string): Promise<void> {
+  const response = await fetch(FILEBASE_NAMES_API, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ name: label, enabled: true }),
+    body: JSON.stringify({ label, cid, enabled: true }),
   });
-
   if (!response.ok) {
     throw new Error(`Filebase IPNS create failed: ${response.status} ${response.statusText}`);
   }
-
-  return (await response.json()) as FilebaseIpnsItem;
 }
 
-async function updateIpnsName(apiToken: string, id: string, label: string, cid: string): Promise<void> {
-  const response = await fetch(`https://api.filebase.io/v1/ipns/${id}`, {
+async function updateIpnsName(apiToken: string, label: string, cid: string): Promise<void> {
+  const response = await fetch(`${FILEBASE_NAMES_API}/${encodeURIComponent(label)}`, {
     method: "PUT",
     headers: {
       Authorization: `Bearer ${apiToken}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ name: label, cid, enabled: true }),
+    body: JSON.stringify({ cid }),
   });
-
   if (!response.ok) {
     throw new Error(`Filebase IPNS update failed: ${response.status} ${response.statusText}`);
   }
 }
 
 async function upsertIpnsPointer(apiToken: string, label: string, indexCid: string): Promise<string> {
-  const items = await listIpnsNames(apiToken);
-  let existing = items.find((item) => item.label === label);
+  const existing = await getIpnsName(apiToken, label);
 
-  if (existing === undefined) {
+  if (existing === null) {
     console.log(JSON.stringify({ event: "ipns_creating", label }));
-    existing = await createIpnsName(apiToken, label);
+    await createIpnsName(apiToken, label, indexCid);
+  } else {
+    await updateIpnsName(apiToken, label, indexCid);
   }
 
-  await updateIpnsName(apiToken, existing._id, label, indexCid);
+  // Re-read to get the resolved IPNS name (network_key, e.g. k51q…) and confirm the pointer.
+  const record = await getIpnsName(apiToken, label);
+  const ipnsName = record?.network_key ?? label;
 
-  // Use the record field (the actual IPNS name like k51q...) if available, else _id
-  const ipnsName = (existing.record !== undefined && existing.record.length > 0)
-    ? existing.record
-    : existing._id;
-
-  console.log(JSON.stringify({ event: "ipns_updated", label, id: existing._id, ipnsName, indexCid }));
+  console.log(JSON.stringify({ event: "ipns_updated", label, ipnsName, indexCid }));
   return ipnsName;
 }
 
@@ -559,7 +552,10 @@ async function main(): Promise<void> {
   // 1. Upload property files in parallel
   const uploadTasks = entries.map((entry) => {
     const key = `properties/${entry.propertyId}.json`;
-    const absolutePath = join(options.exportDir, entry.filePath);
+    // Use the relative key, not entry.filePath: the manifest stores filePath WITH the
+    // export-dir prefix already, so join(exportDir, filePath) would double it
+    // (".property-consolidation-export/.property-consolidation-export/...").
+    const absolutePath = join(options.exportDir, key);
 
     if (alreadyUploaded.has(key)) {
       progress.skipped += 1;

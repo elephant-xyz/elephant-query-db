@@ -401,6 +401,7 @@ type AddressRow = {
   postal_code: string | null;
   latitude: string | null;
   longitude: string | null;
+  unnormalized_address: string | null;
   normalized_address_key: string | null;
 };
 
@@ -755,6 +756,70 @@ function normalizeParcelIdentifier(identifier: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Unnormalized address parsing
+// ---------------------------------------------------------------------------
+
+export type ParsedUnnormalizedAddress = {
+  readonly street: string | null;
+  readonly city: string | null;
+  readonly postalCode: string | null;
+};
+
+const TRAILING_STATE_ZIP_RE = /\b[A-Za-z]{2}\s+(\d{5})(?:-\d{4})?\s*$/;
+const TRAILING_ZIP_RE = /\b(\d{5})(?:-\d{4})?\s*$/;
+
+/**
+ * Parse a free-text single-line address in the standard US form
+ * "STREET, CITY, STATE ZIP" back into discrete street / city / ZIP fields.
+ *
+ * The lee_appraiser source stores addresses ONLY as this free-text string in
+ * `addresses.unnormalized_address`; the structured street_* / city_name columns are
+ * null. The NEO app renders street and city as separate fields, so we split them
+ * back apart here.
+ *
+ * State is deliberately NOT returned: the DB `state_code` (only ever 'FL' or null,
+ * never a wrong value) is authoritative, and NEO falls back to the parcel's
+ * stateCode (FL for 100% of parcels). A parsed state token would inject wrong
+ * source values (e.g. "MI", "NC") into the ~37k rows whose state_code is null.
+ */
+export function parseUnnormalizedAddress(
+  value: string | null | undefined,
+): ParsedUnnormalizedAddress {
+  const empty: ParsedUnnormalizedAddress = { street: null, city: null, postalCode: null };
+  if (value === null || value === undefined) return empty;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return empty;
+
+  const segments = trimmed
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (segments.length === 0) return empty;
+
+  // Peel a trailing "STATE ZIP" (or bare ZIP) off the final segment.
+  let postalCode: string | null = null;
+  const last = segments[segments.length - 1] ?? "";
+  const stateZip = TRAILING_STATE_ZIP_RE.exec(last);
+  const zipOnly = TRAILING_ZIP_RE.exec(last);
+  if (stateZip?.[1] !== undefined) {
+    postalCode = stateZip[1];
+    const head = last.replace(TRAILING_STATE_ZIP_RE, "").trim();
+    if (head.length > 0) segments[segments.length - 1] = head;
+    else segments.pop();
+  } else if (zipOnly?.[1] !== undefined) {
+    postalCode = zipOnly[1];
+    const head = last.replace(TRAILING_ZIP_RE, "").trim();
+    if (head.length > 0) segments[segments.length - 1] = head;
+    else segments.pop();
+  }
+
+  const street = segments.length > 0 ? (segments[0] ?? null) : null;
+  const cityParts = segments.slice(1);
+  const city = cityParts.length > 0 ? cityParts.join(", ") : null;
+  return { street, city, postalCode };
+}
+
+// ---------------------------------------------------------------------------
 // Contractor name normalization (mirrors catalog commercial-contractor-quality-overlay.mjs)
 // ---------------------------------------------------------------------------
 
@@ -844,17 +909,22 @@ type BbbProfileWithChildren = {
 export function assemblePropertyRecord(params: AssembleParams): ConsolidatedProperty {
   const { property, parcel, address, county, collectedAt } = params;
 
-  const street = address !== null
+  const structuredStreet = address !== null
     ? [address.street_number, address.street_name, address.street_suffix_type]
         .filter((part): part is string => part !== null && part.length > 0)
         .join(" ") || null
     : null;
 
+  // Appraisal addresses have only `unnormalized_address` populated (structured
+  // street_* and city_name columns are null); parse it so street/city/zip are not lost.
+  // Structured columns, when present, always win over the parsed fallback.
+  const parsed = parseUnnormalizedAddress(address?.unnormalized_address ?? null);
+
   const addressShape: AddressShape = {
-    street,
-    city: address?.city_name ?? null,
+    street: structuredStreet ?? parsed.street,
+    city: address?.city_name ?? parsed.city,
     state: address?.state_code ?? null,
-    postalCode: address?.postal_code ?? null,
+    postalCode: address?.postal_code ?? parsed.postalCode,
     latitude: address?.latitude ?? null,
     longitude: address?.longitude ?? null,
   };
@@ -1336,7 +1406,8 @@ async function fetchAddresses(pool: Pool, addressIds: readonly string[]): Promis
   if (addressIds.length === 0) return [];
   const result = await pool.query<AddressRow>(
     `SELECT address_id, street_number, street_name, street_suffix_type,
-            city_name, state_code, postal_code, latitude, longitude, normalized_address_key
+            city_name, state_code, postal_code, latitude, longitude,
+            unnormalized_address, normalized_address_key
      FROM addresses WHERE address_id = ANY($1::uuid[])`,
     [addressIds],
   );
@@ -2022,8 +2093,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  const message = err instanceof Error ? err.message : String(err);
-  console.error(JSON.stringify({ event: "property_consolidation_export_failed", error: message }));
-  process.exit(1);
-});
+// Only run when invoked directly as a script — not when imported (e.g. by tests).
+// Mirrors the entrypoint guard used by the sibling scripts in this directory.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(JSON.stringify({ event: "property_consolidation_export_failed", error: message }));
+    process.exit(1);
+  });
+}

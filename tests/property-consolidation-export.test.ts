@@ -10,6 +10,7 @@ import {
   EMPTY_MANIFEST_STATS,
   normalizeContractorName,
   parseOptions,
+  parseUnnormalizedAddress,
 } from "../scripts/run-property-consolidation-export.js";
 
 // ---------------------------------------------------------------------------
@@ -142,6 +143,7 @@ const mockAddress = {
   postal_code: "33901",
   latitude: "26.640628",
   longitude: "-81.872605",
+  unnormalized_address: "123 Main St, Fort Myers, FL 33901",
   normalized_address_key: "123-main-st-fort-myers-fl-33901",
 };
 
@@ -535,6 +537,123 @@ describe("assemblePropertyRecord", () => {
     expect(result.address.latitude).toBeNull();
   });
 
+  it("derives street/city/postalCode from unnormalized_address when structured columns are null (appraisal source)", () => {
+    const appraisalAddress = {
+      address_id: "addr-appraisal-1",
+      street_number: null,
+      street_name: null,
+      street_suffix_type: null,
+      city_name: null,
+      state_code: "FL",
+      postal_code: "33905",
+      latitude: null,
+      longitude: null,
+      unnormalized_address: "5845 CORPORATION CIRCLE, FORT MYERS, FL 33905",
+      normalized_address_key: "5845-corporation-circle-fort-myers-fl-33905",
+    };
+
+    const result = assemblePropertyRecord({
+      property: mockProperty,
+      parcel: mockParcel,
+      address: appraisalAddress,
+      taxes: [],
+      salesHistories: [],
+      structures: [],
+      layouts: [],
+      lots: [],
+      floodStorm: [],
+      utilities: [],
+      ownerships: [],
+      deeds: [],
+      files: [],
+      geometries: [],
+      valuations: [],
+      permits: [],
+      sunbizTenants: [],
+      bbbProfiles: [],
+      county: "lee",
+      collectedAt: "2026-06-18T10:00:00.000Z",
+    });
+
+    expect(result.address.street).toBe("5845 CORPORATION CIRCLE");
+    expect(result.address.city).toBe("FORT MYERS");
+    expect(result.address.state).toBe("FL");
+    expect(result.address.postalCode).toBe("33905");
+  });
+
+  it("leaves state null (not a wrong parsed value) when state_code is null", () => {
+    const appraisalAddress = {
+      address_id: "addr-appraisal-2",
+      street_number: null,
+      street_name: null,
+      street_suffix_type: null,
+      city_name: null,
+      state_code: null,
+      postal_code: "33936",
+      latitude: null,
+      longitude: null,
+      // Source carries a wrong state token "MI" for a Lee County (FL) property.
+      unnormalized_address: "331 JOEL BOULEVARD 108, LEHIGH ACRES, MI 33936",
+      normalized_address_key: "331-joel-boulevard-108-lehigh-acres-mi-33936",
+    };
+
+    const result = assemblePropertyRecord({
+      property: mockProperty,
+      parcel: mockParcel,
+      address: appraisalAddress,
+      taxes: [],
+      salesHistories: [],
+      structures: [],
+      layouts: [],
+      lots: [],
+      floodStorm: [],
+      utilities: [],
+      ownerships: [],
+      deeds: [],
+      files: [],
+      geometries: [],
+      valuations: [],
+      permits: [],
+      sunbizTenants: [],
+      bbbProfiles: [],
+      county: "lee",
+      collectedAt: "2026-06-18T10:00:00.000Z",
+    });
+
+    expect(result.address.street).toBe("331 JOEL BOULEVARD 108");
+    expect(result.address.city).toBe("LEHIGH ACRES");
+    // state_code is null and we never inject the wrong parsed "MI" — NEO falls back to parcel.stateCode.
+    expect(result.address.state).toBeNull();
+  });
+
+  it("prefers structured street/city columns over the unnormalized fallback", () => {
+    const result = assemblePropertyRecord({
+      property: mockProperty,
+      parcel: mockParcel,
+      address: mockAddress, // has both structured cols and an unnormalized_address
+      taxes: [],
+      salesHistories: [],
+      structures: [],
+      layouts: [],
+      lots: [],
+      floodStorm: [],
+      utilities: [],
+      ownerships: [],
+      deeds: [],
+      files: [],
+      geometries: [],
+      valuations: [],
+      permits: [],
+      sunbizTenants: [],
+      bbbProfiles: [],
+      county: "lee",
+      collectedAt: "2026-06-18T10:00:00.000Z",
+    });
+
+    expect(result.address.street).toBe("123 Main St");
+    expect(result.address.city).toBe("Fort Myers");
+  });
+
   it("maps permits with nested children", () => {
     const permitRow = {
       property_improvement_id: "permit-uuid-1",
@@ -876,6 +995,7 @@ describe("batched assembly produces identical output to non-batched assembly", (
     postal_code: "33990",
     latitude: "26.563",
     longitude: "-81.949",
+    unnormalized_address: "100 Commerce Blvd, Cape Coral, FL 33990",
     normalized_address_key: `key-${addressId}`,
   });
 
@@ -1064,5 +1184,72 @@ describe("normalizeContractorName", () => {
     ];
     const keys = variants.map(normalizeContractorName);
     expect(new Set(keys).size).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseUnnormalizedAddress — splits the free-text "STREET, CITY, STATE ZIP"
+// (the only address form the lee_appraiser source provides) into discrete fields.
+// Cases use real values sampled from prod (ep-mute-leaf).
+// ---------------------------------------------------------------------------
+
+describe("parseUnnormalizedAddress", () => {
+  it("splits a standard three-part address", () => {
+    expect(parseUnnormalizedAddress("5845 CORPORATION CIRCLE, FORT MYERS, FL 33905")).toEqual({
+      street: "5845 CORPORATION CIRCLE",
+      city: "FORT MYERS",
+      postalCode: "33905",
+    });
+  });
+
+  it("keeps a unit/suffix number in the street segment", () => {
+    expect(parseUnnormalizedAddress("331 JOEL BOULEVARD 108, LEHIGH ACRES, MI 33936")).toEqual({
+      street: "331 JOEL BOULEVARD 108",
+      city: "LEHIGH ACRES",
+      postalCode: "33936",
+    });
+  });
+
+  it("handles a short street name", () => {
+    expect(parseUnnormalizedAddress("5 JUTE, ALVA, FL 33920")).toEqual({
+      street: "5 JUTE",
+      city: "ALVA",
+      postalCode: "33920",
+    });
+  });
+
+  it("peels state+zip even when the city/state/zip share one segment", () => {
+    expect(parseUnnormalizedAddress("100 Commerce Blvd, Cape Coral FL 33990")).toEqual({
+      street: "100 Commerce Blvd",
+      city: "Cape Coral",
+      postalCode: "33990",
+    });
+  });
+
+  it("returns nulls for null, undefined, and empty input", () => {
+    const empty = { street: null, city: null, postalCode: null };
+    expect(parseUnnormalizedAddress(null)).toEqual(empty);
+    expect(parseUnnormalizedAddress(undefined)).toEqual(empty);
+    expect(parseUnnormalizedAddress("   ")).toEqual(empty);
+  });
+
+  it("returns street only when there is no city/state/zip tail", () => {
+    expect(parseUnnormalizedAddress("123 LONE STREET")).toEqual({
+      street: "123 LONE STREET",
+      city: null,
+      postalCode: null,
+    });
+  });
+
+  // Degenerate two-segment form "STREET, STATE ZIP" (no city). Prod currently
+  // always carries a city in segment 1 (validated: city 100% non-null over 20k
+  // rows), so this should not occur — but pin the behavior so a future data shift
+  // surfaces as a loud test failure rather than silently reverting to null cities.
+  it("yields null city for a two-segment 'STREET, STATE ZIP' with no city", () => {
+    expect(parseUnnormalizedAddress("123 MAIN ST, FL 33901")).toEqual({
+      street: "123 MAIN ST",
+      city: null,
+      postalCode: "33901",
+    });
   });
 });
