@@ -10,3 +10,5 @@ coverage/
 .env*.local
 .loader-runs/
 downloads/
+.property-consolidation-export/
+.upload-runs/
