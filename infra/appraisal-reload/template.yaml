@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Serial appraisal re-load for the Lee County query DB. A single Fargate task runs the
+  existing bulk loader (migrate -> FK-safe clear -> load -> validate-by-folio). Step
+  Functions orchestrates it with a cost-metric step and retries. No EC2 vCPU quota needed
+  (Fargate), no 15-min limit (the clear + serial merge are too heavy for Lambda).
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: ECR image URI (repo:tag) built from Dockerfile.reload.
+  DatabaseUrlSecretArn:
+    Type: String
+    Description: Secrets Manager ARN holding the DIRECT (unpooled) Neon DATABASE_URL (ep-mute-leaf).
+  AppraisalBucketName:
+    Type: String
+    Default: elephant-oracle-node-environmentbucket-mmsoo3xbdi80
+  AppraisalPrefix:
+    Type: String
+    Default: outputs/lee-property-first-seed/lee-fullcounty-20260619/
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets with egress to S3 + Neon (public subnet, or private + NAT).
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group allowing outbound 443/5432.
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+  TaskCpu:
+    Type: String
+    Default: "2048"
+  TaskMemory:
+    Type: String
+    Default: "8192"
+  BatchSize:
+    Type: String
+    Default: "20000"
+  ExpectedMinParcels:
+    Type: String
+    Default: "510000"
+  ExpectedParcels:
+    Type: String
+    Default: ""
+    Description: Exact distinct-folio target from S3 source (e.g. 511695). When set, the in-task validate asserts distinct_folios == this (spec-level reconciliation, not a floor).
+  ServiceName:
+    Type: String
+    Default: appraisal-reload
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ServiceName}"
+      RetentionInDays: 30
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ServiceName
+
+  # Pulls the image, injects the DATABASE_URL secret, writes logs.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadDatabaseSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DatabaseUrlSecretArn
+
+  # The running container: read appraisal artifacts from S3, emit metrics.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppraisalReloadTaskAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub "arn:aws:s3:::${AppraisalBucketName}"
+                  - !Sub "arn:aws:s3:::${AppraisalBucketName}/*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ServiceName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      EphemeralStorage:
+        SizeInGiB: 50
+      ContainerDefinitions:
+        - Name: reload
+          Image: !Ref ImageUri
+          Essential: true
+          Environment:
+            - { Name: APPRAISAL_PREFIX, Value: !Ref AppraisalPrefix }
+            - { Name: APPRAISAL_BUCKET, Value: !Ref AppraisalBucketName }
+            - { Name: BATCH_SIZE, Value: !Ref BatchSize }
+            - { Name: EXPECTED_MIN_PARCELS, Value: !Ref ExpectedMinParcels }
+            - { Name: EXPECTED_PARCELS, Value: !Ref ExpectedParcels }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+          Secrets:
+            - { Name: DATABASE_URL, ValueFrom: !Ref DatabaseUrlSecretArn }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: reload
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RunReloadTask
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ecs:RunTask, ecs:StopTask, ecs:DescribeTasks]
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt ExecutionRole.Arn, !GetAtt TaskRole.Arn]
+              - Effect: Allow
+                Action: [events:PutTargets, events:PutRule, events:DescribeRule]
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref ServiceName
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionSubstitutions:
+        ClusterArn: !GetAtt Cluster.Arn
+        TaskDefArn: !Ref TaskDefinition
+        Subnet0: !Select [0, !Ref SubnetIds]
+        SecurityGroup: !Ref SecurityGroupId
+        AssignPublicIp: !Ref AssignPublicIp
+      DefinitionString: |
+        {
+          "Comment": "Serial appraisal re-load (single Fargate task: migrate -> clear -> load -> validate).",
+          "StartAt": "RunReload",
+          "States": {
+            "RunReload": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "Cluster": "${ClusterArn}",
+                "TaskDefinition": "${TaskDefArn}",
+                "LaunchType": "FARGATE",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ["${Subnet0}"],
+                    "SecurityGroups": ["${SecurityGroup}"],
+                    "AssignPublicIp": "${AssignPublicIp}"
+                  }
+                }
+              },
+              "Retry": [
+                { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 2, "BackoffRate": 2 }
+              ],
+              "End": true
+            }
+          }
+        }
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref StateMachine
+  ClusterName:
+    Value: !Ref Cluster
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
