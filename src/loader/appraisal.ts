@@ -475,7 +475,9 @@ function mapKnownAppraisalRecord(
     return [mapPropertyChild("flood_storm_information", record, fileName, requestIdentifier, artifactUri, FLOOD_COLUMNS, sourceSystem)];
   }
   if (fileName === "fact_sheet.json") return [mapFactSheet(record, requestIdentifier, artifactUri, sourceSystem)];
-  if (fileName === "geometry.json") return [mapGeometry(record, requestIdentifier, artifactUri, sourceSystem)];
+  if (fileName === "geometry.json" || /^geometry_\d+\.json$/.test(fileName)) {
+    return [mapGeometry(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
+  }
   if (/^deed_/.test(fileName)) return [mapDeed(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
   if (/^file_/.test(fileName)) return [mapFile(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
   return null;
@@ -883,11 +885,16 @@ function mapFactSheet(
 
 function mapGeometry(
   record: JsonObject,
+  fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
   sourceSystem: SourceSystem,
 ): PreparedRow {
-  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "geometry", "geometry");
+  // Derive the key part from the file name so multiple geometries per parcel
+  // (`geometry_1.json`, `geometry_2.json`, …) don't collide. The legacy
+  // single `geometry.json` still maps to key part "geometry" (backward compat).
+  const geometryKeyPart = fileName.replace(/\.json$/, "");
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "geometry", geometryKeyPart);
   return {
     tableName: "geometries",
     references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
