@@ -693,15 +693,30 @@ async function findBusinessRegistrationIdByDocumentNumber(
 }
 
 function inferSourceSystemFromSourceRecordKey(sourceRecordKey: string): SourceSystem | null {
-  if (sourceRecordKey.startsWith("bbb:")) return "bbb";
-  if (sourceRecordKey.startsWith("lee_appraiser:")) return "lee_appraiser";
-  if (sourceRecordKey.startsWith("lee_accela:")) return "lee_accela";
-  if (sourceRecordKey.startsWith("sunbiz:")) return "sunbiz";
-  return null;
+  // Source record keys are `${source_system}:...`, so the source_system is the
+  // prefix before the first colon. Validating it through readSourceSystem keeps
+  // county-parameterized systems (e.g. `orange_appraiser`) working while still
+  // rejecting unrecognized prefixes (which fall back to a key-only lookup).
+  const separatorIndex = sourceRecordKey.indexOf(":");
+  if (separatorIndex <= 0) return null;
+  return readSourceSystem(sourceRecordKey.slice(0, separatorIndex));
 }
 
+const APPRAISER_SOURCE_SYSTEM_SUFFIX = "_appraiser";
+const PERMIT_SOURCE_SYSTEM_SUFFIX = "_accela";
+
 function readSourceSystem(value: unknown): SourceSystem | null {
-  if (value === "bbb" || value === "lee_appraiser" || value === "lee_accela" || value === "sunbiz") return value;
+  if (value === "bbb" || value === "sunbiz") return value;
+  if (typeof value !== "string") return null;
+  // Admit county-parameterized appraiser/permit systems (`<county>_appraiser`,
+  // `<county>_accela`) but require a non-empty county prefix so bare suffixes
+  // and unrelated strings are rejected.
+  if (value.length > APPRAISER_SOURCE_SYSTEM_SUFFIX.length && value.endsWith(APPRAISER_SOURCE_SYSTEM_SUFFIX)) {
+    return value as SourceSystem;
+  }
+  if (value.length > PERMIT_SOURCE_SYSTEM_SUFFIX.length && value.endsWith(PERMIT_SOURCE_SYSTEM_SUFFIX)) {
+    return value as SourceSystem;
+  }
   return null;
 }
 
