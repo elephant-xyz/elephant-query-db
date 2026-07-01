@@ -1374,9 +1374,22 @@ export async function writeShardedIndex(
 // Bulk DB query helpers
 // ---------------------------------------------------------------------------
 
-async function fetchProperties(pool: Pool, limit: number | null): Promise<PropertyRow[]> {
+// Map the --county option to the appraisal source_system stored in the DB.
+// Defaults to `<county>_appraiser` with non-alphanumerics collapsed to underscores,
+// so new counties work without code changes (e.g. "palm-beach" -> "palm_beach_appraiser").
+function appraisalSourceForCounty(county: string): string {
+  const slug = county.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return slug.endsWith("_appraiser") ? slug : `${slug}_appraiser`;
+}
+
+async function fetchProperties(
+  pool: Pool,
+  limit: number | null,
+  sourceSystem: string,
+): Promise<PropertyRow[]> {
   const limitClause = limit !== null ? `LIMIT ${limit}` : "";
-  const result = await pool.query<PropertyRow>(`
+  const result = await pool.query<PropertyRow>(
+    `
     SELECT
       property_id, parcel_id, address_id, parcel_identifier,
       property_type, property_usage_type, structure_form, build_status,
@@ -1385,10 +1398,12 @@ async function fetchProperties(pool: Pool, limit: number | null): Promise<Proper
       number_of_units, subdivision, zoning, property_legal_description_text,
       source_system
     FROM properties
-    WHERE source_system = 'lee_appraiser'
+    WHERE source_system = $1
     ORDER BY property_id
     ${limitClause}
-  `);
+  `,
+    [sourceSystem],
+  );
   return result.rows;
 }
 
@@ -1759,7 +1774,8 @@ async function main(): Promise<void> {
     await mkdir(propertiesDir, { recursive: true });
 
     // 1. Fetch all property rows (lightweight — only scalar columns, no related data)
-    const allProperties = await fetchProperties(pg, options.limit);
+    const sourceSystem = appraisalSourceForCounty(options.county);
+    const allProperties = await fetchProperties(pg, options.limit, sourceSystem);
     const propertyCount = allProperties.length;
 
     console.log(JSON.stringify({
