@@ -14,12 +14,24 @@
  *   2. total parcel rows == distinct folios (no collapse, no duplicate folios).
  *   3. zero orphaned appraisal properties (parcel_id IS NULL) — the collapse symptom.
  *   4. letter-STRAP parcels present (post-fix the raw STRAP is stored; a near-zero count would
- *      mean the digits-only normalization regressed).
+ *      mean the digits-only normalization regressed). This is a LEE-specific regression guard:
+ *      counties whose folios are purely numeric legitimately have zero letter-STRAPs, so it is
+ *      gated behind EXPECT_LETTER_STRAPS (default true to preserve Lee behavior; set to a falsy
+ *      value like "0"/"false" for numeric-folio counties such as Palm Beach).
+ *
+ * COUNTY-GENERIC: every count is scoped to the loaded county via source_system = JURISDICTION_KEY
+ * (default lee_appraiser). Without this, a shared multi-county DB would validate PB against the
+ * global parcel count (i.e. Lee's rows), which is wrong.
  * Exits non-zero on any failure so the Fargate task / Step Functions run fails loudly.
  */
 import { Client } from "pg";
 
-const SOURCE_SYSTEM = "lee_appraiser";
+const SOURCE_SYSTEM = process.env.JURISDICTION_KEY?.trim() || "lee_appraiser";
+
+function envFlag(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === "") return fallback;
+  return !["0", "false", "no", "off"].includes(value.trim().toLowerCase());
+}
 
 async function main(): Promise<void> {
   const databaseUrl = process.env.DATABASE_URL;
@@ -27,6 +39,7 @@ async function main(): Promise<void> {
     throw new Error("DATABASE_URL is required");
   }
   const expectedMin = Number(process.env.EXPECTED_MIN_PARCELS ?? "510000");
+  const expectLetterStraps = envFlag(process.env.EXPECT_LETTER_STRAPS, true);
   const expectedExactRaw = process.env.EXPECTED_PARCELS;
   const expectedExact = expectedExactRaw !== undefined && expectedExactRaw.trim() !== ""
     ? Number(expectedExactRaw)
@@ -37,9 +50,9 @@ async function main(): Promise<void> {
   try {
     const { rows } = await client.query(`
       SELECT
-        (SELECT count(*) FROM parcels) AS total_parcels,
-        (SELECT count(DISTINCT request_identifier) FROM parcels) AS distinct_folios,
-        (SELECT count(*) FROM parcels WHERE parcel_identifier ~ '[A-Za-z]') AS letter_straps,
+        (SELECT count(*) FROM parcels WHERE source_system = $1) AS total_parcels,
+        (SELECT count(DISTINCT request_identifier) FROM parcels WHERE source_system = $1) AS distinct_folios,
+        (SELECT count(*) FROM parcels WHERE source_system = $1 AND parcel_identifier ~ '[A-Za-z]') AS letter_straps,
         (SELECT count(*) FROM properties WHERE source_system = $1 AND parcel_id IS NULL) AS orphaned_properties
     `, [SOURCE_SYSTEM]);
 
@@ -64,18 +77,20 @@ async function main(): Promise<void> {
     if (orphanedProperties > 0) {
       failures.push(`orphaned_properties ${orphanedProperties} > 0 (collapse symptom)`);
     }
-    if (letterStraps === 0 && distinctFolios > 0) {
+    if (expectLetterStraps && letterStraps === 0 && distinctFolios > 0) {
       failures.push(`letter_straps 0 (raw STRAP not stored — digits-only normalization regressed?)`);
     }
 
     console.log(JSON.stringify({
       event: "validate_appraisal_folio",
+      sourceSystem: SOURCE_SYSTEM,
       totalParcels,
       distinctFolios,
       letterStraps,
       orphanedProperties,
       expectedExact,
       expectedMin: expectedExact === null ? expectedMin : undefined,
+      expectLetterStraps,
       passed: failures.length === 0,
       failures,
     }));

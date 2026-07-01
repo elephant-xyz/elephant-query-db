@@ -12,10 +12,17 @@
  *
  * THE SAFE RULE
  * -------------
- * Delete ONLY rows whose `source_system = 'lee_appraiser'`, in reverse FK order, and NEVER
+ * Delete ONLY rows for a SINGLE appraisal `source_system`, in reverse FK order, and NEVER
  * touch the shared tables (`addresses`, `companies`, `people`). Deleting
- * `property_improvements WHERE source_system='lee_appraiser'` is safe because the permit
- * children hang off the `lee_accela` rows, which are left untouched.
+ * `property_improvements WHERE source_system=<key>` is safe because the permit children hang
+ * off the permit source (e.g. `lee_accela`) rows, which are left untouched.
+ *
+ * COUNTY-GENERIC
+ * --------------
+ * The target `source_system` is read from env so this never wipes another county's data:
+ * `CLEAR_SOURCE_SYSTEM` takes precedence, else `JURISDICTION_KEY`, else defaults to
+ * `lee_appraiser` (preserving the original Lee behavior byte-for-byte). For a NEW county set
+ * `JURISDICTION_KEY` (or use `SKIP_CLEAR=1`, since the loader upsert is idempotent).
  *
  * Batched (chunked via ctid) so a single statement never locks millions of rows or blows a
  * task timeout, and so the job is interruptible/resumable (re-running just deletes whatever
@@ -23,7 +30,9 @@
  */
 import { Client } from "pg";
 
-const SOURCE_SYSTEM = "lee_appraiser";
+const SOURCE_SYSTEM = process.env.CLEAR_SOURCE_SYSTEM?.trim()
+  || process.env.JURISDICTION_KEY?.trim()
+  || "lee_appraiser";
 const CHUNK_SIZE = 50_000;
 
 /**

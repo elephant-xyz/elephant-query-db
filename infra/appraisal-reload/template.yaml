@@ -1,6 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Serial appraisal re-load for the Lee County query DB. A single Fargate task runs the
+  Serial appraisal re-load for a county's query DB (county-generic + multi-track via
+  JurisdictionKey/Tracks; defaults preserve Lee). A single Fargate task runs the
   existing bulk loader (migrate -> FK-safe clear -> load -> validate-by-folio). Step
   Functions orchestrates it with a cost-metric step and retries. No EC2 vCPU quota needed
   (Fargate), no 15-min limit (the clear + serial merge are too heavy for Lambda).
@@ -44,6 +45,30 @@ Parameters:
     Type: String
     Default: ""
     Description: Exact distinct-folio target from S3 source (e.g. 511695). When set, the in-task validate asserts distinct_folios == this (spec-level reconciliation, not a floor).
+  JurisdictionKey:
+    Type: String
+    Default: lee_appraiser
+    Description: Appraisal source_system / parcel jurisdiction_key. Scopes the clear, the loaded rows, and the folio validation. Set per county (e.g. palm_beach_appraiser). Default preserves Lee.
+  Tracks:
+    Type: String
+    Default: appraisal
+    Description: Comma-separated loader tracks (e.g. appraisal,sunbiz,bbb). One task can load several tracks for a county. Default preserves Lee (appraisal only).
+  SunbizPrefix:
+    Type: String
+    Default: ""
+    Description: S3 prefix for the sunbiz track (only used when Tracks includes sunbiz).
+  BbbPrefix:
+    Type: String
+    Default: ""
+    Description: S3 prefix for the bbb track (only used when Tracks includes bbb).
+  SkipClear:
+    Type: String
+    Default: ""
+    Description: Set to any non-empty value to skip the FK-safe clear step (required for a fresh county, since the loader upsert is idempotent; also used on a resumed run).
+  ExpectLetterStraps:
+    Type: String
+    Default: "true"
+    Description: Validate guard that letter-STRAP parcels exist (Lee-specific). Set to "0" for numeric-folio counties like Palm Beach. Default preserves Lee.
   ServiceName:
     Type: String
     Default: appraisal-reload
@@ -127,6 +152,12 @@ Resources:
             - { Name: BATCH_SIZE, Value: !Ref BatchSize }
             - { Name: EXPECTED_MIN_PARCELS, Value: !Ref ExpectedMinParcels }
             - { Name: EXPECTED_PARCELS, Value: !Ref ExpectedParcels }
+            - { Name: JURISDICTION_KEY, Value: !Ref JurisdictionKey }
+            - { Name: TRACKS, Value: !Ref Tracks }
+            - { Name: SUNBIZ_PREFIX, Value: !Ref SunbizPrefix }
+            - { Name: BBB_PREFIX, Value: !Ref BbbPrefix }
+            - { Name: SKIP_CLEAR, Value: !Ref SkipClear }
+            - { Name: EXPECT_LETTER_STRAPS, Value: !Ref ExpectLetterStraps }
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
           Secrets:
             - { Name: DATABASE_URL, ValueFrom: !Ref DatabaseUrlSecretArn }
