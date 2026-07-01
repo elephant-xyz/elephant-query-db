@@ -119,10 +119,19 @@ function isRawHttpResponse(value: unknown): value is RawHttpResponse {
 // ---------------------------------------------------------------------------
 
 const UPLOAD_RUNS_DIR = ".upload-runs";
-const CHECKPOINT_PATH = join(UPLOAD_RUNS_DIR, "filebase-upload-checkpoint.json");
 
-async function readCheckpoint(): Promise<Map<string, CheckpointRecord>> {
-  const text = await readFile(CHECKPOINT_PATH, "utf8").catch((err: unknown) => {
+// Checkpoint MUST be scoped per bucket. The upload uses fixed object keys
+// (index.json, manifest.json, shards/shard-NNNN.json); a single shared checkpoint
+// keyed only by object key would make a second bucket (e.g. another county) skip
+// those fixed files as "already uploaded", leaving its IPNS pointing at a stale
+// index. Scoping by bucket prevents that cross-bucket contamination.
+function checkpointPathForBucket(bucket: string): string {
+  const safeBucket = bucket.replace(/[^a-zA-Z0-9._-]/g, "_");
+  return join(UPLOAD_RUNS_DIR, `filebase-upload-checkpoint-${safeBucket}.json`);
+}
+
+async function readCheckpoint(checkpointPath: string): Promise<Map<string, CheckpointRecord>> {
+  const text = await readFile(checkpointPath, "utf8").catch((err: unknown) => {
     if (err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
     }
@@ -139,13 +148,17 @@ async function readCheckpoint(): Promise<Map<string, CheckpointRecord>> {
   return map;
 }
 
-function writeCheckpointSync(startedAt: string, uploaded: Map<string, CheckpointRecord>): void {
+function writeCheckpointSync(
+  checkpointPath: string,
+  startedAt: string,
+  uploaded: Map<string, CheckpointRecord>,
+): void {
   const checkpoint: Checkpoint = {
     schemaVersion: "1",
     startedAt,
     entries: [...uploaded.values()],
   };
-  writeFile(CHECKPOINT_PATH, `${JSON.stringify(checkpoint, null, 2)}\n`, "utf8").catch((err: unknown) => {
+  writeFile(checkpointPath, `${JSON.stringify(checkpoint, null, 2)}\n`, "utf8").catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     console.error(JSON.stringify({ event: "checkpoint_write_failed", error: message }));
   });
@@ -516,7 +529,8 @@ async function main(): Promise<void> {
   }
 
   await mkdir(UPLOAD_RUNS_DIR, { recursive: true });
-  const checkpoint = await readCheckpoint();
+  const checkpointPath = checkpointPathForBucket(options.bucket);
+  const checkpoint = await readCheckpoint(checkpointPath);
   const startedAt = new Date().toISOString();
 
   const alreadyUploaded = new Map<string, CheckpointRecord>(checkpoint);
@@ -554,7 +568,7 @@ async function main(): Promise<void> {
     if (progress.uploaded - lastLogAt >= 500) {
       lastLogAt = progress.uploaded;
       logProgress(progress);
-      writeCheckpointSync(startedAt, alreadyUploaded);
+      writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
     }
   };
 
@@ -580,7 +594,7 @@ async function main(): Promise<void> {
   await Promise.all(uploadTasks);
 
   // Flush checkpoint after all property files
-  writeCheckpointSync(startedAt, alreadyUploaded);
+  writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
 
   // 2. Upload shard files (if sharded index exists), before index.json
   if (hasShardedIndex && indexFile !== null) {
@@ -618,7 +632,7 @@ async function main(): Promise<void> {
       });
 
       await Promise.all(shardTasks);
-      writeCheckpointSync(startedAt, alreadyUploaded);
+      writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
     }
   }
 
@@ -658,7 +672,7 @@ async function main(): Promise<void> {
           cid: filebaseCid,
           uploadedAt: new Date().toISOString(),
         });
-        writeCheckpointSync(startedAt, alreadyUploaded);
+        writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
         progress.uploaded += 1;
       }
     }
@@ -699,7 +713,7 @@ async function main(): Promise<void> {
         cid: filebaseCid,
         uploadedAt: new Date().toISOString(),
       });
-      writeCheckpointSync(startedAt, alreadyUploaded);
+      writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
       progress.uploaded += 1;
     }
   }
