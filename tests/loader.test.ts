@@ -863,6 +863,45 @@ describe("source mappers", () => {
     expect(property.values.property_structure_built_year).toBe(1);
   });
 
+  it("threads a non-Lee jurisdiction-key through parcel identity (Orange)", () => {
+    const bundle = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/property_seed.json",
+      filePath: "property_seed.json",
+      requestIdentifier: "282201145000820",
+      record: {
+        request_identifier: "282201145000820",
+        parcel_identifier: "282201145000820",
+      },
+      sourceSystem: "orange_appraiser",
+    });
+    const parcel = findRow(bundle.rows, "parcels");
+    // jurisdiction_key is the parcels dedup key (ON CONFLICT jurisdiction_key,
+    // request_identifier), so it MUST carry the county source system or Orange
+    // parcels would collide with Lee parcels that share a folio.
+    expect(parcel.values.jurisdiction_key).toBe("orange_appraiser");
+    expect(parcel.values.source_system).toBe("orange_appraiser");
+    expect(parcel.values.source_record_key).toBe(
+      "orange_appraiser:282201145000820:parcel:property_seed",
+    );
+  });
+
+  it("defaults appraisal identity to lee_appraiser when no jurisdiction-key is given", () => {
+    const bundle = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/property_seed.json",
+      filePath: "property_seed.json",
+      requestIdentifier: "36-43-24-00-00001.0000",
+      record: {
+        request_identifier: "36-43-24-00-00001.0000",
+        parcel_identifier: "36-43-24-00-00001.0000",
+      },
+    });
+    const parcel = findRow(bundle.rows, "parcels");
+    expect(parcel.values.jurisdiction_key).toBe("lee_appraiser");
+    expect(parcel.values.source_record_key).toBe(
+      "lee_appraiser:36-43-24-00-00001.0000:parcel:property_seed",
+    );
+  });
+
   it("maps Lee appraisal owner, tax, lot, sales, and permit-history files into logical child rows", () => {
     const ownerBundle = mapAppraisalTransformedFile({
       artifactUri: "s3://bucket/appraisal/transformed_output.zip",

@@ -13,9 +13,9 @@ import {
   readNumber,
   readString,
 } from "./normalizers.js";
-import type { JsonObject, LogicalTableName, PreparedRow, PreparedRowBundle } from "./types.js";
+import type { JsonObject, LogicalTableName, PreparedRow, PreparedRowBundle, SourceSystem } from "./types.js";
 
-const APPRAISER_SOURCE_SYSTEM = "lee_appraiser";
+const DEFAULT_APPRAISER_SOURCE_SYSTEM = "lee_appraiser";
 
 const PROPERTY_COLUMNS = [
   "property_legal_description_text",
@@ -415,6 +415,7 @@ export function mapAppraisalTransformedFile(params: {
   readonly record: unknown;
   readonly artifactUri: string | null;
   readonly requestIdentifier?: string | null;
+  readonly sourceSystem?: string;
 }): PreparedRowBundle {
   if (!isJsonObject(params.record)) {
     return skipped(params, "appraisal transformed file is not a JSON object", { value: params.record });
@@ -430,7 +431,8 @@ export function mapAppraisalTransformedFile(params: {
     return skipped(params, "appraisal record is missing request_identifier", params.record);
   }
 
-  const rows = mapKnownAppraisalRecord(fileName, params.record, requestIdentifier, params.artifactUri);
+  const sourceSystem = (params.sourceSystem ?? DEFAULT_APPRAISER_SOURCE_SYSTEM) as SourceSystem;
+  const rows = mapKnownAppraisalRecord(fileName, params.record, requestIdentifier, params.artifactUri, sourceSystem);
   return rows === null
     ? skipped(params, `unrecognized appraisal transformed file: ${fileName}`, params.record)
     : { rows, skippedRecords: [] };
@@ -441,40 +443,41 @@ function mapKnownAppraisalRecord(
   record: JsonObject,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] | null {
-  if (fileName === "property_seed.json") return [mapParcel(record, requestIdentifier, artifactUri)];
-  if (fileName === "property.json") return [mapProperty(record, requestIdentifier, artifactUri)];
+  if (fileName === "property_seed.json") return [mapParcel(record, requestIdentifier, artifactUri, sourceSystem)];
+  if (fileName === "property.json") return [mapProperty(record, requestIdentifier, artifactUri, sourceSystem)];
   if (fileName === "unnormalized_address.json") {
-    return [mapUnnormalizedAddress(record, requestIdentifier, artifactUri)];
+    return [mapUnnormalizedAddress(record, requestIdentifier, artifactUri, sourceSystem)];
   }
   if (fileName === "address.json" || /^mailing_address_\d+\.json$/.test(fileName)) {
-    return [mapAddress(record, fileName, requestIdentifier, artifactUri)];
+    return [mapAddress(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
   }
-  if (/^person_\d+\.json$/.test(fileName)) return mapAppraisalPersonOwnerRows(record, fileName, requestIdentifier, artifactUri);
-  if (/^company_\d+\.json$/.test(fileName)) return mapAppraisalCompanyOwnerRows(record, fileName, requestIdentifier, artifactUri);
-  if (/^tax_/.test(fileName)) return mapTaxRows(record, fileName, requestIdentifier, artifactUri);
+  if (/^person_\d+\.json$/.test(fileName)) return mapAppraisalPersonOwnerRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
+  if (/^company_\d+\.json$/.test(fileName)) return mapAppraisalCompanyOwnerRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
+  if (/^tax_/.test(fileName)) return mapTaxRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
   if (/^property_valuation_/.test(fileName)) {
-    return [mapPropertyChild("property_valuations", record, fileName, requestIdentifier, artifactUri, PROPERTY_VALUATION_COLUMNS)];
+    return [mapPropertyChild("property_valuations", record, fileName, requestIdentifier, artifactUri, PROPERTY_VALUATION_COLUMNS, sourceSystem)];
   }
   if (/^(sales_history_|sales_)/.test(fileName)) {
-    return [mapPropertyChild("sales_histories", record, fileName, requestIdentifier, artifactUri, SALES_HISTORY_COLUMNS)];
+    return [mapPropertyChild("sales_histories", record, fileName, requestIdentifier, artifactUri, SALES_HISTORY_COLUMNS, sourceSystem)];
   }
   if (/^property_improvement_/.test(fileName)) {
-    return [mapAppraisalPropertyImprovement(record, fileName, requestIdentifier, artifactUri)];
+    return [mapAppraisalPropertyImprovement(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
   }
-  if (/^structure_/.test(fileName)) return [mapPropertyChild("structures", record, fileName, requestIdentifier, artifactUri, STRUCTURE_COLUMNS)];
-  if (/^utility_/.test(fileName)) return [mapPropertyChild("utilities", record, fileName, requestIdentifier, artifactUri, UTILITY_COLUMNS)];
-  if (/^layout_/.test(fileName)) return [mapPropertyChild("layouts", record, fileName, requestIdentifier, artifactUri, LAYOUT_COLUMNS)];
+  if (/^structure_/.test(fileName)) return [mapPropertyChild("structures", record, fileName, requestIdentifier, artifactUri, STRUCTURE_COLUMNS, sourceSystem)];
+  if (/^utility_/.test(fileName)) return [mapPropertyChild("utilities", record, fileName, requestIdentifier, artifactUri, UTILITY_COLUMNS, sourceSystem)];
+  if (/^layout_/.test(fileName)) return [mapPropertyChild("layouts", record, fileName, requestIdentifier, artifactUri, LAYOUT_COLUMNS, sourceSystem)];
   if (fileName === "lot.json" || /^lot_/.test(fileName)) {
-    return [mapPropertyChild("lots", record, fileName, requestIdentifier, artifactUri, LOT_COLUMNS)];
+    return [mapPropertyChild("lots", record, fileName, requestIdentifier, artifactUri, LOT_COLUMNS, sourceSystem)];
   }
   if (/^flood_storm_information/.test(fileName)) {
-    return [mapPropertyChild("flood_storm_information", record, fileName, requestIdentifier, artifactUri, FLOOD_COLUMNS)];
+    return [mapPropertyChild("flood_storm_information", record, fileName, requestIdentifier, artifactUri, FLOOD_COLUMNS, sourceSystem)];
   }
-  if (fileName === "fact_sheet.json") return [mapFactSheet(record, requestIdentifier, artifactUri)];
-  if (fileName === "geometry.json") return [mapGeometry(record, requestIdentifier, artifactUri)];
-  if (/^deed_/.test(fileName)) return [mapDeed(record, fileName, requestIdentifier, artifactUri)];
-  if (/^file_/.test(fileName)) return [mapFile(record, fileName, requestIdentifier, artifactUri)];
+  if (fileName === "fact_sheet.json") return [mapFactSheet(record, requestIdentifier, artifactUri, sourceSystem)];
+  if (fileName === "geometry.json") return [mapGeometry(record, requestIdentifier, artifactUri, sourceSystem)];
+  if (/^deed_/.test(fileName)) return [mapDeed(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
+  if (/^file_/.test(fileName)) return [mapFile(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
   return null;
 }
 
@@ -482,12 +485,13 @@ function mapParcel(
   record: JsonObject,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
-  const sourceRecordKey = sourceKey(requestIdentifier, "parcel", "property_seed");
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "parcel", "property_seed");
   return {
     tableName: "parcels",
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       request_identifier: requestIdentifier,
       // Store the RAW STRAP so letters (e.g. condo units `…0001A`) are preserved
       // for display/reference. Parcel dedup keys on `request_identifier` (folio),
@@ -497,7 +501,7 @@ function mapParcel(
       parcel_identifier: readString(record.parcel_id) ?? requestIdentifier,
       county_name: readCountyName(record),
       state_code: "FL",
-      jurisdiction_key: "lee_appraiser",
+      jurisdiction_key: sourceSystem,
       source_http_request: jsonObjectOrNull(record.source_http_request),
       source_payload: record,
     }),
@@ -508,16 +512,17 @@ function mapProperty(
   record: JsonObject,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
-  const sourceRecordKey = sourceKey(requestIdentifier, "property", "property");
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "property", "property");
   return {
     tableName: "properties",
     references: {
-      addressSourceRecordKey: sourceKey(requestIdentifier, "address", "site"),
-      parcelSourceRecordKey: sourceKey(requestIdentifier, "parcel", "property_seed"),
+      addressSourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "address", "site"),
+      parcelSourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "parcel", "property_seed"),
     },
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       ...pick(record, PROPERTY_COLUMNS),
       request_identifier: requestIdentifier,
       parcel_identifier: normalizeParcelIdentifier(record.parcel_identifier ?? requestIdentifier),
@@ -531,12 +536,13 @@ function mapUnnormalizedAddress(
   record: JsonObject,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
-  const sourceRecordKey = sourceKey(requestIdentifier, "unnormalized_address", "site");
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "unnormalized_address", "site");
   return {
     tableName: "unnormalized_addresses",
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       request_identifier: requestIdentifier,
       full_address: readString(record.full_address),
       county_jurisdiction: readString(record.county_jurisdiction),
@@ -554,13 +560,14 @@ function mapAddress(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
   const addressRole = fileName === "address.json" ? "site" : fileName.replace(/\.json$/, "");
-  const sourceRecordKey = sourceKey(requestIdentifier, "address", addressRole);
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "address", addressRole);
   const unnormalizedAddress = readString(record.unnormalized_address);
   const normalizedAddressKey = buildNormalizedAddressKey(unnormalizedAddress);
   const values = compactObject({
-    ...metadata(sourceRecordKey, record, artifactUri),
+    ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
     request_identifier: requestIdentifier,
     unnormalized_address: unnormalizedAddress,
     normalized_address_key: normalizedAddressKey,
@@ -585,7 +592,7 @@ function mapAddress(
   }
   return {
     tableName: "addresses",
-    references: { propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property") },
+    references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
     values,
   };
 }
@@ -595,8 +602,9 @@ function mapPerson(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
-  const sourceRecordKey = sourceKey(requestIdentifier, "person", fileName.replace(/\.json$/, ""));
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "person", fileName.replace(/\.json$/, ""));
   const fullName = [record.first_name, record.middle_name, record.last_name]
     .map(readString)
     .filter((value): value is string => value !== null)
@@ -604,7 +612,7 @@ function mapPerson(
   return {
     tableName: "people",
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       request_identifier: requestIdentifier,
       prefix_name: readString(record.prefix_name),
       first_name: readString(record.first_name),
@@ -641,8 +649,9 @@ function mapAppraisalPersonOwnerRows(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
-  const person = mapPerson(record, fileName, requestIdentifier, artifactUri);
+  const person = mapPerson(record, fileName, requestIdentifier, artifactUri, sourceSystem);
   const ownerKeyPart = fileName.replace(/\.json$/, "");
   const fullName = readString(person.values.full_name) ?? readString(person.values.normalized_name);
   return [
@@ -651,9 +660,10 @@ function mapAppraisalPersonOwnerRows(
       artifactUri,
       ownerKeyPart,
       ownedBy: fullName,
-      ownerReference: { personSourceRecordKey: sourceKey(requestIdentifier, "person", ownerKeyPart) },
+      ownerReference: { personSourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "person", ownerKeyPart) },
       record,
       requestIdentifier,
+      sourceSystem,
     }),
   ];
 }
@@ -672,6 +682,7 @@ function mapAppraisalCompanyOwnerRows(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
   const companyKeyPart = fileName.replace(/\.json$/, "");
   const name = readString(record.name) ?? readString(record.company_name);
@@ -679,7 +690,7 @@ function mapAppraisalCompanyOwnerRows(
     {
       tableName: "companies",
       values: compactObject({
-        ...metadata(sourceKey(requestIdentifier, "company", companyKeyPart), record, artifactUri),
+        ...metadata(sourceSystem, sourceKey(sourceSystem, requestIdentifier, "company", companyKeyPart), record, artifactUri),
         request_identifier: requestIdentifier,
         name,
         normalized_name: normalizeName(name),
@@ -691,9 +702,10 @@ function mapAppraisalCompanyOwnerRows(
       artifactUri,
       ownerKeyPart: companyKeyPart,
       ownedBy: name,
-      ownerReference: { companySourceRecordKey: sourceKey(requestIdentifier, "company", companyKeyPart) },
+      ownerReference: { companySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "company", companyKeyPart) },
       record,
       requestIdentifier,
+      sourceSystem,
     }),
   ];
 }
@@ -711,15 +723,16 @@ function mapOwnership(params: {
   readonly ownerReference: Pick<NonNullable<PreparedRow["references"]>, "companySourceRecordKey" | "personSourceRecordKey">;
   readonly record: JsonObject;
   readonly requestIdentifier: string;
+  readonly sourceSystem: SourceSystem;
 }): PreparedRow {
   return {
     tableName: "ownerships",
     references: {
-      propertySourceRecordKey: sourceKey(params.requestIdentifier, "property", "property"),
+      propertySourceRecordKey: sourceKey(params.sourceSystem, params.requestIdentifier, "property", "property"),
       ...params.ownerReference,
     },
     values: compactObject({
-      ...metadata(sourceKey(params.requestIdentifier, "ownership", params.ownerKeyPart), params.record, params.artifactUri),
+      ...metadata(params.sourceSystem, sourceKey(params.sourceSystem, params.requestIdentifier, "ownership", params.ownerKeyPart), params.record, params.artifactUri),
       ownership_identifier: params.ownerKeyPart,
       owned_by: params.ownedBy,
       source_payload: params.record,
@@ -745,9 +758,10 @@ function mapTaxRows(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
-  const taxRow = mapPropertyChild("taxes", record, fileName, requestIdentifier, artifactUri, TAX_COLUMNS);
-  const valuationRow = mapCountyValuationFromTax(record, fileName, requestIdentifier, artifactUri);
+  const taxRow = mapPropertyChild("taxes", record, fileName, requestIdentifier, artifactUri, TAX_COLUMNS, sourceSystem);
+  const valuationRow = mapCountyValuationFromTax(record, fileName, requestIdentifier, artifactUri, sourceSystem);
   return valuationRow === null ? [taxRow] : [taxRow, valuationRow];
 }
 
@@ -765,6 +779,7 @@ function mapCountyValuationFromTax(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow | null {
   const marketValue = normalizeAppraisalColumnValue("property_market_value_amount", record.property_market_value_amount);
   const assessedValue = normalizeAppraisalColumnValue("property_assessed_value_amount", record.property_assessed_value_amount);
@@ -782,10 +797,11 @@ function mapCountyValuationFromTax(
   });
   return {
     tableName: "property_valuations",
-    references: { propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property") },
+    references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
     values: compactObject({
       ...metadata(
-        sourceKey(requestIdentifier, "property_valuation", fileName.replace(/\.json$/, "")),
+        sourceSystem,
+        sourceKey(sourceSystem, requestIdentifier, "property_valuation", fileName.replace(/\.json$/, "")),
         valuationPayload,
         artifactUri,
       ),
@@ -804,16 +820,17 @@ function mapPropertyChild(
   requestIdentifier: string,
   artifactUri: string | null,
   columns: readonly string[],
+  sourceSystem: SourceSystem,
 ): PreparedRow {
   const className = tableName.endsWith("ies")
     ? tableName.slice(0, -3) + "y"
     : tableName.replace(/s$/, "");
-  const sourceRecordKey = sourceKey(requestIdentifier, className, fileName.replace(/\.json$/, ""));
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, className, fileName.replace(/\.json$/, ""));
   return {
     tableName,
-    references: { propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property") },
+    references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       ...pick(record, columns),
       request_identifier: requestIdentifier,
       source_http_request: jsonObjectOrNull(record.source_http_request),
@@ -827,13 +844,14 @@ function mapAppraisalPropertyImprovement(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
-  const sourceRecordKey = sourceKey(requestIdentifier, "property_improvement", fileName.replace(/\.json$/, ""));
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "property_improvement", fileName.replace(/\.json$/, ""));
   return {
     tableName: "property_improvements",
-    references: { propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property") },
+    references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       ...pick(record, APPRAISAL_PROPERTY_IMPROVEMENT_COLUMNS),
       request_identifier: requestIdentifier,
       more_details: {},
@@ -847,13 +865,14 @@ function mapFactSheet(
   record: JsonObject,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
-  const sourceRecordKey = sourceKey(requestIdentifier, "fact_sheet", "fact_sheet");
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "fact_sheet", "fact_sheet");
   return {
     tableName: "fact_sheets",
-    references: { propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property") },
+    references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       request_identifier: requestIdentifier,
       ipfs_url: readString(record.ipfs_url),
       full_generation_command: readString(record.full_generation_command),
@@ -866,13 +885,14 @@ function mapGeometry(
   record: JsonObject,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
-  const sourceRecordKey = sourceKey(requestIdentifier, "geometry", "geometry");
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "geometry", "geometry");
   return {
     tableName: "geometries",
-    references: { propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property") },
+    references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       request_identifier: requestIdentifier,
       latitude: normalizeAppraisalColumnValue("latitude", record.latitude),
       longitude: normalizeAppraisalColumnValue("longitude", record.longitude),
@@ -887,14 +907,15 @@ function mapDeed(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
   const deedKeyPart = fileName.replace(/\.json$/, "");
-  const sourceRecordKey = sourceKey(requestIdentifier, "deed", deedKeyPart);
+  const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "deed", deedKeyPart);
   return {
     tableName: "deeds",
-    references: { propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property") },
+    references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
     values: compactObject({
-      ...metadata(sourceRecordKey, record, artifactUri),
+      ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
       request_identifier: requestIdentifier,
       deed_type: readString(record.deed_type),
       book: readString(record.book),
@@ -911,21 +932,22 @@ function mapFile(
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
   const fileKeyPart = fileName.replace(/\.json$/, "");
   const deedOrdinal = /file_(\d+)/.exec(fileName)?.[1] ?? null;
   const references =
     deedOrdinal === null
-      ? { propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property") }
+      ? { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") }
       : {
-          propertySourceRecordKey: sourceKey(requestIdentifier, "property", "property"),
-          deedSourceRecordKey: sourceKey(requestIdentifier, "deed", `deed_${deedOrdinal}`),
+          propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property"),
+          deedSourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "deed", `deed_${deedOrdinal}`),
         };
   return {
     tableName: "files",
     references,
     values: compactObject({
-      ...metadata(sourceKey(requestIdentifier, "file", fileKeyPart), record, artifactUri),
+      ...metadata(sourceSystem, sourceKey(sourceSystem, requestIdentifier, "file", fileKeyPart), record, artifactUri),
       request_identifier: requestIdentifier,
       document_type: readString(record.document_type),
       file_format: readString(record.file_format),
@@ -967,17 +989,17 @@ function normalizeAppraisalColumnValue(columnName: string, value: unknown): unkn
   return value;
 }
 
-function metadata(sourceRecordKey: string, record: JsonObject, artifactUri: string | null): JsonObject {
+function metadata(sourceSystem: SourceSystem, sourceRecordKey: string, record: JsonObject, artifactUri: string | null): JsonObject {
   return buildSourceMetadata({
-    sourceSystem: APPRAISER_SOURCE_SYSTEM,
+    sourceSystem,
     sourceRecordKey,
     sourcePayload: record,
     sourceArtifactUri: artifactUri,
   });
 }
 
-function sourceKey(requestIdentifier: string, classType: string, localKey: string): string {
-  return `lee_appraiser:${requestIdentifier}:${classType}:${localKey}`;
+function sourceKey(sourceSystem: SourceSystem, requestIdentifier: string, classType: string, localKey: string): string {
+  return `${sourceSystem}:${requestIdentifier}:${classType}:${localKey}`;
 }
 
 function readCountyName(record: JsonObject): string | null {

@@ -780,12 +780,15 @@ function sourceJsonText(columnName: string): string {
 }
 
 function sourceSystemFromReferenceExpression(expression: string): string {
+  // Source record keys are `${source_system}:...` (see appraisal.sourceKey /
+  // permits key builders), so the source_system is the prefix before the first
+  // colon. Deriving it generically keeps county-parameterized appraiser/permit
+  // source systems (e.g. `orange_appraiser`) working with no per-county change,
+  // and stays consistent with the keys those mappers emit. Values without a
+  // colon fall back to NULL, preserving the prior permissive-join behavior.
   return [
     `CASE`,
-    `WHEN ${expression} LIKE 'bbb:%' THEN 'bbb'`,
-    `WHEN ${expression} LIKE 'lee_appraiser:%' THEN 'lee_appraiser'`,
-    `WHEN ${expression} LIKE 'lee_accela:%' THEN 'lee_accela'`,
-    `WHEN ${expression} LIKE 'sunbiz:%' THEN 'sunbiz'`,
+    `WHEN ${expression} LIKE '%:%' THEN split_part(${expression}, ':', 1)`,
     `ELSE NULL`,
     `END`,
   ].join(" ");

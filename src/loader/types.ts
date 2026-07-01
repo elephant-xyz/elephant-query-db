@@ -1,6 +1,13 @@
 export type JsonObject = Record<string, unknown>;
 
-export type SourceSystem = "bbb" | "lee_appraiser" | "lee_accela" | "sunbiz";
+// Appraiser and permit source systems are county-parameterized: the bulk loader
+// derives them from the `--jurisdiction-key` / `--permit-source-system` CLI
+// options (defaulting to `lee_appraiser` / `lee_accela`). The template-literal
+// arms admit any `<county>_appraiser` / `<county>_accela` value (e.g.
+// `orange_appraiser`) while still excluding unrelated strings. `bbb` and
+// `sunbiz` remain fixed. Existing `lee_appraiser` / `lee_accela` literals stay
+// assignable via the template arms.
+export type SourceSystem = "bbb" | "sunbiz" | `${string}_appraiser` | `${string}_accela`;
 
 export type LogicalTableName =
   | "addresses"

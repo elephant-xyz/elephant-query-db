@@ -15,7 +15,7 @@ import {
   readTimestamp,
   stableJsonStringify,
 } from "./normalizers.js";
-import type { JsonObject, PreparedRow, PreparedRowBundle } from "./types.js";
+import type { JsonObject, PreparedRow, PreparedRowBundle, SourceSystem } from "./types.js";
 
 type LeeCompletedInspection = {
   readonly result?: unknown;
@@ -91,7 +91,7 @@ type ContractorAddressSplit = {
   readonly addressText: string | null;
 };
 
-const PERMIT_SOURCE_SYSTEM = "lee_accela";
+const DEFAULT_PERMIT_SOURCE_SYSTEM = "lee_accela";
 const ADDITIONAL_LICENSED_PROFESSIONALS_MARKER = "View Additional Licensed Professionals>>";
 const PERMIT_STATUS_MAX_LENGTH = 256;
 const CONTRACTOR_COMPANY_INDICATOR_TOKENS = new Set<string>([
@@ -173,7 +173,9 @@ function readPermitRecordStatus(value: unknown): string | null {
 export function mapLeePermitDetail(params: {
   readonly record: unknown;
   readonly artifactUri: string | null;
+  readonly sourceSystem?: string;
 }): PreparedRowBundle {
+  const sourceSystem = (params.sourceSystem ?? DEFAULT_PERMIT_SOURCE_SYSTEM) as SourceSystem;
   if (!isJsonObject(params.record)) {
     return {
       rows: [],
@@ -203,15 +205,16 @@ export function mapLeePermitDetail(params: {
     };
   }
 
-  const permitKey = `lee_accela:permit:${sourceRecordKey}`;
+  const permitKey = `${sourceSystem}:permit:${sourceRecordKey}`;
   const workLocation = readString(params.record.workLocation);
-  const workLocationKey = workLocation === null ? null : `lee_accela:permit:${sourceRecordKey}:work_location`;
+  const workLocationKey = workLocation === null ? null : `${sourceSystem}:permit:${sourceRecordKey}:work_location`;
   const recordStatus = readPermitRecordStatus(params.record.recordStatus);
   const moreDetails = isJsonObject(params.record.moreDetails) ? params.record.moreDetails : {};
   const parsedFees = parsePermitFees(params.record);
   const totalFeeAmount = sumPermitFeeAmounts(parsedFees);
   const licensedProfessionalContacts = parseLicensedProfessionalContacts(
     readString(params.record.licensedProfessional),
+    sourceSystem,
   );
   const primaryLicensedProfessional = licensedProfessionalContacts.find((contact) => contact.isPrimary);
   const rows: PreparedRow[] = [];
@@ -224,10 +227,11 @@ export function mapLeePermitDetail(params: {
         sourcePayload: params.record,
         artifactUri: params.artifactUri,
         unnormalizedAddress: workLocation,
+        sourceSystem,
       }),
     });
   }
-  rows.push(...mapLicensedProfessionalEntityRows(licensedProfessionalContacts, params.artifactUri));
+  rows.push(...mapLicensedProfessionalEntityRows(licensedProfessionalContacts, params.artifactUri, sourceSystem));
 
   const permitReferences = {
     ...(workLocationKey === null ? {} : { addressSourceRecordKey: workLocationKey }),
@@ -238,7 +242,7 @@ export function mapLeePermitDetail(params: {
 
   const permitValues = compactObject({
     ...buildSourceMetadata({
-      sourceSystem: PERMIT_SOURCE_SYSTEM,
+      sourceSystem,
       sourceRecordKey: permitKey,
       sourcePayload: params.record,
       sourceArtifactUri: params.artifactUri,
@@ -302,12 +306,12 @@ export function mapLeePermitDetail(params: {
         },
   );
 
-  rows.push(...mapPermitContacts(params.record, permitKey, params.artifactUri, licensedProfessionalContacts));
-  rows.push(...mapPermitInspections(params.record, recordNumber, permitKey, params.artifactUri));
-  rows.push(...mapPermitEvents(params.record, permitKey, params.artifactUri));
-  rows.push(...mapPermitFees(parsedFees, permitKey, params.artifactUri));
-  rows.push(...mapPermitLinks(params.record, permitKey, params.artifactUri));
-  rows.push(...mapPermitCustomFields(moreDetails, permitKey, params.artifactUri));
+  rows.push(...mapPermitContacts(params.record, permitKey, params.artifactUri, licensedProfessionalContacts, sourceSystem));
+  rows.push(...mapPermitInspections(params.record, recordNumber, permitKey, params.artifactUri, sourceSystem));
+  rows.push(...mapPermitEvents(params.record, permitKey, params.artifactUri, sourceSystem));
+  rows.push(...mapPermitFees(parsedFees, permitKey, params.artifactUri, sourceSystem));
+  rows.push(...mapPermitLinks(params.record, permitKey, params.artifactUri, sourceSystem));
+  rows.push(...mapPermitCustomFields(moreDetails, permitKey, params.artifactUri, sourceSystem));
 
   return { rows, skippedRecords: [] };
 }
@@ -329,6 +333,7 @@ function mapPermitEvents(
   record: JsonObject,
   permitKey: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
   return parsePermitEvents(record).map((event) => {
     const identity = [
@@ -345,7 +350,7 @@ function mapPermitEvents(
       references: { propertyImprovementSourceRecordKey: permitKey },
       values: compactObject({
         ...buildSourceMetadata({
-          sourceSystem: PERMIT_SOURCE_SYSTEM,
+          sourceSystem,
           sourceRecordKey,
           sourcePayload: event.sourcePayload,
           sourceArtifactUri: artifactUri,
@@ -422,6 +427,7 @@ function mapPermitFees(
   fees: readonly ParsedPermitFee[],
   permitKey: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
   return fees.map((fee, index) => {
     const sourceRecordKey = `${permitKey}:fee:${hashString(`${String(index)}\n${stableEventPayloadIdentity(fee.sourcePayload)}`)}`;
@@ -430,7 +436,7 @@ function mapPermitFees(
       references: { propertyImprovementSourceRecordKey: permitKey },
       values: compactObject({
         ...buildSourceMetadata({
-          sourceSystem: PERMIT_SOURCE_SYSTEM,
+          sourceSystem,
           sourceRecordKey,
           sourcePayload: fee.sourcePayload,
           sourceArtifactUri: artifactUri,
@@ -542,11 +548,12 @@ function buildAddressRow(params: {
   readonly sourcePayload: JsonObject;
   readonly artifactUri: string | null;
   readonly unnormalizedAddress: string;
+  readonly sourceSystem: SourceSystem;
 }): JsonObject {
   const normalizedAddressKey = buildNormalizedAddressKey(params.unnormalizedAddress);
   return compactObject({
     ...buildSourceMetadata({
-      sourceSystem: PERMIT_SOURCE_SYSTEM,
+      sourceSystem: params.sourceSystem,
       sourceRecordKey: params.sourceRecordKey,
       sourcePayload: params.sourcePayload,
       sourceArtifactUri: params.artifactUri,
@@ -572,6 +579,7 @@ function buildAddressRow(params: {
 function mapLicensedProfessionalEntityRows(
   contacts: readonly ParsedLicensedProfessionalContact[],
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
   const rows: PreparedRow[] = [];
   const seenSourceKeys = new Set<string>();
@@ -584,6 +592,7 @@ function mapLicensedProfessionalEntityRows(
           sourcePayload: contact.sourcePayload,
           artifactUri,
           unnormalizedAddress: contact.addressText,
+          sourceSystem,
         }),
       });
     }
@@ -593,7 +602,7 @@ function mapLicensedProfessionalEntityRows(
         tableName: "people",
         values: compactObject({
           ...buildSourceMetadata({
-            sourceSystem: PERMIT_SOURCE_SYSTEM,
+            sourceSystem,
             sourceRecordKey: contact.personSourceRecordKey,
             sourcePayload: contact.sourcePayload,
             sourceArtifactUri: artifactUri,
@@ -614,7 +623,7 @@ function mapLicensedProfessionalEntityRows(
         tableName: "companies",
         values: compactObject({
           ...buildSourceMetadata({
-            sourceSystem: PERMIT_SOURCE_SYSTEM,
+            sourceSystem,
             sourceRecordKey: contact.companySourceRecordKey,
             sourcePayload: contact.sourcePayload,
             sourceArtifactUri: artifactUri,
@@ -649,14 +658,15 @@ function mapPermitContacts(
   permitKey: string,
   artifactUri: string | null,
   licensedProfessionalContacts: readonly ParsedLicensedProfessionalContact[],
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
   const contacts: PreparedRow[] = [];
   const applicant = readString(record.applicant);
   if (applicant !== null) {
-    contacts.push(buildPermitContactRow("APPLICANT", applicant, record, permitKey, artifactUri));
+    contacts.push(buildPermitContactRow("APPLICANT", applicant, record, permitKey, artifactUri, sourceSystem));
   }
   for (const licensedProfessional of licensedProfessionalContacts) {
-    contacts.push(buildLicensedProfessionalContactRow(licensedProfessional, permitKey, artifactUri));
+    contacts.push(buildLicensedProfessionalContactRow(licensedProfessional, permitKey, artifactUri, sourceSystem));
   }
   return contacts;
 }
@@ -667,7 +677,10 @@ function mapPermitContacts(
  * @param value - Raw `licensedProfessional` field from one Lee Accela permit detail artifact.
  * @returns Primary contact plus any `View Additional Licensed Professionals` blocks found in the source text.
  */
-function parseLicensedProfessionalContacts(value: string | null): readonly ParsedLicensedProfessionalContact[] {
+function parseLicensedProfessionalContacts(
+  value: string | null,
+  sourceSystem: SourceSystem,
+): readonly ParsedLicensedProfessionalContact[] {
   if (value === null) return [];
   const normalized = normalizeWhitespace(value);
   if (normalized.length === 0) return [];
@@ -678,9 +691,9 @@ function parseLicensedProfessionalContacts(value: string | null): readonly Parse
     ? ""
     : normalized.slice(markerIndex + ADDITIONAL_LICENSED_PROFESSIONALS_MARKER.length).trim();
   const contacts: ParsedLicensedProfessionalContact[] = [];
-  if (primaryText.length > 0) contacts.push(parseLicensedProfessionalBlock(primaryText, 1, true));
+  if (primaryText.length > 0) contacts.push(parseLicensedProfessionalBlock(primaryText, 1, true, sourceSystem));
   for (const block of splitAdditionalLicensedProfessionalBlocks(additionalText)) {
-    contacts.push(parseLicensedProfessionalBlock(block, contacts.length + 1, false));
+    contacts.push(parseLicensedProfessionalBlock(block, contacts.length + 1, false, sourceSystem));
   }
   return contacts;
 }
@@ -715,6 +728,7 @@ function parseLicensedProfessionalBlock(
   rawText: string,
   sequenceNumber: number,
   isPrimary: boolean,
+  sourceSystem: SourceSystem,
 ): ParsedLicensedProfessionalContact {
   const normalizedRawText = normalizeWhitespace(rawText);
   const license = parseContractorLicense(normalizedRawText);
@@ -743,9 +757,9 @@ function parseLicensedProfessionalBlock(
     addressText: addressSplit.addressText,
     licenseType: license?.licenseType ?? null,
     licenseNumber,
-    personSourceRecordKey: buildContractorPersonSourceRecordKey(nameParts.personName, licenseNumber),
-    companySourceRecordKey: buildContractorCompanySourceRecordKey(nameParts.companyName),
-    addressSourceRecordKey: buildContractorAddressSourceRecordKey(addressSplit.addressText),
+    personSourceRecordKey: buildContractorPersonSourceRecordKey(nameParts.personName, licenseNumber, sourceSystem),
+    companySourceRecordKey: buildContractorCompanySourceRecordKey(nameParts.companyName, sourceSystem),
+    addressSourceRecordKey: buildContractorAddressSourceRecordKey(addressSplit.addressText, sourceSystem),
     sourcePayload,
   };
 }
@@ -834,23 +848,24 @@ function splitPersonName(value: string): ParsedPersonNameParts {
 function buildContractorPersonSourceRecordKey(
   personName: string | null,
   licenseNumber: string | null,
+  sourceSystem: SourceSystem,
 ): string | null {
   const normalizedName = normalizeName(personName);
   if (normalizedName === null) return null;
   const normalizedLicenseNumber = normalizeContractorLicenseNumber(licenseNumber);
-  return `lee_accela:contractor_person:${hashString(`${normalizedName}\n${normalizedLicenseNumber ?? ""}`)}`;
+  return `${sourceSystem}:contractor_person:${hashString(`${normalizedName}\n${normalizedLicenseNumber ?? ""}`)}`;
 }
 
-function buildContractorCompanySourceRecordKey(companyName: string | null): string | null {
+function buildContractorCompanySourceRecordKey(companyName: string | null, sourceSystem: SourceSystem): string | null {
   const canonicalName = canonicalizeContractorName(companyName);
   if (canonicalName === null) return null;
-  return `lee_accela:contractor_company:${hashString(canonicalName)}`;
+  return `${sourceSystem}:contractor_company:${hashString(canonicalName)}`;
 }
 
-function buildContractorAddressSourceRecordKey(addressText: string | null): string | null {
+function buildContractorAddressSourceRecordKey(addressText: string | null, sourceSystem: SourceSystem): string | null {
   const normalizedAddressKey = buildNormalizedAddressKey(addressText);
   if (normalizedAddressKey === null) return null;
-  return `lee_accela:contractor_address:${hashString(normalizedAddressKey)}`;
+  return `${sourceSystem}:contractor_address:${hashString(normalizedAddressKey)}`;
 }
 
 function canonicalizeContractorName(value: unknown): string | null {
@@ -876,6 +891,7 @@ function buildLicensedProfessionalContactRow(
   contact: ParsedLicensedProfessionalContact,
   permitKey: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
   const sourceRecordKey = contact.isPrimary
     ? `${permitKey}:contact:licensed_professional`
@@ -891,7 +907,7 @@ function buildLicensedProfessionalContactRow(
     references,
     values: compactObject({
       ...buildSourceMetadata({
-        sourceSystem: PERMIT_SOURCE_SYSTEM,
+        sourceSystem,
         sourceRecordKey,
         sourcePayload: contact.sourcePayload,
         sourceArtifactUri: artifactUri,
@@ -912,6 +928,7 @@ function buildPermitContactRow(
   sourcePayload: JsonObject,
   permitKey: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): PreparedRow {
   const sourceRecordKey = `${permitKey}:contact:${role.toLowerCase()}`;
   return {
@@ -919,7 +936,7 @@ function buildPermitContactRow(
     references: { propertyImprovementSourceRecordKey: permitKey },
     values: compactObject({
       ...buildSourceMetadata({
-        sourceSystem: PERMIT_SOURCE_SYSTEM,
+        sourceSystem,
         sourceRecordKey,
         sourcePayload,
         sourceArtifactUri: artifactUri,
@@ -937,6 +954,7 @@ function mapPermitInspections(
   recordNumber: string | null,
   permitKey: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
   const inspections = Array.isArray(record.completedInspections)
     ? record.completedInspections.filter(isJsonObject)
@@ -949,7 +967,7 @@ function mapPermitInspections(
       references: { propertyImprovementSourceRecordKey: permitKey },
       values: compactObject({
         ...buildSourceMetadata({
-          sourceSystem: PERMIT_SOURCE_SYSTEM,
+          sourceSystem,
           sourceRecordKey,
           sourcePayload: inspection,
           sourceArtifactUri: artifactUri,
@@ -973,6 +991,7 @@ function mapPermitLinks(
   record: JsonObject,
   permitKey: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
   const links = [
     ...readLinkArray(record.documentLinks, "DOCUMENT"),
@@ -991,7 +1010,7 @@ function mapPermitLinks(
       references: { propertyImprovementSourceRecordKey: permitKey },
       values: compactObject({
         ...buildSourceMetadata({
-          sourceSystem: PERMIT_SOURCE_SYSTEM,
+          sourceSystem,
           sourceRecordKey,
           sourcePayload: link,
           sourceArtifactUri: artifactUri,
@@ -1028,6 +1047,7 @@ function mapPermitCustomFields(
   moreDetails: JsonObject,
   permitKey: string,
   artifactUri: string | null,
+  sourceSystem: SourceSystem,
 ): readonly PreparedRow[] {
   return Object.entries(moreDetails).map(([fieldName, fieldValue]) => {
     const sourceRecordKey = `${permitKey}:custom:${fieldName.toLowerCase().replace(/[^a-z0-9]+/g, "_")}`;
@@ -1036,7 +1056,7 @@ function mapPermitCustomFields(
       references: { propertyImprovementSourceRecordKey: permitKey },
       values: compactObject({
         ...buildSourceMetadata({
-          sourceSystem: PERMIT_SOURCE_SYSTEM,
+          sourceSystem,
           sourceRecordKey,
           sourcePayload: { fieldName, fieldValue },
           sourceArtifactUri: artifactUri,

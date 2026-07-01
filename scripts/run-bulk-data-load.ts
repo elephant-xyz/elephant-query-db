@@ -59,8 +59,12 @@ type BulkLoaderOptions = {
   readonly bucket: string;
   readonly concurrency: number;
   readonly envFile: string;
+  /** Appraisal source_system / parcel jurisdiction_key. Defaults to "lee_appraiser" to preserve Lee behavior. */
+  readonly jurisdictionKey: string;
   readonly limit: number | null;
   readonly permitPrefix: string;
+  /** Permit source_system. Defaults to "lee_accela" to preserve Lee behavior. */
+  readonly permitSourceSystem: string;
   readonly phase: BulkLoaderPhase;
   readonly stageDir: string;
   readonly stageFile: string | null;
@@ -372,6 +376,7 @@ async function stageAppraisal(params: {
             artifactUri: artifact.uri,
             filePath: entry.entryName,
             record,
+            sourceSystem: params.options.jurisdictionKey,
           });
           rows.push(...bundle.rows);
           skippedRecords += bundle.skippedRecords.length;
@@ -520,6 +525,7 @@ async function stageAndMergeAppraisalBatched(params: {
               artifactUri: artifact.uri,
               filePath: entry.entryName,
               record,
+              sourceSystem: params.options.jurisdictionKey,
             });
             rows.push(...bundle.rows);
             skippedRecords += bundle.skippedRecords.length;
@@ -705,7 +711,11 @@ async function stagePermits(params: {
           filteredRecords += 1;
           continue;
         }
-        const bundle = mapLeePermitDetail({ artifactUri: artifact.uri, record: record.record });
+        const bundle = mapLeePermitDetail({
+          artifactUri: artifact.uri,
+          record: record.record,
+          sourceSystem: params.options.permitSourceSystem,
+        });
         rows.push(...bundle.rows);
         skippedRecords += bundle.skippedRecords.length;
       }
@@ -1619,8 +1629,10 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
     bucket: values.get("bucket") ?? DEFAULT_BUCKET,
     concurrency: parseConcurrency(values.get("concurrency")),
     envFile: values.get("env-file") ?? ".env.local",
+    jurisdictionKey: values.get("jurisdiction-key") ?? "lee_appraiser",
     limit: parseLimit(values.get("limit")),
     permitPrefix: values.get("permit-prefix") ?? DEFAULT_PERMIT_PREFIX,
+    permitSourceSystem: values.get("permit-source-system") ?? "lee_accela",
     phase: parsePhase(values.get("phase") ?? "all"),
     scopeManifest: values.get("scope-manifest") ?? null,
     stageDir: values.get("stage-dir") ?? DEFAULT_STAGE_DIR,
@@ -1751,8 +1763,10 @@ function redactedOptions(options: BulkLoaderOptions): JsonObject {
     bucket: options.bucket,
     concurrency: options.concurrency,
     envFile: options.envFile,
+    jurisdictionKey: options.jurisdictionKey,
     limit: options.limit,
     permitPrefix: options.permitPrefix,
+    permitSourceSystem: options.permitSourceSystem,
     phase: options.phase,
     scopeManifest: options.scopeManifest,
     stageDir: options.stageDir,
