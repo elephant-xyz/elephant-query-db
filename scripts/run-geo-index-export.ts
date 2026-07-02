@@ -217,6 +217,23 @@ export function parseOptions(argv: readonly string[]): GeoIndexExportOptions {
 // Env file loader
 // ---------------------------------------------------------------------------
 
+/**
+ * Strip a single matching pair of surrounding double or single quotes from an
+ * env value. Without this, a `.env.local` line like `DATABASE_URL="postgres://…"`
+ * is read WITH the literal quotes, so `pg` tries to connect to a host named `"`
+ * and fails with `getaddrinfo ENOTFOUND base`.
+ */
+export function unquoteEnvValue(value: string): string {
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
 function loadEnvFile(envFile: string): void {
   try {
     const text = readFileSync(envFile, "utf8");
@@ -226,7 +243,7 @@ function loadEnvFile(envFile: string): void {
       const equalsIndex = trimmed.indexOf("=");
       if (equalsIndex <= 0) continue;
       const key = trimmed.slice(0, equalsIndex);
-      const value = trimmed.slice(equalsIndex + 1);
+      const value = unquoteEnvValue(trimmed.slice(equalsIndex + 1));
       if (process.env[key] === undefined) process.env[key] = value;
     }
   } catch (caught) {
@@ -244,12 +261,26 @@ function loadEnvFile(envFile: string): void {
 // Single SQL pass
 // ---------------------------------------------------------------------------
 
+// Map the --county option to the appraisal source_system stored in the DB.
+// Defaults to `<county>_appraiser` with non-alphanumerics collapsed to underscores,
+// so new counties work without code changes (e.g. "palm-beach" -> "palm_beach_appraiser").
+// Mirrors appraisalSourceForCounty in run-property-consolidation-export.ts.
+export function appraisalSourceForCounty(county: string): string {
+  const slug = county.trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return slug.endsWith("_appraiser") ? slug : `${slug}_appraiser`;
+}
+
 /**
  * The one and only query. Joins properties → geometries → property_valuations,
  * selecting just the slim scalar columns the geo index needs. Properties with
- * no centroid are excluded (they cannot be placed on a map).
+ * no centroid are excluded (they cannot be placed on a map). Scoped to a single
+ * county via its source_system (bound as $1), so the export is county-generic.
  */
-async function fetchGeoRows(pool: Pool, limit: number | null): Promise<GeoIndexSourceRow[]> {
+async function fetchGeoRows(
+  pool: Pool,
+  sourceSystem: string,
+  limit: number | null,
+): Promise<GeoIndexSourceRow[]> {
   const limitClause = limit !== null ? `LIMIT ${limit}` : "";
   // Pre-dedupe in SQL to keep this a single slim pass with exactly one row per
   // property: collapse the many-to-one property_valuations join to the maximum
@@ -275,12 +306,12 @@ async function fetchGeoRows(pool: Pool, limit: number | null): Promise<GeoIndexS
     FROM properties p
     JOIN geometries g ON g.property_id = p.property_id
     LEFT JOIN avm a ON a.property_id = p.property_id
-    WHERE p.source_system = 'lee_appraiser'
+    WHERE p.source_system = $1
       AND g.latitude IS NOT NULL
       AND g.longitude IS NOT NULL
     ORDER BY p.property_id, g.latitude, g.longitude
     ${limitClause}
-  `);
+  `, [sourceSystem]);
   return result.rows;
 }
 
@@ -299,11 +330,13 @@ async function main(): Promise<void> {
     );
   }
 
+  const sourceSystem = appraisalSourceForCounty(options.county);
   const startedAt = new Date().toISOString();
   console.log(
     JSON.stringify({
       event: "geo_index_export_started",
       county: options.county,
+      sourceSystem,
       limit: options.limit,
       outDir: options.outDir,
       startedAt,
@@ -326,7 +359,7 @@ async function main(): Promise<void> {
   try {
     await mkdir(options.outDir, { recursive: true });
 
-    const rows = await fetchGeoRows(pg, options.limit);
+    const rows = await fetchGeoRows(pg, sourceSystem, options.limit);
     const index = buildGeoIndex(rows, { county: options.county });
 
     const json = `${JSON.stringify(index, null, 2)}\n`;

@@ -1,6 +1,7 @@
 import { createReadStream, readFileSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import {
   PutObjectCommand,
@@ -16,6 +17,7 @@ import type {
   HandlerExecutionContext,
 } from "@smithy/types";
 
+import { computeIpfsCid } from "./run-property-consolidation-export.js";
 import type { IndexFile, ManifestEntry, ManifestSummary } from "./run-property-consolidation-export.js";
 
 // ---------------------------------------------------------------------------
@@ -33,6 +35,7 @@ type UploadOptions = {
   readonly secretAccessKey: string;
   readonly filebaseApiToken: string | null;
   readonly filebaseIpnsLabel: string | null;
+  readonly forceIndex: boolean;
 };
 
 type CheckpointRecord = {
@@ -40,6 +43,39 @@ type CheckpointRecord = {
   readonly cid: string;
   readonly uploadedAt: string;
 };
+
+// Fixed-key files (index.json, manifest.json, shards/shard-*.json) share stable keys
+// across runs, so a plain skip-by-key would re-point IPNS at a STALE index whenever a
+// bucket still holds an older checkpoint (e.g. a sample export). These files must be
+// re-uploaded when their freshly-computed local CID differs from the checkpoint's.
+export type FixedKeyUploadDecision =
+  | { readonly reupload: false }
+  | {
+      readonly reupload: true;
+      readonly reason: "new" | "content_changed" | "cid_unverifiable" | "forced";
+    };
+
+/**
+ * Decide whether a fixed-key file must be (re-)uploaded. Property files stay
+ * content-addressed and skip-by-key; only the fixed-key pointer files use this.
+ *
+ * - not in checkpoint            -> upload ("new")
+ * - --force-index                -> re-upload ("forced")
+ * - local CID could not be hashed -> re-upload defensively ("cid_unverifiable")
+ * - local CID != checkpoint CID   -> re-upload ("content_changed")
+ * - local CID == checkpoint CID   -> skip
+ */
+export function decideFixedKeyUpload(
+  existing: CheckpointRecord | undefined,
+  localCid: string | null,
+  forceIndex: boolean,
+): FixedKeyUploadDecision {
+  if (existing === undefined) return { reupload: true, reason: "new" };
+  if (forceIndex) return { reupload: true, reason: "forced" };
+  if (localCid === null) return { reupload: true, reason: "cid_unverifiable" };
+  if (localCid !== existing.cid) return { reupload: true, reason: "content_changed" };
+  return { reupload: false };
+}
 
 type Checkpoint = {
   readonly schemaVersion: "1";
@@ -436,6 +472,7 @@ function parseOptions(argv: readonly string[]): UploadOptions {
     secretAccessKey,
     filebaseApiToken,
     filebaseIpnsLabel,
+    forceIndex: values.get("force-index") === "true",
   };
 }
 
@@ -618,11 +655,27 @@ async function main(): Promise<void> {
       const shardTasks = shardFileNames.map((fileName) => {
         const s3Key = `shards/${fileName}`;
         const absolutePath = join(options.exportDir, "shards", fileName);
+        // The index carries each shard's freshly-computed local CID; use it to
+        // decide whether the checkpointed copy is stale.
         const expectedCid = shardCidMap.get(fileName) ?? null;
+        const existing = alreadyUploaded.get(s3Key);
+        const decision = decideFixedKeyUpload(existing, expectedCid, options.forceIndex);
 
-        if (alreadyUploaded.has(s3Key)) {
+        if (!decision.reupload) {
           progress.skipped += 1;
           return Promise.resolve();
+        }
+
+        if (decision.reason !== "new") {
+          console.log(
+            JSON.stringify({
+              event: "fixed_key_reupload",
+              key: s3Key,
+              reason: decision.reason,
+              previousCid: existing?.cid ?? null,
+              localCid: expectedCid,
+            })
+          );
         }
 
         return semaphore.runExclusive(async () => {
@@ -650,30 +703,48 @@ async function main(): Promise<void> {
           message: "Fix failures and resume before uploading index.json.",
         })
       );
-    } else if (alreadyUploaded.has(indexKey)) {
-      indexCid = alreadyUploaded.get(indexKey)?.cid;
-      console.log(JSON.stringify({ event: "index_already_uploaded", cid: indexCid }));
     } else {
       const indexBody = await readFile(indexPath);
-      const filebaseCid = await putObjectAndCaptureCid(client, {
-        bucket: options.bucket,
-        key: indexKey,
-        body: indexBody,
-        contentType: "application/json",
-      });
+      const localIndexCid = await computeIpfsCid(indexBody);
+      const existingIndex = alreadyUploaded.get(indexKey);
+      const decision = decideFixedKeyUpload(existingIndex, localIndexCid, options.forceIndex);
 
-      if (filebaseCid === undefined) {
-        failures.push(indexKey);
-        console.error(JSON.stringify({ event: "index_upload_failed", error: "No CID returned from Filebase" }));
+      if (!decision.reupload) {
+        indexCid = existingIndex?.cid;
+        console.log(JSON.stringify({ event: "index_already_uploaded", cid: indexCid }));
       } else {
-        indexCid = filebaseCid;
-        alreadyUploaded.set(indexKey, {
+        if (decision.reason !== "new") {
+          console.log(
+            JSON.stringify({
+              event: "fixed_key_reupload",
+              key: indexKey,
+              reason: decision.reason,
+              previousCid: existingIndex?.cid ?? null,
+              localCid: localIndexCid,
+            })
+          );
+        }
+
+        const filebaseCid = await putObjectAndCaptureCid(client, {
+          bucket: options.bucket,
           key: indexKey,
-          cid: filebaseCid,
-          uploadedAt: new Date().toISOString(),
+          body: indexBody,
+          contentType: "application/json",
         });
-        writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
-        progress.uploaded += 1;
+
+        if (filebaseCid === undefined) {
+          failures.push(indexKey);
+          console.error(JSON.stringify({ event: "index_upload_failed", error: "No CID returned from Filebase" }));
+        } else {
+          indexCid = filebaseCid;
+          alreadyUploaded.set(indexKey, {
+            key: indexKey,
+            cid: filebaseCid,
+            uploadedAt: new Date().toISOString(),
+          });
+          writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
+          progress.uploaded += 1;
+        }
       }
     }
   }
@@ -691,30 +762,48 @@ async function main(): Promise<void> {
         message: "Fix failures and resume before uploading manifest.",
       })
     );
-  } else if (alreadyUploaded.has(manifestKey)) {
-    manifestCid = alreadyUploaded.get(manifestKey)?.cid;
-    console.log(JSON.stringify({ event: "manifest_already_uploaded", cid: manifestCid }));
   } else {
     const manifestBody = await readFile(manifestPath);
-    const filebaseCid = await putObjectAndCaptureCid(client, {
-      bucket: options.bucket,
-      key: manifestKey,
-      body: manifestBody,
-      contentType: "application/json",
-    });
+    const localManifestCid = await computeIpfsCid(manifestBody);
+    const existingManifest = alreadyUploaded.get(manifestKey);
+    const decision = decideFixedKeyUpload(existingManifest, localManifestCid, options.forceIndex);
 
-    if (filebaseCid === undefined) {
-      failures.push(manifestKey);
-      console.error(JSON.stringify({ event: "manifest_upload_failed", error: "No CID returned from Filebase" }));
+    if (!decision.reupload) {
+      manifestCid = existingManifest?.cid;
+      console.log(JSON.stringify({ event: "manifest_already_uploaded", cid: manifestCid }));
     } else {
-      manifestCid = filebaseCid;
-      alreadyUploaded.set(manifestKey, {
+      if (decision.reason !== "new") {
+        console.log(
+          JSON.stringify({
+            event: "fixed_key_reupload",
+            key: manifestKey,
+            reason: decision.reason,
+            previousCid: existingManifest?.cid ?? null,
+            localCid: localManifestCid,
+          })
+        );
+      }
+
+      const filebaseCid = await putObjectAndCaptureCid(client, {
+        bucket: options.bucket,
         key: manifestKey,
-        cid: filebaseCid,
-        uploadedAt: new Date().toISOString(),
+        body: manifestBody,
+        contentType: "application/json",
       });
-      writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
-      progress.uploaded += 1;
+
+      if (filebaseCid === undefined) {
+        failures.push(manifestKey);
+        console.error(JSON.stringify({ event: "manifest_upload_failed", error: "No CID returned from Filebase" }));
+      } else {
+        manifestCid = filebaseCid;
+        alreadyUploaded.set(manifestKey, {
+          key: manifestKey,
+          cid: filebaseCid,
+          uploadedAt: new Date().toISOString(),
+        });
+        writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
+        progress.uploaded += 1;
+      }
     }
   }
 
@@ -780,8 +869,20 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err: unknown) => {
-  const message = err instanceof Error ? err.message : String(err);
-  console.error(JSON.stringify({ event: "upload_failed_fatal", error: message }));
-  process.exit(1);
-});
+function isInvokedDirectly(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isInvokedDirectly()) {
+  main().catch((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(JSON.stringify({ event: "upload_failed_fatal", error: message }));
+    process.exit(1);
+  });
+}
