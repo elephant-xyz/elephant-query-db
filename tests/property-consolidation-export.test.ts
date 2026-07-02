@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   accumulateManifestStats,
+  appraisalSourceForCounty,
   assemblePropertyRecord,
   buildManifestEntry,
   buildManifestSummary,
@@ -11,6 +12,7 @@ import {
   normalizeContractorName,
   parseOptions,
   parseUnnormalizedAddress,
+  unquoteEnvValue,
 } from "../scripts/run-property-consolidation-export.js";
 
 // ---------------------------------------------------------------------------
@@ -1251,5 +1253,48 @@ describe("parseUnnormalizedAddress", () => {
       city: null,
       postalCode: "33901",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// unquoteEnvValue — .env parsing must strip surrounding quotes so a
+// DATABASE_URL="postgresql://…" line does not reach pg with literal quotes
+// (which fails with `getaddrinfo ENOTFOUND base`).
+// ---------------------------------------------------------------------------
+
+describe("unquoteEnvValue", () => {
+  it("strips surrounding double quotes", () => {
+    expect(unquoteEnvValue('"postgresql://user:pass@host/db"')).toBe(
+      "postgresql://user:pass@host/db",
+    );
+  });
+
+  it("strips surrounding single quotes", () => {
+    expect(unquoteEnvValue("'value'")).toBe("value");
+  });
+
+  it("leaves an unquoted value untouched", () => {
+    expect(unquoteEnvValue("plain-value")).toBe("plain-value");
+  });
+
+  it("does not strip a mismatched or lone quote", () => {
+    expect(unquoteEnvValue("\"unbalanced")).toBe("\"unbalanced");
+    expect(unquoteEnvValue("'mixed\"")).toBe("'mixed\"");
+    expect(unquoteEnvValue('"')).toBe('"');
+  });
+});
+
+describe("appraisalSourceForCounty", () => {
+  it("maps a slug county to <slug>_appraiser", () => {
+    expect(appraisalSourceForCounty("palm-beach")).toBe("palm_beach_appraiser");
+    expect(appraisalSourceForCounty("lee")).toBe("lee_appraiser");
+  });
+
+  it("collapses spaces and casing to a normalized source_system", () => {
+    expect(appraisalSourceForCounty("Palm Beach")).toBe("palm_beach_appraiser");
+  });
+
+  it("does not double the _appraiser suffix when already present", () => {
+    expect(appraisalSourceForCounty("lee_appraiser")).toBe("lee_appraiser");
   });
 });

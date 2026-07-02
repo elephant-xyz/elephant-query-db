@@ -121,3 +121,58 @@ describe("buildGeoIndex", () => {
     expect(index.count).toBe(index.entries.length);
   });
 });
+
+// ---------------------------------------------------------------------------
+// unquoteEnvValue — .env parsing must strip surrounding quotes so a
+// DATABASE_URL="postgresql://…" line does not reach pg with literal quotes
+// (which fails with `getaddrinfo ENOTFOUND base`).
+// ---------------------------------------------------------------------------
+
+describe("unquoteEnvValue", () => {
+  it("strips surrounding double quotes", async () => {
+    const { unquoteEnvValue } = await import(EXPORT_MODULE);
+    expect(unquoteEnvValue('"postgresql://user:pass@host/db"')).toBe(
+      "postgresql://user:pass@host/db",
+    );
+  });
+
+  it("strips surrounding single quotes", async () => {
+    const { unquoteEnvValue } = await import(EXPORT_MODULE);
+    expect(unquoteEnvValue("'value'")).toBe("value");
+  });
+
+  it("leaves an unquoted value untouched", async () => {
+    const { unquoteEnvValue } = await import(EXPORT_MODULE);
+    expect(unquoteEnvValue("plain-value")).toBe("plain-value");
+  });
+
+  it("does not strip a mismatched or lone quote", async () => {
+    const { unquoteEnvValue } = await import(EXPORT_MODULE);
+    expect(unquoteEnvValue("\"unbalanced")).toBe("\"unbalanced");
+    expect(unquoteEnvValue("'mixed\"")).toBe("'mixed\"");
+    expect(unquoteEnvValue('"')).toBe('"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// appraisalSourceForCounty — the geo query must scope to the requested county's
+// source_system (not the hardcoded lee_appraiser).
+// ---------------------------------------------------------------------------
+
+describe("appraisalSourceForCounty", () => {
+  it("maps a slug county to <slug>_appraiser", async () => {
+    const { appraisalSourceForCounty } = await import(EXPORT_MODULE);
+    expect(appraisalSourceForCounty("palm-beach")).toBe("palm_beach_appraiser");
+    expect(appraisalSourceForCounty("lee")).toBe("lee_appraiser");
+  });
+
+  it("collapses spaces and casing to a normalized source_system", async () => {
+    const { appraisalSourceForCounty } = await import(EXPORT_MODULE);
+    expect(appraisalSourceForCounty("Palm Beach")).toBe("palm_beach_appraiser");
+  });
+
+  it("does not double the _appraiser suffix when already present", async () => {
+    const { appraisalSourceForCounty } = await import(EXPORT_MODULE);
+    expect(appraisalSourceForCounty("lee_appraiser")).toBe("lee_appraiser");
+  });
+});
