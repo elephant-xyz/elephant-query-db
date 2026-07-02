@@ -46,7 +46,10 @@
     "load:select-industrial-scope": "tsx scripts/select-incremental-industrial-scope.ts",
     "permits:documents": "tsx scripts/upload-permit-link-documents.ts",
     "export:property-consolidation": "tsx scripts/run-property-consolidation-export.ts",
+    "export:query-table": "tsx scripts/run-query-table-export.ts",
+    "validate:query-table": "tsx scripts/validate-query-table.ts",
     "publish:ipfs-upload": "tsx scripts/upload-consolidation-to-filebase.ts",
+    "publish:query-table": "tsx scripts/upload-query-table-to-filebase.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
@@ -54,6 +57,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1054.0",
+    "@dsnp/parquetjs": "^1.8.7",
     "@vercel/blob": "^2.4.0",
     "adm-zip": "^0.5.17",
     "drizzle-orm": "^0.45.2",
