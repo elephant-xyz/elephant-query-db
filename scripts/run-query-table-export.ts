@@ -75,6 +75,13 @@ export type QueryTableSourceRow = {
   readonly built_year: number | null;
   readonly livable_floor_area: string | null;
   readonly total_area: string | null;
+  // Building living-area is not carried on `properties` (that column is unused,
+  // 0 non-null for every county); it lives on the `layouts` detail rows and is
+  // aggregated per property in SQL. `livable_area_sq_ft` is Lee's living area;
+  // `area_under_air_sq_ft` (conditioned area) is Palm Beach's, which has no
+  // `livable_area_sq_ft`. See buildQueryTableRow for the resolution order.
+  readonly layout_livable_area_sq_ft: string | null;
+  readonly layout_area_under_air_sq_ft: string | null;
   readonly assessed_value: string | null;
   readonly market_value: string | null;
   readonly land_value: string | null;
@@ -222,6 +229,14 @@ function resolveSitusAddress(row: QueryTableSourceRow): ResolvedAddress {
  * acreage prefers the direct `lot_size_acre`, deriving it from `lot_area_sqft`
  * (÷ 43,560) when the direct value is absent — for palm_beach_appraiser
  * lot_size_acre is ~0% populated while lot_area_sqft is ~92%.
+ *
+ * Building living area (the Sq Ft NEO displays) is resolved from the layout
+ * aggregate, not `properties.livable_floor_area` (unused, 0 non-null every
+ * county): prefer the property column if it is ever populated, then Lee's
+ * `livable_area_sq_ft`, then Palm Beach's `area_under_air_sq_ft` (conditioned
+ * living area). `total_area_sq_ft` is intentionally NOT used — it is
+ * land-inflated for Lee (median 13,266 vs 3,424 living) and unreliable as a
+ * building measure.
  */
 export function buildQueryTableRow(row: QueryTableSourceRow, cid: string | null): QueryTableRow {
   const address = resolveSitusAddress(row);
@@ -250,7 +265,10 @@ export function buildQueryTableRow(row: QueryTableSourceRow, cid: string | null)
     property_type: toText(row.property_type),
     property_usage_type: toText(row.property_usage_type),
     built_year: toInteger(row.built_year),
-    livable_floor_area: toNumber(row.livable_floor_area),
+    livable_floor_area:
+      toNumber(row.livable_floor_area) ??
+      toNumber(row.layout_livable_area_sq_ft) ??
+      toNumber(row.layout_area_under_air_sq_ft),
     total_area: toNumber(row.total_area),
     assessed_value: toNumber(row.assessed_value),
     market_value: toNumber(row.market_value),
@@ -493,6 +511,17 @@ async function fetchQueryTableRows(
       FROM lots
       ORDER BY property_id
     ),
+    layout_area AS (
+      -- Building living area lives on the layout rows, one or more per property.
+      -- Only the space_type='Building' rows carry these columns (room rows carry
+      -- size_square_feet instead), so SUM ignores the NULL room rows and folds a
+      -- multi-building parcel to its total living area — one row per property.
+      SELECT property_id,
+        SUM(livable_area_sq_ft) AS livable_area_sq_ft,
+        SUM(area_under_air_sq_ft) AS area_under_air_sq_ft
+      FROM layouts
+      GROUP BY property_id
+    ),
     geom_pick AS (
       SELECT DISTINCT ON (property_id)
         property_id, latitude, longitude
@@ -586,6 +615,8 @@ async function fetchQueryTableRows(
       p.property_structure_built_year AS built_year,
       ${safeNumeric("p.livable_floor_area")} AS livable_floor_area,
       ${safeNumeric("p.total_area")} AS total_area,
+      la.livable_area_sq_ft AS layout_livable_area_sq_ft,
+      la.area_under_air_sq_ft AS layout_area_under_air_sq_ft,
       tl.assessed_value AS assessed_value,
       tl.market_value AS market_value,
       tl.land_value AS land_value,
@@ -606,6 +637,7 @@ async function fetchQueryTableRows(
     LEFT JOIN addresses a ON a.address_id = p.address_id
     LEFT JOIN geom_pick gp ON gp.property_id = p.property_id
     LEFT JOIN lot_pick lp ON lp.property_id = p.property_id
+    LEFT JOIN layout_area la ON la.property_id = p.property_id
     LEFT JOIN structure_pick sp ON sp.property_id = p.property_id
     LEFT JOIN tax_latest tl ON tl.property_id = p.property_id
     LEFT JOIN avm av ON av.property_id = p.property_id
