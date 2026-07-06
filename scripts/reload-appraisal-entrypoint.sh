@@ -25,6 +25,7 @@
 #   BATCH_SIZE            (optional)  default 20000
 #   SCOPE_MANIFEST        (optional)  S3-URI manifest path/URL to scope a TEST subset
 #   SKIP_CLEAR            (optional)  set to skip the clear step on a resumed run (or a fresh county)
+#   INCREMENTAL           (optional)  set to load only artifacts not already in the DB (skip already-loaded; safe cadence re-runs)
 #   EXPECTED_MIN_PARCELS  (optional)  validate threshold (default 510000)
 #   STEP                  (optional)  all (default) | migrate | clear | load | validate
 #                                     — run a single step (e.g. STEP=validate for a read-only smoke).
@@ -72,6 +73,9 @@ build_load_args() {
   fi
   if [ -n "${SCOPE_MANIFEST:-}" ]; then
     LOAD_ARGS="$LOAD_ARGS --scope-manifest $SCOPE_MANIFEST"
+  fi
+  if [ -n "${INCREMENTAL:-}" ]; then
+    LOAD_ARGS="$LOAD_ARGS --incremental"
   fi
   return 0
 }

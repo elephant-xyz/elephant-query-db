@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import { createQueryClient, type DatabaseQueryRunner } from "../scripts/run-data-load.js";
 import {
+  filterAlreadyLoaded,
+  type MutableIncrementalCounters,
+} from "../scripts/run-bulk-data-load.js";
+import {
   assertAppraisalPrefixIsScoped,
   buildAppraisalTransformedArtifactUri,
   buildNormalizedAddressKey,
@@ -1575,3 +1579,62 @@ function tableColumns(
     ordinal_position: index + 1,
   }));
 }
+
+describe("incremental appraisal filter", () => {
+  async function* listings(
+    items: readonly { readonly uri: string; readonly size: number | null }[],
+  ): AsyncGenerator<{ readonly uri: string; readonly size: number | null }> {
+    for (const item of items) yield item;
+  }
+
+  async function collect<Item>(iterable: AsyncIterable<Item>): Promise<Item[]> {
+    const out: Item[] = [];
+    for await (const item of iterable) out.push(item);
+    return out;
+  }
+
+  it("yields only artifacts absent from the watermark and counts skipped vs processed", async () => {
+    const source = listings([
+      { uri: "s3://bucket/a/transformed_output.zip", size: 1 },
+      { uri: "s3://bucket/b/transformed_output.zip", size: 2 },
+      { uri: "s3://bucket/c/transformed_output.zip", size: 3 },
+    ]);
+    const loadedUris = new Set(["s3://bucket/b/transformed_output.zip"]);
+    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+
+    const result = await collect(filterAlreadyLoaded(source, loadedUris, counters));
+
+    expect(result.map((item) => item.uri)).toEqual([
+      "s3://bucket/a/transformed_output.zip",
+      "s3://bucket/c/transformed_output.zip",
+    ]);
+    expect(counters).toEqual({ skipped: 1, processed: 2 });
+  });
+
+  it("yields everything and skips nothing when the watermark is empty", async () => {
+    const source = listings([
+      { uri: "s3://bucket/a/transformed_output.zip", size: 1 },
+      { uri: "s3://bucket/b/transformed_output.zip", size: 2 },
+    ]);
+    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+
+    const result = await collect(filterAlreadyLoaded(source, new Set(), counters));
+
+    expect(result).toHaveLength(2);
+    expect(counters).toEqual({ skipped: 0, processed: 2 });
+  });
+
+  it("skips everything when all artifacts are already loaded", async () => {
+    const uris = [
+      "s3://bucket/a/transformed_output.zip",
+      "s3://bucket/b/transformed_output.zip",
+    ];
+    const source = listings(uris.map((uri) => ({ uri, size: null })));
+    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+
+    const result = await collect(filterAlreadyLoaded(source, new Set(uris), counters));
+
+    expect(result).toHaveLength(0);
+    expect(counters).toEqual({ skipped: 2, processed: 0 });
+  });
+});
