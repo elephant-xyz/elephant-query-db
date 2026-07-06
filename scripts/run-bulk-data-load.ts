@@ -59,6 +59,8 @@ type BulkLoaderOptions = {
   readonly bucket: string;
   readonly concurrency: number;
   readonly envFile: string;
+  /** When true, skip appraisal artifacts whose URI is already loaded in Neon (cadence re-runs). */
+  readonly incremental: boolean;
   /** Appraisal source_system / parcel jurisdiction_key. Defaults to "lee_appraiser" to preserve Lee behavior. */
   readonly jurisdictionKey: string;
   readonly limit: number | null;
@@ -84,6 +86,11 @@ type MutableBulkCounters = {
   failedArtifacts: number;
   filteredRecords: number;
   missingArtifacts: number;
+};
+
+export type MutableIncrementalCounters = {
+  skipped: number;
+  processed: number;
 };
 
 type StageArtifactResult = {
@@ -231,6 +238,14 @@ async function main(): Promise<void> {
 
   const stageFile = options.stageFile ?? buildDefaultStageFile(options.stageDir);
 
+  // Incremental mode: load the set of appraisal artifact URIs already present in Neon
+  // ONCE up front, then filter the S3 listing so cadence re-runs only process new work.
+  const incrementalCounters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+  const loadedArtifactUris =
+    options.incremental && options.tracks.includes("appraisal") && options.phase !== "load"
+      ? await loadIncrementalWatermark({ databaseUrl, jurisdictionKey: options.jurisdictionKey })
+      : null;
+
   console.log(JSON.stringify({
     event: "bulk_loader_started",
     options: redactedOptions(options),
@@ -249,13 +264,28 @@ async function main(): Promise<void> {
   if (useAppraisalBatchMode) {
     // Batched path: appraisal is processed batch-by-batch inline; remaining tracks
     // (permits, sunbiz, bbb) are processed together in a single staging pass afterward.
-    await stageAndMergeAppraisalBatched({ counters, databaseUrl, options, scopeSelection });
+    await stageAndMergeAppraisalBatched({
+      counters,
+      databaseUrl,
+      incrementalCounters,
+      loadedArtifactUris,
+      options,
+      scopeSelection,
+    });
 
     const remainingTracks = options.tracks.filter((t) => t !== "appraisal");
     if (remainingTracks.length > 0) {
       const remainingOptions = { ...options, tracks: remainingTracks };
       if (remainingOptions.phase === "all" || remainingOptions.phase === "stage") {
-        await stageSelectedTracks({ counters, options: remainingOptions, scopeSelection, stageFile });
+        // Appraisal is handled above in batch mode; remaining tracks are never filtered.
+        await stageSelectedTracks({
+          counters,
+          incrementalCounters,
+          loadedArtifactUris: null,
+          options: remainingOptions,
+          scopeSelection,
+          stageFile,
+        });
       }
       if (remainingOptions.phase === "all" || remainingOptions.phase === "load") {
         const mergeResults = await copyAndMergeStageFile({
@@ -271,7 +301,7 @@ async function main(): Promise<void> {
   } else {
     // Legacy single-batch path (used for sunbiz/bbb/permits standalone, or explicit --batch-size 0).
     if (options.phase === "all" || options.phase === "stage") {
-      await stageSelectedTracks({ counters, options, scopeSelection, stageFile });
+      await stageSelectedTracks({ counters, incrementalCounters, loadedArtifactUris, options, scopeSelection, stageFile });
     }
     if (options.phase === "all" || options.phase === "load") {
       const mergeResults = await copyAndMergeStageFile({
@@ -296,6 +326,8 @@ async function main(): Promise<void> {
  */
 async function stageSelectedTracks(params: {
   readonly counters: MutableBulkCounters;
+  readonly incrementalCounters: MutableIncrementalCounters;
+  readonly loadedArtifactUris: ReadonlySet<string> | null;
   readonly options: BulkLoaderOptions;
   readonly scopeSelection: ScopedLoadSelection | null;
   readonly stageFile: string;
@@ -343,6 +375,8 @@ async function stageSelectedTracks(params: {
  */
 async function stageAppraisal(params: {
   readonly counters: MutableBulkCounters;
+  readonly incrementalCounters: MutableIncrementalCounters;
+  readonly loadedArtifactUris: ReadonlySet<string> | null;
   readonly options: BulkLoaderOptions;
   readonly scopeSelection: ScopedLoadSelection | null;
   readonly s3: S3Client;
@@ -350,13 +384,16 @@ async function stageAppraisal(params: {
 }): Promise<void> {
   assertAppraisalPrefixIsScoped(params.options.appraisalPrefix);
   console.log(JSON.stringify({ event: "bulk_track_started", track: "appraisal" }));
+  const baseArtifacts = listAppraisalArtifacts({
+    bucket: params.options.bucket,
+    limit: params.options.limit,
+    prefix: params.options.appraisalPrefix,
+    s3: params.s3,
+  });
   const artifactCount = await processAsyncIterable(
-    listAppraisalArtifacts({
-      bucket: params.options.bucket,
-      limit: params.options.limit,
-      prefix: params.options.appraisalPrefix,
-      s3: params.s3,
-    }),
+    params.loadedArtifactUris === null
+      ? baseArtifacts
+      : filterAlreadyLoaded(baseArtifacts, params.loadedArtifactUris, params.incrementalCounters),
     params.options.concurrency,
     async (artifact) => {
       await stageArtifact(params, artifact.uri, async () => {
@@ -410,6 +447,13 @@ async function stageAppraisal(params: {
       });
     },
   );
+  if (params.loadedArtifactUris !== null) {
+    console.log(JSON.stringify({
+      event: "incremental_filter_summary",
+      skipped: params.incrementalCounters.skipped,
+      processed: params.incrementalCounters.processed,
+    }));
+  }
   console.log(JSON.stringify({ event: "bulk_track_finished", track: "appraisal", artifactCount }));
 }
 
@@ -433,10 +477,12 @@ async function stageAppraisal(params: {
 async function stageAndMergeAppraisalBatched(params: {
   readonly counters: MutableBulkCounters;
   readonly databaseUrl: string;
+  readonly incrementalCounters: MutableIncrementalCounters;
+  readonly loadedArtifactUris: ReadonlySet<string> | null;
   readonly options: BulkLoaderOptions;
   readonly scopeSelection: ScopedLoadSelection | null;
 }): Promise<void> {
-  const { counters, databaseUrl, options, scopeSelection } = params;
+  const { counters, databaseUrl, incrementalCounters, loadedArtifactUris, options, scopeSelection } = params;
   const s3 = new S3Client({});
 
   assertAppraisalPrefixIsScoped(options.appraisalPrefix);
@@ -445,7 +491,11 @@ async function stageAndMergeAppraisalBatched(params: {
   // Include batch-size in the checkpoint filename so runs with different batch
   // sizes don't cross-contaminate each other's resume state.
   const batchCheckpointPath = join(options.stageDir, `appraisal-batch-checkpoint-n${options.batchSize}.json`);
-  const completedBatches = await readBatchCheckpoint(batchCheckpointPath);
+  // Each incremental cadence run is an independent set of not-yet-loaded artifacts,
+  // so a prior cycle's batch checkpoint must not skip this cycle's (renumbered) batches.
+  const completedBatches = options.incremental
+    ? new Set<number>()
+    : await readBatchCheckpoint(batchCheckpointPath);
 
   console.log(JSON.stringify({
     event: "appraisal_batch_mode_started",
@@ -453,12 +503,15 @@ async function stageAndMergeAppraisalBatched(params: {
     completedBatches: [...completedBatches],
   }));
 
-  const artifactIterator = listAppraisalArtifacts({
+  const baseArtifacts = listAppraisalArtifacts({
     bucket: options.bucket,
     limit: options.limit,
     prefix: options.appraisalPrefix,
     s3,
   });
+  const artifactIterator = loadedArtifactUris === null
+    ? baseArtifacts
+    : filterAlreadyLoaded(baseArtifacts, loadedArtifactUris, incrementalCounters);
 
   let batchIndex = 0;
   let batchBuffer: S3ObjectListing[] = [];
@@ -619,7 +672,12 @@ async function stageAndMergeAppraisalBatched(params: {
     });
 
     completedBatches.add(currentBatch);
-    writeBatchCheckpoint(batchCheckpointPath, completedBatches);
+    // Skip persisting resume state in incremental mode: batch indices are re-numbered
+    // per cadence run, so a stored checkpoint would be meaningless (and could mislead a
+    // later non-incremental resume) — see the completedBatches init above.
+    if (!options.incremental) {
+      writeBatchCheckpoint(batchCheckpointPath, completedBatches);
+    }
 
     console.log(JSON.stringify({
       event: "appraisal_batch_completed",
@@ -639,6 +697,14 @@ async function stageAndMergeAppraisalBatched(params: {
   // Flush any remaining artifacts as a final (possibly smaller) batch.
   if (batchBuffer.length > 0) {
     await flushBatch(batchBuffer);
+  }
+
+  if (loadedArtifactUris !== null) {
+    console.log(JSON.stringify({
+      event: "incremental_filter_summary",
+      skipped: incrementalCounters.skipped,
+      processed: incrementalCounters.processed,
+    }));
   }
 
   console.log(JSON.stringify({
@@ -1127,6 +1193,68 @@ async function createKeepaliveClient(databaseUrl: string): Promise<Client> {
   });
   await client.connect();
   return client;
+}
+
+/**
+ * Load the set of appraisal artifact URIs already present in Neon for a jurisdiction.
+ *
+ * Used by incremental cadence runs as a watermark: any artifact whose
+ * `source_artifact_uri` is already recorded on `parcels` has been loaded and can be
+ * skipped. The exact S3 URI is stored at load time, so an exact-match set is reliable.
+ *
+ * @param params - Database URL and the parcel jurisdiction_key to scope the watermark.
+ * @returns Set of already-loaded artifact URIs.
+ */
+async function loadIncrementalWatermark(params: {
+  readonly databaseUrl: string;
+  readonly jurisdictionKey: string;
+}): Promise<Set<string>> {
+  const client = await createKeepaliveClient(params.databaseUrl);
+  try {
+    const result = await client.query<{ source_artifact_uri: string }>(
+      "SELECT source_artifact_uri FROM parcels WHERE jurisdiction_key = $1 AND source_artifact_uri IS NOT NULL",
+      [params.jurisdictionKey],
+    );
+    const loadedUris = new Set<string>();
+    for (const row of result.rows) {
+      if (typeof row.source_artifact_uri === "string") loadedUris.add(row.source_artifact_uri);
+    }
+    console.log(JSON.stringify({
+      event: "incremental_watermark_loaded",
+      jurisdictionKey: params.jurisdictionKey,
+      alreadyLoaded: loadedUris.size,
+    }));
+    return loadedUris;
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * Wrap an appraisal artifact listing so already-loaded artifacts are skipped.
+ *
+ * The idempotent merges make re-processing a loaded artifact harmless, so this filter
+ * is purely a work-avoidance optimization for cadence re-runs; a missed or extra
+ * artifact is never a correctness bug.
+ *
+ * @param artifacts - Source artifact listings from `listAppraisalArtifacts`.
+ * @param loadedUris - Artifact URIs already present in Neon (the incremental watermark).
+ * @param counters - Mutable counters incremented for each skipped / yielded artifact.
+ * @yields Only the artifacts whose URI is not already loaded.
+ */
+export async function* filterAlreadyLoaded(
+  artifacts: AsyncIterable<S3ObjectListing>,
+  loadedUris: ReadonlySet<string>,
+  counters: MutableIncrementalCounters,
+): AsyncGenerator<S3ObjectListing> {
+  for await (const artifact of artifacts) {
+    if (loadedUris.has(artifact.uri)) {
+      counters.skipped += 1;
+      continue;
+    }
+    counters.processed += 1;
+    yield artifact;
+  }
 }
 
 /**
@@ -1629,6 +1757,7 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
     bucket: values.get("bucket") ?? DEFAULT_BUCKET,
     concurrency: parseConcurrency(values.get("concurrency")),
     envFile: values.get("env-file") ?? ".env.local",
+    incremental: values.get("incremental") === "true",
     jurisdictionKey: values.get("jurisdiction-key") ?? "lee_appraiser",
     limit: parseLimit(values.get("limit")),
     permitPrefix: values.get("permit-prefix") ?? DEFAULT_PERMIT_PREFIX,
@@ -1763,6 +1892,7 @@ function redactedOptions(options: BulkLoaderOptions): JsonObject {
     bucket: options.bucket,
     concurrency: options.concurrency,
     envFile: options.envFile,
+    incremental: options.incremental,
     jurisdictionKey: options.jurisdictionKey,
     limit: options.limit,
     permitPrefix: options.permitPrefix,
