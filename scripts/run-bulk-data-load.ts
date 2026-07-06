@@ -5,7 +5,7 @@ import type { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import AdmZip from "adm-zip";
-import { GetObjectCommand, ListObjectsV2Command, S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { from as copyFrom } from "pg-copy-streams";
 import { Client, Pool, type PoolClient } from "pg";
 
@@ -132,6 +132,12 @@ const DEFAULT_BBB_PREFIX = "permit-harvest/bbb/category-data/browser-harvest-v1/
 const DEFAULT_STAGE_DIR = ".loader-runs/bulk-staging";
 const STAGE_TABLE_PREFIX = "elephant_bulk_stage";
 
+// Global cross-county serialization lock. Concurrent incremental county loads
+// deadlock on shared parent tables, so a single fixed-key Postgres session
+// advisory lock ensures only one incremental load runs at a time across every
+// county. Held for the whole run; releasing the session releases the lock.
+const INCREMENTAL_LOAD_LOCK_KEY = 911001;
+
 const APPRAISAL_TABLE_ORDER: readonly LogicalTableName[] = [
   "unnormalized_addresses",
   "addresses",
@@ -224,98 +230,139 @@ async function main(): Promise<void> {
     throw new Error(`DATABASE_URL is required; expected it in ${options.envFile} or the environment`);
   }
 
-  const scopeSelection = options.scopeManifest === null
-    ? null
-    : loadScopedSelection(options.scopeManifest);
-  const counters = emptyCounters();
+  // Incremental status is an optional machine-readable contract for a downstream
+  // Step Functions loop; it is only meaningful in incremental mode.
+  const incrementalStatusUri = options.incremental
+    ? (process.env.INCREMENTAL_STATUS_URI ?? null)
+    : null;
 
-  // Batched appraisal mode: stage + merge each batch atomically so peak disk usage
-  // equals ONE batch CSV (~few GB) rather than all 501k artifacts at once (~106 GB).
-  const useAppraisalBatchMode =
-    options.batchSize > 0 &&
-    options.tracks.includes("appraisal") &&
-    options.phase !== "load"; // --phase load resumes via --stage-table; skip batch routing
-
-  const stageFile = options.stageFile ?? buildDefaultStageFile(options.stageDir);
-
-  // Incremental mode: load the set of appraisal artifact URIs already present in Neon
-  // ONCE up front, then filter the S3 listing so cadence re-runs only process new work.
-  const incrementalCounters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
-  const loadedArtifactUris =
-    options.incremental && options.tracks.includes("appraisal") && options.phase !== "load"
-      ? await loadIncrementalWatermark({ databaseUrl, jurisdictionKey: options.jurisdictionKey })
-      : null;
-
-  console.log(JSON.stringify({
-    event: "bulk_loader_started",
-    options: redactedOptions(options),
-    scope: scopeSelection === null
-      ? null
-      : {
-          appraisalArtifactUriCount: scopeSelection.appraisalArtifactUris.size,
-          addressBaseCount: scopeSelection.addressBases.size,
-          parcelIdentifierCount: scopeSelection.parcelIdentifiers.size,
-          sourceCandidateCount: scopeSelection.sourceCandidateCount,
-        },
-    batchMode: useAppraisalBatchMode,
-    stageFile: useAppraisalBatchMode ? "(per-batch)" : stageFile,
-  }));
-
-  if (useAppraisalBatchMode) {
-    // Batched path: appraisal is processed batch-by-batch inline; remaining tracks
-    // (permits, sunbiz, bbb) are processed together in a single staging pass afterward.
-    await stageAndMergeAppraisalBatched({
-      counters,
-      databaseUrl,
-      incrementalCounters,
-      loadedArtifactUris,
-      options,
-      scopeSelection,
-    });
-
-    const remainingTracks = options.tracks.filter((t) => t !== "appraisal");
-    if (remainingTracks.length > 0) {
-      const remainingOptions = { ...options, tracks: remainingTracks };
-      if (remainingOptions.phase === "all" || remainingOptions.phase === "stage") {
-        // Appraisal is handled above in batch mode; remaining tracks are never filtered.
-        await stageSelectedTracks({
-          counters,
-          incrementalCounters,
-          loadedArtifactUris: null,
-          options: remainingOptions,
-          scopeSelection,
-          stageFile,
-        });
+  // Incremental mode: serialize all county loads behind one global advisory lock so
+  // that only a single incremental load runs at a time (see INCREMENTAL_LOAD_LOCK_KEY).
+  // The lock client is held open for the whole run and released in the finally below.
+  let lockClient: Client | null = null;
+  if (options.incremental) {
+    lockClient = await createKeepaliveClient(databaseUrl);
+    const lockResult = await lockClient.query<{ acquired: boolean }>(
+      "SELECT pg_try_advisory_lock($1) AS acquired",
+      [INCREMENTAL_LOAD_LOCK_KEY],
+    );
+    if (lockResult.rows[0]?.acquired !== true) {
+      // Another incremental load already holds the lock; a skipped cycle is not an
+      // error, so record it and exit cleanly (process exits 0).
+      console.log(JSON.stringify({ event: "incremental_load_lock_busy", key: INCREMENTAL_LOAD_LOCK_KEY }));
+      await lockClient.end();
+      if (incrementalStatusUri !== null) {
+        await writeIncrementalStatus(incrementalStatusUri, { processed: 0, skipped: true });
       }
-      if (remainingOptions.phase === "all" || remainingOptions.phase === "load") {
+      return;
+    }
+    console.log(JSON.stringify({ event: "incremental_load_lock_acquired", key: INCREMENTAL_LOAD_LOCK_KEY }));
+  }
+
+  try {
+    const scopeSelection = options.scopeManifest === null
+      ? null
+      : loadScopedSelection(options.scopeManifest);
+    const counters = emptyCounters();
+
+    // Batched appraisal mode: stage + merge each batch atomically so peak disk usage
+    // equals ONE batch CSV (~few GB) rather than all 501k artifacts at once (~106 GB).
+    const useAppraisalBatchMode =
+      options.batchSize > 0 &&
+      options.tracks.includes("appraisal") &&
+      options.phase !== "load"; // --phase load resumes via --stage-table; skip batch routing
+
+    const stageFile = options.stageFile ?? buildDefaultStageFile(options.stageDir);
+
+    // Incremental mode: load the set of appraisal artifact URIs already present in Neon
+    // ONCE up front, then filter the S3 listing so cadence re-runs only process new work.
+    const incrementalCounters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+    const loadedArtifactUris =
+      options.incremental && options.tracks.includes("appraisal") && options.phase !== "load"
+        ? await loadIncrementalWatermark({ databaseUrl, jurisdictionKey: options.jurisdictionKey })
+        : null;
+
+    console.log(JSON.stringify({
+      event: "bulk_loader_started",
+      options: redactedOptions(options),
+      scope: scopeSelection === null
+        ? null
+        : {
+            appraisalArtifactUriCount: scopeSelection.appraisalArtifactUris.size,
+            addressBaseCount: scopeSelection.addressBases.size,
+            parcelIdentifierCount: scopeSelection.parcelIdentifiers.size,
+            sourceCandidateCount: scopeSelection.sourceCandidateCount,
+          },
+      batchMode: useAppraisalBatchMode,
+      stageFile: useAppraisalBatchMode ? "(per-batch)" : stageFile,
+    }));
+
+    if (useAppraisalBatchMode) {
+      // Batched path: appraisal is processed batch-by-batch inline; remaining tracks
+      // (permits, sunbiz, bbb) are processed together in a single staging pass afterward.
+      await stageAndMergeAppraisalBatched({
+        counters,
+        databaseUrl,
+        incrementalCounters,
+        loadedArtifactUris,
+        options,
+        scopeSelection,
+      });
+
+      const remainingTracks = options.tracks.filter((t) => t !== "appraisal");
+      if (remainingTracks.length > 0) {
+        const remainingOptions = { ...options, tracks: remainingTracks };
+        if (remainingOptions.phase === "all" || remainingOptions.phase === "stage") {
+          // Appraisal is handled above in batch mode; remaining tracks are never filtered.
+          await stageSelectedTracks({
+            counters,
+            incrementalCounters,
+            loadedArtifactUris: null,
+            options: remainingOptions,
+            scopeSelection,
+            stageFile,
+          });
+        }
+        if (remainingOptions.phase === "all" || remainingOptions.phase === "load") {
+          const mergeResults = await copyAndMergeStageFile({
+            databaseUrl,
+            stageDir: options.stageDir,
+            stageFile,
+            stageTable: options.stageTable,
+            tableOrder: tableOrderForTracks(remainingTracks),
+          });
+          console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
+        }
+      }
+    } else {
+      // Legacy single-batch path (used for sunbiz/bbb/permits standalone, or explicit --batch-size 0).
+      if (options.phase === "all" || options.phase === "stage") {
+        await stageSelectedTracks({ counters, incrementalCounters, loadedArtifactUris, options, scopeSelection, stageFile });
+      }
+      if (options.phase === "all" || options.phase === "load") {
         const mergeResults = await copyAndMergeStageFile({
           databaseUrl,
           stageDir: options.stageDir,
           stageFile,
           stageTable: options.stageTable,
-          tableOrder: tableOrderForTracks(remainingTracks),
+          tableOrder: tableOrderForTracks(options.tracks),
         });
         console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
       }
     }
-  } else {
-    // Legacy single-batch path (used for sunbiz/bbb/permits standalone, or explicit --batch-size 0).
-    if (options.phase === "all" || options.phase === "stage") {
-      await stageSelectedTracks({ counters, incrementalCounters, loadedArtifactUris, options, scopeSelection, stageFile });
-    }
-    if (options.phase === "all" || options.phase === "load") {
-      const mergeResults = await copyAndMergeStageFile({
-        databaseUrl,
-        stageDir: options.stageDir,
-        stageFile,
-        stageTable: options.stageTable,
-        tableOrder: tableOrderForTracks(options.tracks),
-      });
-      console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
-    }
-  }
 
-  console.log(JSON.stringify({ event: "bulk_loader_finished", counters, stageFile: useAppraisalBatchMode ? "(batched)" : stageFile }));
+    console.log(JSON.stringify({ event: "bulk_loader_finished", counters, stageFile: useAppraisalBatchMode ? "(batched)" : stageFile }));
+
+    if (incrementalStatusUri !== null) {
+      await writeIncrementalStatus(incrementalStatusUri, {
+        processed: incrementalCounters.processed,
+        skipped: false,
+      });
+    }
+  } finally {
+    // Closing the session releases the global advisory lock held for this run.
+    if (lockClient !== null) await lockClient.end();
+  }
 }
 
 /**
@@ -1631,6 +1678,36 @@ async function readS3ObjectBuffer(s3: S3Client, artifactUri: string): Promise<Bu
     return Buffer.from(bytes);
   }
   throw new Error(`Unsupported S3 body type for ${artifactUri}`);
+}
+
+/**
+ * Write the machine-readable incremental status object to S3.
+ *
+ * A downstream Step Functions machine parses exactly the `processed` and `skipped`
+ * fields, so those names are a fixed contract and must not be renamed.
+ *
+ * @param uri - Destination `s3://bucket/key` status object URI.
+ * @param status - Processed artifact count and whether this cycle was skipped.
+ * @returns Promise that resolves once the status object has been written.
+ */
+async function writeIncrementalStatus(
+  uri: string,
+  status: { readonly processed: number; readonly skipped: boolean },
+): Promise<void> {
+  const { bucket, key } = parseS3Uri(uri);
+  const s3 = new S3Client({});
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: JSON.stringify({ processed: status.processed, skipped: status.skipped }),
+    ContentType: "application/json",
+  }));
+  console.log(JSON.stringify({
+    event: "incremental_status_written",
+    uri,
+    processed: status.processed,
+    skipped: status.skipped,
+  }));
 }
 
 /**
