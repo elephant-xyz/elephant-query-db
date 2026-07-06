@@ -65,6 +65,10 @@ Parameters:
     Type: String
     Default: ""
     Description: Set to any non-empty value to skip the FK-safe clear step (required for a fresh county, since the loader upsert is idempotent; also used on a resumed run).
+  Incremental:
+    Type: String
+    Default: ""
+    Description: Set to any non-empty value to load only artifacts not already in the DB (skip already-loaded; safe cadence re-runs). Default empty preserves current (off) behavior.
   ExpectLetterStraps:
     Type: String
     Default: "true"
@@ -157,6 +161,7 @@ Resources:
             - { Name: SUNBIZ_PREFIX, Value: !Ref SunbizPrefix }
             - { Name: BBB_PREFIX, Value: !Ref BbbPrefix }
             - { Name: SKIP_CLEAR, Value: !Ref SkipClear }
+            - { Name: INCREMENTAL, Value: !Ref Incremental }
             - { Name: EXPECT_LETTER_STRAPS, Value: !Ref ExpectLetterStraps }
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
           Secrets:
