@@ -16,7 +16,8 @@ COPY migrations ./migrations
 # sync with package.json (missing esbuild@0.28.1); ci would refuse. install reconciles it.
 RUN npm install --no-audit --no-fund
 
-RUN chmod +x scripts/reload-appraisal-entrypoint.sh
+# Strip CRLF when the image is built on Windows; `set -eu\r` breaks /bin/sh at runtime.
+RUN sed -i 's/\r$//' scripts/*.sh && chmod +x scripts/reload-appraisal-entrypoint.sh scripts/query-table-publish-entrypoint.sh
 
 # DATABASE_URL, APPRAISAL_PREFIX, etc. are injected by the task definition / Step Functions.
 ENTRYPOINT ["sh", "scripts/reload-appraisal-entrypoint.sh"]
