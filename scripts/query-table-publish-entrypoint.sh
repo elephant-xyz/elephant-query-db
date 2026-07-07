@@ -53,10 +53,21 @@ fi
 
 echo "{\"event\":\"query_table_publish_entrypoint_started\",\"county\":\"$COUNTY\",\"step\":\"$STEP\",\"validateMode\":\"$VALIDATE_MODE\",\"publishApproved\":$PUBLISH_APPROVED_LOG}"
 
+# Fargate injects DATABASE_URL + Filebase creds via Secrets Manager. Node 22 also
+# treats `--env-file` as a *runtime* flag, so passing it to tsx makes node try to
+# open `.env.local` and exit before our script runs.
+USE_ENV_FILE=true
+if [ -n "${DATABASE_URL:-}" ]; then
+  USE_ENV_FILE=false
+fi
+
 run_export() {
   # NOTE: use if/then, NOT `[ ... ] && ...` — under `set -e` a false test as the
   # function's last command makes the function return non-zero and aborts the run.
-  EXPORT_ARGS="--county $COUNTY --env-file $ENV_FILE --out-dir $OUT_DIR"
+  EXPORT_ARGS="--county $COUNTY --out-dir $OUT_DIR"
+  if [ "$USE_ENV_FILE" = true ]; then
+    EXPORT_ARGS="$EXPORT_ARGS --env-file $ENV_FILE"
+  fi
   if [ -n "${MANIFEST:-}" ]; then
     EXPORT_ARGS="$EXPORT_ARGS --manifest $MANIFEST"
   fi
@@ -65,7 +76,10 @@ run_export() {
 }
 
 run_validate() {
-  VALIDATE_ARGS="--county $COUNTY --env-file $ENV_FILE --parquet $PARQUET"
+  VALIDATE_ARGS="--county $COUNTY --parquet $PARQUET"
+  if [ "$USE_ENV_FILE" = true ]; then
+    VALIDATE_ARGS="$VALIDATE_ARGS --env-file $ENV_FILE"
+  fi
   if [ "$VALIDATE_MODE" = "parquet-only" ]; then
     VALIDATE_ARGS="$VALIDATE_ARGS --parquet-only"
   fi
@@ -74,7 +88,10 @@ run_validate() {
 }
 
 run_publish() {
-  PUBLISH_ARGS="--county $COUNTY --env-file $PUBLISH_ENV_FILE"
+  PUBLISH_ARGS="--county $COUNTY"
+  if [ "$USE_ENV_FILE" = true ]; then
+    PUBLISH_ARGS="$PUBLISH_ARGS --env-file $PUBLISH_ENV_FILE"
+  fi
   if [ -z "$PUBLISH_APPROVED" ]; then
     PUBLISH_ARGS="$PUBLISH_ARGS --dry-run"
   fi
