@@ -257,6 +257,9 @@ function buildUpdateGuardColumnsByTable(): ReadonlyMap<LogicalTableName, readonl
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_OWNER_PERSON_ID, ["owner_person_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_PROPERTY_ID, ["property_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_PROPERTY_IMPROVEMENT_ID, ["property_improvement_id"]);
+  // Incremental appraisal watermarks key off parcels.source_artifact_uri. Alternate S3 zip
+  // paths for the same folio can share a source hash; refresh the URI without rewriting data.
+  addUpdateGuardColumns(columnsByTable, new Set<LogicalTableName>(["parcels"]), ["source_artifact_uri"]);
   return new Map(
     [...columnsByTable.entries()].map(([tableName, columnNames]) => [
       tableName,

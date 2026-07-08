@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import { createQueryClient, type DatabaseQueryRunner } from "../scripts/run-data-load.js";
 import {
+  defaultBatchSize,
+  deriveIncrementalLedgerUri,
   filterAlreadyLoaded,
   type MutableIncrementalCounters,
+  resolveEffectiveIncrementalProcessed,
 } from "../scripts/run-bulk-data-load.js";
 import {
   assertAppraisalPrefixIsScoped,
@@ -1403,6 +1406,52 @@ describe("loader SQL helpers", () => {
     );
   });
 
+  it("refreshes parcel source_artifact_uri during replay when the source hash is unchanged", () => {
+    const statement = buildUpsertStatement({
+      tableName: "parcels",
+      values: {
+        jurisdiction_key: "miami_dade_appraiser",
+        request_identifier: "0101010100010",
+        parcel_identifier: "01-0101-010-0001.0010",
+        source_system: "miami_dade_appraiser",
+        source_record_key: "miami_dade_appraiser:0101010100010:parcel:property_seed",
+        source_record_hash: "hash-1",
+        source_artifact_uri: "s3://bucket/retransform/uuid-a/transformed_output.zip",
+        source_payload: { ok: true },
+      },
+    });
+
+    expect(statement.text).toContain(
+      "OR \"parcels\".\"source_artifact_uri\" IS DISTINCT FROM EXCLUDED.\"source_artifact_uri\"",
+    );
+  });
+
+  it("includes parcel source_artifact_uri in bulk merge replay guards", () => {
+    const statement = buildBulkMergeSql({
+      stageTableName: "elephant_bulk_stage_rows",
+      tableName: "parcels",
+      columns: tableColumns("parcels", [
+        "parcel_id",
+        "jurisdiction_key",
+        "request_identifier",
+        "parcel_identifier",
+        "source_system",
+        "source_record_key",
+        "source_record_hash",
+        "source_artifact_uri",
+        "source_payload",
+        "created_at",
+        "updated_at",
+        "loaded_at",
+      ]),
+    });
+
+    expect(statement).toContain("ON CONFLICT (\"jurisdiction_key\", \"request_identifier\")");
+    expect(statement).toContain(
+      "OR \"public\".\"parcels\".\"source_artifact_uri\" IS DISTINCT FROM EXCLUDED.\"source_artifact_uri\"",
+    );
+  });
+
   it("registers write specs for reserved future source tables", () => {
     const valuationStatement = buildUpsertStatement({
       tableName: "property_valuations",
@@ -1600,7 +1649,7 @@ describe("incremental appraisal filter", () => {
       { uri: "s3://bucket/c/transformed_output.zip", size: 3 },
     ]);
     const loadedUris = new Set(["s3://bucket/b/transformed_output.zip"]);
-    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0, changedRows: 0 };
 
     const result = await collect(filterAlreadyLoaded(source, loadedUris, counters));
 
@@ -1608,7 +1657,7 @@ describe("incremental appraisal filter", () => {
       "s3://bucket/a/transformed_output.zip",
       "s3://bucket/c/transformed_output.zip",
     ]);
-    expect(counters).toEqual({ skipped: 1, processed: 2 });
+    expect(counters).toEqual({ skipped: 1, processed: 2, changedRows: 0 });
   });
 
   it("yields everything and skips nothing when the watermark is empty", async () => {
@@ -1616,12 +1665,12 @@ describe("incremental appraisal filter", () => {
       { uri: "s3://bucket/a/transformed_output.zip", size: 1 },
       { uri: "s3://bucket/b/transformed_output.zip", size: 2 },
     ]);
-    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0, changedRows: 0 };
 
     const result = await collect(filterAlreadyLoaded(source, new Set(), counters));
 
     expect(result).toHaveLength(2);
-    expect(counters).toEqual({ skipped: 0, processed: 2 });
+    expect(counters).toEqual({ skipped: 0, processed: 2, changedRows: 0 });
   });
 
   it("skips everything when all artifacts are already loaded", async () => {
@@ -1630,11 +1679,46 @@ describe("incremental appraisal filter", () => {
       "s3://bucket/b/transformed_output.zip",
     ];
     const source = listings(uris.map((uri) => ({ uri, size: null })));
-    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+    const counters: MutableIncrementalCounters = { skipped: 0, processed: 0, changedRows: 0 };
 
     const result = await collect(filterAlreadyLoaded(source, new Set(uris), counters));
 
     expect(result).toHaveLength(0);
-    expect(counters).toEqual({ skipped: 2, processed: 0 });
+    expect(counters).toEqual({ skipped: 2, processed: 0, changedRows: 0 });
+  });
+
+  it("derives the appraisal artifact ledger URI at the legacy track-less path", () => {
+    expect(
+      deriveIncrementalLedgerUri(
+        "s3://elephant-oracle-node-environmentbucket-mmsoo3xbdi80/incremental-status/miami-dade/appraisal.json",
+        "miami_dade_appraiser",
+        "appraisal",
+      ),
+    ).toBe(
+      "s3://elephant-oracle-node-environmentbucket-mmsoo3xbdi80/incremental-ledgers/miami_dade_appraiser/artifact-uris.json",
+    );
+  });
+
+  it("namespaces non-appraisal track ledgers under the track name", () => {
+    expect(
+      deriveIncrementalLedgerUri(
+        "s3://elephant-oracle-node-environmentbucket-mmsoo3xbdi80/incremental-status/miami-dade/permits.json",
+        "miami_dade_appraiser",
+        "permits",
+      ),
+    ).toBe(
+      "s3://elephant-oracle-node-environmentbucket-mmsoo3xbdi80/incremental-ledgers/miami_dade_appraiser/permits/artifact-uris.json",
+    );
+  });
+
+  it("reports processed 0 when artifacts were touched but no rows changed", () => {
+    expect(resolveEffectiveIncrementalProcessed({ skipped: 959000, processed: 26342, changedRows: 0 })).toBe(0);
+    expect(resolveEffectiveIncrementalProcessed({ skipped: 0, processed: 12, changedRows: 3 })).toBe(12);
+    expect(resolveEffectiveIncrementalProcessed({ skipped: 100, processed: 0, changedRows: 0 })).toBe(0);
+  });
+
+  it("uses a smaller default batch size for incremental cadence runs", () => {
+    expect(defaultBatchSize(true)).toBe(500);
+    expect(defaultBatchSize(false)).toBe(20_000);
   });
 });

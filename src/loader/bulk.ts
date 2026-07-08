@@ -347,6 +347,8 @@ function buildBulkUpdateGuardColumnsByTable(): ReadonlyMap<LogicalTableName, rea
     new Set<LogicalTableName>(["business_registration_addresses"]),
     BUSINESS_REGISTRATION_ADDRESS_HYDRATION_COLUMNS.map((column) => column.targetColumnName),
   );
+  // See sql.ts: parcel incremental watermarks compare exact artifact URIs.
+  addBulkUpdateGuardColumns(columnsByTable, new Set<LogicalTableName>(["parcels"]), ["source_artifact_uri"]);
   return new Map(
     [...columnsByTable.entries()].map(([tableName, columnNames]) => [
       tableName,
