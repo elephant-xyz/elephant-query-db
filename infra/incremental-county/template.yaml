@@ -1,23 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Source-agnostic, per-county INCREMENTAL ingestion orchestration split into TWO
-  independent state machines that share one ECS cluster + image (Dockerfile.reload):
-
-  1. LOAD machine (source-agnostic; run ONE execution per source/track per county).
-     Runs one Fargate "load" task in --incremental mode for a single TRACK
-     (appraisal|permits|sunbiz|bbb) reading SOURCE_PREFIX, writes a {processed,skipped}
-     status JSON to S3, and — when processed>0 — flips a per-county publish-pending flag
-     in S3, then loops until the seed feeder is drained (appraisal) or forever (permit
-     deltas). It NEVER publishes; it only loads and signals.
-
-  2. PUBLISH machine (per-county singleton; run ONE execution per county). Polls the
-     per-county publish-pending flag; when set it clears the flag, exports+validates the
-     query-table Parquet, and re-points the oracle-query-table-<county> IPNS. Coalesces
-     signals from every LOAD execution into a single county publish, so appraisal and
-     permit loads never race on the shared county Parquet.
-
-  Two task definitions share ONE image; each sets its own EntryPoint because a Fargate
-  command override cannot replace the image ENTRYPOINT. Pure CloudFormation (no SAM Transform).
+  Source-agnostic, per-county INCREMENTAL ingestion split into TWO state machines
+  sharing one ECS cluster + image. LOAD machine: one execution per track
+  (appraisal|permits|sunbiz|bbb), loads --incremental, flips a per-county
+  publish-pending S3 flag when processed>0. PUBLISH machine: per-county singleton
+  that polls the flag, exports+validates the query-table Parquet, and re-points the
+  oracle-query-table-<county> IPNS. Pure CloudFormation (no SAM Transform).
 
 Parameters:
   ImageUri:
@@ -414,8 +402,24 @@ Resources:
       DefinitionString: |
         {
           "Comment": "Per-county singleton PUBLISH loop: poll publish-pending flag -> when set, clear it, export+validate query-table Parquet, re-point oracle-query-table-<county> IPNS -> wait -> loop. Coalesces signals from every LOAD execution so appraisal + permit loads never race on the shared county Parquet.",
-          "StartAt": "ReadPending",
+          "StartAt": "StopCheck",
           "States": {
+            "StopCheck": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    { "Variable": "$.stop", "IsPresent": true },
+                    { "Variable": "$.stop", "BooleanEquals": true }
+                  ],
+                  "Next": "Done"
+                }
+              ],
+              "Default": "ReadPending"
+            },
+            "Done": {
+              "Type": "Succeed"
+            },
             "ReadPending": {
               "Type": "Task",
               "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
@@ -517,7 +521,7 @@ Resources:
             "PublishWait": {
               "Type": "Wait",
               "SecondsPath": "$.waitSeconds",
-              "Next": "ReadPending"
+              "Next": "StopCheck"
             }
           }
         }
