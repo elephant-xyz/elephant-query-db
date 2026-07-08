@@ -60,9 +60,28 @@ else
 fi
 
 # Coverage snapshot for Donphan / getOracleDatasetInfo contract (rows upserted in Neon).
+# Writes to the private status bucket AND a local file, then publishes that file
+# to public IPFS so the MCP can read it via DATASET_COVERAGE_MAP.
+COVERAGE_PATH=".dataset-coverage/$COUNTY/dataset-coverage.json"
 if [ -n "${STATUS_BUCKET:-}" ]; then
   # shellcheck disable=SC2086
   $TSX scripts/write-oracle-dataset-coverage-snapshot.ts
+
+  # Publish the coverage JSON to its own IPNS (oracle-dataset-coverage-<county>).
+  # Self-contained env-file resolution: the permit block above may be skipped.
+  if [ -f "$COVERAGE_PATH" ]; then
+    COVERAGE_PUBLISH_ARGS="--county $COUNTY --coverage $COVERAGE_PATH"
+    if [ -z "${DATABASE_URL:-}" ]; then
+      COVERAGE_PUBLISH_ARGS="$COVERAGE_PUBLISH_ARGS --env-file ${PUBLISH_ENV_FILE:-${ENV_FILE:-.env.local}}"
+    fi
+    if [ -z "${PUBLISH_APPROVED:-}" ]; then
+      COVERAGE_PUBLISH_ARGS="$COVERAGE_PUBLISH_ARGS --dry-run"
+    fi
+    # shellcheck disable=SC2086
+    $TSX scripts/upload-coverage-to-filebase.ts $COVERAGE_PUBLISH_ARGS
+  else
+    echo "{\"event\":\"oracle_dataset_coverage_publish_skipped\",\"reason\":\"snapshot file missing\",\"path\":\"$COVERAGE_PATH\"}"
+  fi
 else
   echo "{\"event\":\"oracle_dataset_coverage_snapshot_skipped\",\"reason\":\"STATUS_BUCKET unset\"}"
 fi

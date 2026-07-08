@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -11,7 +13,9 @@ import {
 
 /**
  * Read `oracle_dataset_coverage` for a county and write a JSON snapshot to the
- * incremental-status bucket (for operators / future MCP reads).
+ * incremental-status bucket (for operators) AND to a local file so the publish
+ * step can push it to public IPFS (for MCP `getOracleDatasetInfo` reads via
+ * DATASET_COVERAGE_MAP).
  */
 
 export type WriteCoverageSnapshotOptions = {
@@ -19,7 +23,17 @@ export type WriteCoverageSnapshotOptions = {
   readonly databaseUrl: string;
   readonly statusBucket: string;
   readonly statusKeyPrefix?: string;
+  /**
+   * Local file the snapshot is also written to (for the Filebase publish step).
+   * Defaults to `.dataset-coverage/<county>/dataset-coverage.json`.
+   */
+  readonly localPath?: string;
 };
+
+/** Default local snapshot path for a county. */
+export function defaultCoverageLocalPath(county: string): string {
+  return join(".dataset-coverage", county, "dataset-coverage.json");
+}
 
 /**
  * Load all coverage rows for a county from Neon.
@@ -67,20 +81,28 @@ export async function writeCoverageSnapshotToS3(
     exportedAt: new Date().toISOString(),
     datasets,
   };
+  const body = JSON.stringify(snapshot);
   const s3 = new S3Client({});
   await s3.send(
     new PutObjectCommand({
       Bucket: options.statusBucket,
       Key: key,
-      Body: JSON.stringify(snapshot),
+      Body: body,
       ContentType: "application/json",
     }),
   );
+
+  // Also write a local copy so the publish step can push it to public IPFS.
+  const localPath = options.localPath ?? defaultCoverageLocalPath(options.county);
+  await mkdir(dirname(localPath), { recursive: true });
+  await writeFile(localPath, body, "utf8");
+
   console.log(
     JSON.stringify({
       event: "oracle_dataset_coverage_snapshot_written",
       bucket: options.statusBucket,
       key,
+      localPath,
       datasetCount: datasets.length,
     }),
   );
