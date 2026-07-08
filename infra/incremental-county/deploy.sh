@@ -3,7 +3,7 @@
 #
 # ONE image (Dockerfile.reload) carries the entrypoints this stack uses:
 #   scripts/incremental-load-entrypoint.sh    (source-agnostic incremental LOAD task)
-#   scripts/query-table-publish-entrypoint.sh (county-query-table-publish — PUBLISH task)
+#   scripts/county-publish-entrypoint.sh      (query-table + permit-table + coverage snapshot)
 # reload-appraisal-entrypoint.sh ships in the same image for the separate appraisal-reload stack.
 #
 # Usage:
@@ -107,6 +107,6 @@ cat <<EOF
      --input '{
        "county": "palm-beach",
        "statusBucket": "elephant-oracle-node-environmentbucket-mmsoo3xbdi80",
-       "waitSeconds": 900
+       "waitSeconds": 3600
      }'
 EOF

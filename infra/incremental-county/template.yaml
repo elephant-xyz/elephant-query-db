@@ -134,6 +134,9 @@ Resources:
               - Effect: Allow
                 Action: cloudwatch:PutMetricData
                 Resource: "*"
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${StatusBucketName}/incremental-status/*"
 
   # Source-agnostic incremental load. Per-execution env (TRACK, SOURCE_PREFIX,
   # JURISDICTION_KEY, INCREMENTAL_STATUS_URI) arrives via Step Functions runtime overrides.
@@ -187,7 +190,7 @@ Resources:
         - Name: publish
           Image: !Ref ImageUri
           Essential: true
-          EntryPoint: ["sh", "scripts/query-table-publish-entrypoint.sh"]
+          EntryPoint: ["sh", "scripts/county-publish-entrypoint.sh"]
           Secrets:
             - { Name: DATABASE_URL, ValueFrom: !Ref DatabaseUrlSecretArn }
             - { Name: S3_ENDPOINT, ValueFrom: !Sub "${PublishCredsSecretArn}:S3_ENDPOINT::" }
@@ -229,10 +232,13 @@ Resources:
                 Action: [events:PutTargets, events:PutRule, events:DescribeRule]
                 Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule"
               - Effect: Allow
-                Action: s3:GetObject
+                Action: [s3:GetObject, s3:PutObject]
                 Resource:
                   - !Sub "arn:aws:s3:::${StatusBucketName}/*"
                   - !Sub "arn:aws:s3:::${SourceBucketName}/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${StatusBucketName}"
               # The LOAD machine flips, and the PUBLISH machine clears, the per-county publish-pending flag.
               - Effect: Allow
                 Action: s3:PutObject
@@ -339,10 +345,16 @@ Resources:
                 {
                   "Variable": "$.statusRead.status.processed",
                   "NumericGreaterThan": 0,
-                  "Next": "SetPublishPending"
+                  "Next": "BuildPendingTrue"
                 }
               ],
               "Default": "CompleteChoice"
+            },
+            "BuildPendingTrue": {
+              "Type": "Pass",
+              "Result": { "pending": true },
+              "ResultPath": "$.pendingFlag",
+              "Next": "SetPublishPending"
             },
             "SetPublishPending": {
               "Type": "Task",
@@ -350,7 +362,8 @@ Resources:
               "Parameters": {
                 "Bucket.$": "$.statusBucket",
                 "Key.$": "States.Format('incremental-status/{}/publish-pending.json', $.county)",
-                "Body": "{\"pending\":true}"
+                "Body.$": "States.JsonToString($.pendingFlag)",
+                "ContentType": "application/json"
               },
               "ResultPath": "$.setPending",
               "Next": "CompleteChoice"
@@ -434,7 +447,7 @@ Resources:
               "Catch": [
                 { "ErrorEquals": ["States.ALL"], "ResultPath": "$.pendingError", "Next": "NotPending" }
               ],
-              "Next": "PendingChoice"
+              "Next": "TryParsePendingString"
             },
             "NotPending": {
               "Type": "Pass",
@@ -442,16 +455,50 @@ Resources:
               "ResultPath": "$.pendingRead",
               "Next": "PublishWait"
             },
-            "PendingChoice": {
+            "TryParsePendingString": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.pendingRead.flag",
+                  "IsString": true,
+                  "Next": "ParsePendingString"
+                }
+              ],
+              "Default": "ResolvePendingFlag"
+            },
+            "ParsePendingString": {
+              "Type": "Pass",
+              "Parameters": {
+                "county.$": "$.county",
+                "statusBucket.$": "$.statusBucket",
+                "waitSeconds.$": "$.waitSeconds",
+                "pendingRead": {
+                  "flag.$": "States.StringToJson($.pendingRead.flag)"
+                }
+              },
+              "Next": "TryParsePendingString"
+            },
+            "ResolvePendingFlag": {
               "Type": "Choice",
               "Choices": [
                 {
                   "Variable": "$.pendingRead.flag.pending",
                   "BooleanEquals": true,
-                  "Next": "ClearPending"
+                  "Next": "BuildPendingFalse"
+                },
+                {
+                  "Variable": "$.pendingRead.flag.pending",
+                  "BooleanEquals": false,
+                  "Next": "PublishWait"
                 }
               ],
               "Default": "PublishWait"
+            },
+            "BuildPendingFalse": {
+              "Type": "Pass",
+              "Result": { "pending": false },
+              "ResultPath": "$.pendingFlag",
+              "Next": "ClearPending"
             },
             "ClearPending": {
               "Type": "Task",
@@ -459,7 +506,8 @@ Resources:
               "Parameters": {
                 "Bucket.$": "$.statusBucket",
                 "Key.$": "States.Format('incremental-status/{}/publish-pending.json', $.county)",
-                "Body": "{\"pending\":false}"
+                "Body.$": "States.JsonToString($.pendingFlag)",
+                "ContentType": "application/json"
               },
               "ResultPath": "$.clearPending",
               "Next": "GetApproval"
@@ -505,6 +553,7 @@ Resources:
                       "Name": "publish",
                       "Environment": [
                         { "Name": "COUNTY", "Value.$": "$.county" },
+                        { "Name": "STATUS_BUCKET", "Value.$": "$.statusBucket" },
                         { "Name": "PUBLISH_APPROVED", "Value.$": "$.approval.approved" },
                         { "Name": "VALIDATE_MODE", "Value": "parquet-only" }
                       ]
