@@ -1,13 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Self-looping, per-county INCREMENTAL ingestion orchestration. A Step Functions
-  state machine runs one Fargate "load" task in --incremental mode (global advisory
-  lock; loads only not-yet-loaded artifacts and writes a {processed,skipped} status
-  JSON to S3), then decides — from that status and the seed-feeder checkpoint — whether
-  to publish this cycle, do a final full publish, or wait and loop again. Two task
-  definitions share ONE image (Dockerfile.reload); each sets its own EntryPoint because
-  a Fargate command override cannot replace the image ENTRYPOINT. Pure CloudFormation
-  (no SAM Transform).
+  Source-agnostic, per-county INCREMENTAL ingestion split into TWO state machines
+  sharing one ECS cluster + image. LOAD machine: one execution per track
+  (appraisal|permits|sunbiz|bbb), loads --incremental, flips a per-county
+  publish-pending S3 flag when processed>0. PUBLISH machine: per-county singleton
+  that polls the flag, exports+validates the query-table Parquet, and re-points the
+  oracle-query-table-<county> IPNS. Pure CloudFormation (no SAM Transform).
 
 Parameters:
   ImageUri:
@@ -21,14 +19,14 @@ Parameters:
     Description: >
       Secrets Manager ARN of a JSON secret holding the 5 Filebase publish credentials as
       keys: S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, FILEBASE_API_TOKEN.
-  AppraisalBucketName:
+  SourceBucketName:
     Type: String
     Default: elephant-oracle-node-environmentbucket-mmsoo3xbdi80
-    Description: Bucket holding the county appraisal artifacts (loader reads from here).
+    Description: Bucket holding the county source artifacts for every track (loader reads from here).
   StatusBucketName:
     Type: String
     Default: elephant-oracle-node-environmentbucket-mmsoo3xbdi80
-    Description: Bucket the incremental load writes its {processed,skipped} status JSON to. Also holds the seed feeder-state.json.
+    Description: Bucket the incremental load writes its {processed,skipped} status JSON + the per-county publish-pending flag to. Also holds the seed feeder-state.json.
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Subnets with egress to S3 + Neon (public subnet, or private + NAT).
@@ -45,9 +43,13 @@ Parameters:
   TaskMemory:
     Type: String
     Default: "8192"
+  PublishTaskMemory:
+    Type: String
+    Default: "16384"
+    Description: Fargate memory (MiB) for publish tasks; full-county parquet export needs more than load.
   BatchSize:
     Type: String
-    Default: "20000"
+    Default: "500"
   ServiceName:
     Type: String
     Default: incremental-county
@@ -87,7 +89,7 @@ Resources:
                   - !Ref DatabaseUrlSecretArn
                   - !Ref PublishCredsSecretArn
 
-  # The incremental LOAD container: read appraisal artifacts, write the status JSON, emit metrics.
+  # The incremental LOAD container: read source artifacts (any track), write status JSON + ledger, emit metrics.
   LoadTaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -105,8 +107,8 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject, s3:ListBucket]
                 Resource:
-                  - !Sub "arn:aws:s3:::${AppraisalBucketName}"
-                  - !Sub "arn:aws:s3:::${AppraisalBucketName}/*"
+                  - !Sub "arn:aws:s3:::${SourceBucketName}"
+                  - !Sub "arn:aws:s3:::${SourceBucketName}/*"
               - Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub "arn:aws:s3:::${StatusBucketName}/*"
@@ -133,9 +135,8 @@ Resources:
                 Action: cloudwatch:PutMetricData
                 Resource: "*"
 
-  # STEP=load INCREMENTAL=1 SKIP_CLEAR=1 -> incremental-only load (no clear, no completeness validate).
-  # Per-county env (JURISDICTION_KEY, APPRAISAL_PREFIX, EXPECT_LETTER_STRAPS, INCREMENTAL_STATUS_URI)
-  # arrives via Step Functions runtime container overrides.
+  # Source-agnostic incremental load. Per-execution env (TRACK, SOURCE_PREFIX,
+  # JURISDICTION_KEY, INCREMENTAL_STATUS_URI) arrives via Step Functions runtime overrides.
   LoadTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -153,9 +154,9 @@ Resources:
           Image: !Ref ImageUri
           Essential: true
           # A Fargate command override cannot REPLACE the image ENTRYPOINT, so set it explicitly.
-          EntryPoint: ["sh", "scripts/reload-appraisal-entrypoint.sh"]
+          EntryPoint: ["sh", "scripts/incremental-load-entrypoint.sh"]
           Environment:
-            - { Name: APPRAISAL_BUCKET, Value: !Ref AppraisalBucketName }
+            - { Name: SOURCE_BUCKET, Value: !Ref SourceBucketName }
             - { Name: BATCH_SIZE, Value: !Ref BatchSize }
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
           Secrets:
@@ -168,7 +169,8 @@ Resources:
               awslogs-stream-prefix: load
 
   # Env-driven publish: COUNTY, VALIDATE_MODE (parquet-only|full), PUBLISH_APPROVED (empty=dry-run)
-  # arrive via runtime overrides. Filebase creds are pulled from the single JSON publish secret.
+  # arrive via runtime overrides. Uses county-query-table-publish (Parquet → oracle-query-table-<county> IPNS).
+  # Filebase creds are pulled from the single JSON publish secret.
   PublishTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -176,11 +178,11 @@ Resources:
       RequiresCompatibilities: [FARGATE]
       NetworkMode: awsvpc
       Cpu: !Ref TaskCpu
-      Memory: !Ref TaskMemory
+      Memory: !Ref PublishTaskMemory
       ExecutionRoleArn: !GetAtt ExecutionRole.Arn
       TaskRoleArn: !GetAtt PublishTaskRole.Arn
       EphemeralStorage:
-        SizeInGiB: 50
+        SizeInGiB: 100
       ContainerDefinitions:
         - Name: publish
           Image: !Ref ImageUri
@@ -230,26 +232,31 @@ Resources:
                 Action: s3:GetObject
                 Resource:
                   - !Sub "arn:aws:s3:::${StatusBucketName}/*"
-                  - !Sub "arn:aws:s3:::${AppraisalBucketName}/*"
+                  - !Sub "arn:aws:s3:::${SourceBucketName}/*"
+              # The LOAD machine flips, and the PUBLISH machine clears, the per-county publish-pending flag.
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${StatusBucketName}/incremental-status/*"
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: "arn:aws:ssm:*:*:parameter/oracle/*"
 
+  # LOAD machine — source-agnostic, ONE execution per source/track per county. Loads only,
+  # flags a per-county publish-pending marker when it changed rows, and loops. Never publishes.
   StateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
-      StateMachineName: !Ref ServiceName
+      StateMachineName: !Sub "${ServiceName}-load"
       RoleArn: !GetAtt StateMachineRole.Arn
       DefinitionSubstitutions:
         ClusterArn: !GetAtt Cluster.Arn
         LoadTaskDefArn: !Ref LoadTaskDefinition
-        PublishTaskDefArn: !Ref PublishTaskDefinition
         Subnet0: !Select [0, !Ref SubnetIds]
         SecurityGroup: !Ref SecurityGroupId
         AssignPublicIp: !Ref AssignPublicIp
       DefinitionString: |
         {
-          "Comment": "Self-looping per-county incremental ingestion: load (incremental) -> read status + feeder + approval -> publish/wait/complete -> loop.",
+          "Comment": "Source-agnostic per-county incremental LOAD loop for ONE track: load (incremental) -> read status + feeder -> flag publish-pending when processed>0 -> loop until feeder drained (appraisal) or forever (permit deltas). Never publishes.",
           "StartAt": "IncrementalLoad",
           "States": {
             "IncrementalLoad": {
@@ -272,11 +279,8 @@ Resources:
                       "Name": "load",
                       "Environment": [
                         { "Name": "JURISDICTION_KEY", "Value.$": "$.jurisdictionKey" },
-                        { "Name": "APPRAISAL_PREFIX", "Value.$": "$.appraisalPrefix" },
-                        { "Name": "EXPECT_LETTER_STRAPS", "Value.$": "$.expectLetterStraps" },
-                        { "Name": "INCREMENTAL", "Value": "1" },
-                        { "Name": "SKIP_CLEAR", "Value": "1" },
-                        { "Name": "STEP", "Value": "load" },
+                        { "Name": "TRACK", "Value.$": "$.track" },
+                        { "Name": "SOURCE_PREFIX", "Value.$": "$.sourcePrefix" },
                         { "Name": "INCREMENTAL_STATUS_URI", "Value.$": "States.Format('s3://{}/{}', $.statusBucket, $.statusKey)" }
                       ]
                     }
@@ -316,12 +320,148 @@ Resources:
               "Catch": [
                 { "ErrorEquals": ["States.ALL"], "ResultPath": "$.feederError", "Next": "FeederMissing" }
               ],
-              "Next": "GetApproval"
+              "Next": "ChangedChoice"
             },
             "FeederMissing": {
               "Type": "Pass",
               "Result": { "feeder": { "nextSourceRowNumber": 0 } },
               "ResultPath": "$.feederRead",
+              "Next": "ChangedChoice"
+            },
+            "ChangedChoice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.statusRead.status.skipped",
+                  "BooleanEquals": true,
+                  "Next": "Wait"
+                },
+                {
+                  "Variable": "$.statusRead.status.processed",
+                  "NumericGreaterThan": 0,
+                  "Next": "SetPublishPending"
+                }
+              ],
+              "Default": "CompleteChoice"
+            },
+            "SetPublishPending": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+              "Parameters": {
+                "Bucket.$": "$.statusBucket",
+                "Key.$": "States.Format('incremental-status/{}/publish-pending.json', $.county)",
+                "Body": "{\"pending\":true}"
+              },
+              "ResultPath": "$.setPending",
+              "Next": "CompleteChoice"
+            },
+            "CompleteChoice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.feederRead.feeder.nextSourceRowNumber",
+                      "NumericGreaterThanEqualsPath": "$.seedTotal"
+                    },
+                    {
+                      "Variable": "$.statusRead.status.skipped",
+                      "BooleanEquals": false
+                    }
+                  ],
+                  "Next": "Succeed"
+                }
+              ],
+              "Default": "Wait"
+            },
+            "Wait": {
+              "Type": "Wait",
+              "SecondsPath": "$.waitSeconds",
+              "Next": "IncrementalLoad"
+            },
+            "Succeed": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+  # PUBLISH machine — per-county singleton, ONE execution per county. Polls the publish-pending
+  # flag any LOAD execution sets; when set it clears the flag, exports+validates the county
+  # query-table Parquet, and re-points oracle-query-table-<county> IPNS. Coalesces all tracks.
+  PublishStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${ServiceName}-publish"
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionSubstitutions:
+        ClusterArn: !GetAtt Cluster.Arn
+        PublishTaskDefArn: !Ref PublishTaskDefinition
+        Subnet0: !Select [0, !Ref SubnetIds]
+        SecurityGroup: !Ref SecurityGroupId
+        AssignPublicIp: !Ref AssignPublicIp
+      DefinitionString: |
+        {
+          "Comment": "Per-county singleton PUBLISH loop: poll publish-pending flag -> when set, clear it, export+validate query-table Parquet, re-point oracle-query-table-<county> IPNS -> wait -> loop. Coalesces signals from every LOAD execution so appraisal + permit loads never race on the shared county Parquet.",
+          "StartAt": "StopCheck",
+          "States": {
+            "StopCheck": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    { "Variable": "$.stop", "IsPresent": true },
+                    { "Variable": "$.stop", "BooleanEquals": true }
+                  ],
+                  "Next": "Done"
+                }
+              ],
+              "Default": "ReadPending"
+            },
+            "Done": {
+              "Type": "Succeed"
+            },
+            "ReadPending": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+              "Parameters": {
+                "Bucket.$": "$.statusBucket",
+                "Key.$": "States.Format('incremental-status/{}/publish-pending.json', $.county)"
+              },
+              "ResultSelector": {
+                "flag.$": "States.StringToJson($.Body)"
+              },
+              "ResultPath": "$.pendingRead",
+              "Catch": [
+                { "ErrorEquals": ["States.ALL"], "ResultPath": "$.pendingError", "Next": "NotPending" }
+              ],
+              "Next": "PendingChoice"
+            },
+            "NotPending": {
+              "Type": "Pass",
+              "Result": { "flag": { "pending": false } },
+              "ResultPath": "$.pendingRead",
+              "Next": "PublishWait"
+            },
+            "PendingChoice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.pendingRead.flag.pending",
+                  "BooleanEquals": true,
+                  "Next": "ClearPending"
+                }
+              ],
+              "Default": "PublishWait"
+            },
+            "ClearPending": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+              "Parameters": {
+                "Bucket.$": "$.statusBucket",
+                "Key.$": "States.Format('incremental-status/{}/publish-pending.json', $.county)",
+                "Body": "{\"pending\":false}"
+              },
+              "ResultPath": "$.clearPending",
               "Next": "GetApproval"
             },
             "GetApproval": {
@@ -337,29 +477,13 @@ Resources:
               "Catch": [
                 { "ErrorEquals": ["States.ALL"], "ResultPath": "$.approvalError", "Next": "NoApproval" }
               ],
-              "Next": "ChangedChoice"
+              "Next": "ExportPublish"
             },
             "NoApproval": {
               "Type": "Pass",
               "Result": { "approved": "" },
               "ResultPath": "$.approval",
-              "Next": "ChangedChoice"
-            },
-            "ChangedChoice": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$.statusRead.status.skipped",
-                  "BooleanEquals": true,
-                  "Next": "Wait"
-                },
-                {
-                  "Variable": "$.statusRead.status.processed",
-                  "NumericGreaterThan": 0,
-                  "Next": "ExportPublish"
-                }
-              ],
-              "Default": "CompleteChoice"
+              "Next": "ExportPublish"
             },
             "ExportPublish": {
               "Type": "Task",
@@ -388,69 +512,16 @@ Resources:
                   ]
                 }
               },
-              "ResultPath": "$.publishResult",
-              "Next": "CompleteChoice"
-            },
-            "CompleteChoice": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "And": [
-                    {
-                      "Variable": "$.feederRead.feeder.nextSourceRowNumber",
-                      "NumericGreaterThanEqualsPath": "$.seedTotal"
-                    },
-                    {
-                      "Variable": "$.statusRead.status.processed",
-                      "NumericEquals": 0
-                    },
-                    {
-                      "Variable": "$.statusRead.status.skipped",
-                      "BooleanEquals": false
-                    }
-                  ],
-                  "Next": "FinalPublish"
-                }
+              "Retry": [
+                { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 2, "BackoffRate": 2 }
               ],
-              "Default": "Wait"
+              "ResultPath": "$.publishResult",
+              "Next": "PublishWait"
             },
-            "FinalPublish": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::ecs:runTask.sync",
-              "Parameters": {
-                "Cluster": "${ClusterArn}",
-                "TaskDefinition": "${PublishTaskDefArn}",
-                "LaunchType": "FARGATE",
-                "NetworkConfiguration": {
-                  "AwsvpcConfiguration": {
-                    "Subnets": ["${Subnet0}"],
-                    "SecurityGroups": ["${SecurityGroup}"],
-                    "AssignPublicIp": "${AssignPublicIp}"
-                  }
-                },
-                "Overrides": {
-                  "ContainerOverrides": [
-                    {
-                      "Name": "publish",
-                      "Environment": [
-                        { "Name": "COUNTY", "Value.$": "$.county" },
-                        { "Name": "PUBLISH_APPROVED", "Value.$": "$.approval.approved" },
-                        { "Name": "VALIDATE_MODE", "Value": "full" }
-                      ]
-                    }
-                  ]
-                }
-              },
-              "ResultPath": "$.finalPublishResult",
-              "Next": "Succeed"
-            },
-            "Wait": {
+            "PublishWait": {
               "Type": "Wait",
               "SecondsPath": "$.waitSeconds",
-              "Next": "IncrementalLoad"
-            },
-            "Succeed": {
-              "Type": "Succeed"
+              "Next": "StopCheck"
             }
           }
         }
@@ -458,6 +529,8 @@ Resources:
 Outputs:
   StateMachineArn:
     Value: !Ref StateMachine
+  PublishStateMachineArn:
+    Value: !Ref PublishStateMachine
   ClusterName:
     Value: !Ref Cluster
   LoadTaskDefinitionArn:

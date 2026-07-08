@@ -17,7 +17,7 @@ COPY migrations ./migrations
 RUN npm install --no-audit --no-fund
 
 # Strip CRLF when the image is built on Windows; `set -eu\r` breaks /bin/sh at runtime.
-RUN sed -i 's/\r$//' scripts/*.sh && chmod +x scripts/reload-appraisal-entrypoint.sh scripts/query-table-publish-entrypoint.sh
+RUN sed -i 's/\r$//' scripts/*.sh && chmod +x scripts/incremental-load-entrypoint.sh scripts/reload-appraisal-entrypoint.sh scripts/query-table-publish-entrypoint.sh
 
 # DATABASE_URL, APPRAISAL_PREFIX, etc. are injected by the task definition / Step Functions.
 ENTRYPOINT ["sh", "scripts/reload-appraisal-entrypoint.sh"]

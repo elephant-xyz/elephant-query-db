@@ -91,6 +91,8 @@ type MutableBulkCounters = {
 export type MutableIncrementalCounters = {
   skipped: number;
   processed: number;
+  /** Rows actually updated in Neon during this incremental cycle (sum of merge changedRows). */
+  changedRows: number;
 };
 
 type StageArtifactResult = {
@@ -133,10 +135,25 @@ const DEFAULT_STAGE_DIR = ".loader-runs/bulk-staging";
 const STAGE_TABLE_PREFIX = "elephant_bulk_stage";
 
 // Global cross-county serialization lock. Concurrent incremental county loads
-// deadlock on shared parent tables, so a single fixed-key Postgres session
-// advisory lock ensures only one incremental load runs at a time across every
-// county. Held for the whole run; releasing the session releases the lock.
+// deadlock on shared parent tables, so a single fixed-key Postgres advisory lock
+// ensures only one incremental merge runs at a time across every county. The lock
+// is acquired only around COPY/merge (not during S3 listing or CSV staging) so
+// Neon is not holding an idle session open for the full cadence cycle.
 const INCREMENTAL_LOAD_LOCK_KEY = 911001;
+
+/** Default appraisal batch size for full reloads vs incremental cadence runs. */
+const DEFAULT_FULL_RELOAD_BATCH_SIZE = 20_000;
+const DEFAULT_INCREMENTAL_BATCH_SIZE = 500;
+
+/**
+ * Thrown when another incremental load already holds the global advisory lock.
+ */
+export class IncrementalLoadLockBusyError extends Error {
+  constructor() {
+    super("Another incremental load holds the global advisory lock");
+    this.name = "IncrementalLoadLockBusyError";
+  }
+}
 
 const APPRAISAL_TABLE_ORDER: readonly LogicalTableName[] = [
   "unnormalized_addresses",
@@ -236,29 +253,6 @@ async function main(): Promise<void> {
     ? (process.env.INCREMENTAL_STATUS_URI ?? null)
     : null;
 
-  // Incremental mode: serialize all county loads behind one global advisory lock so
-  // that only a single incremental load runs at a time (see INCREMENTAL_LOAD_LOCK_KEY).
-  // The lock client is held open for the whole run and released in the finally below.
-  let lockClient: Client | null = null;
-  if (options.incremental) {
-    lockClient = await createKeepaliveClient(databaseUrl);
-    const lockResult = await lockClient.query<{ acquired: boolean }>(
-      "SELECT pg_try_advisory_lock($1) AS acquired",
-      [INCREMENTAL_LOAD_LOCK_KEY],
-    );
-    if (lockResult.rows[0]?.acquired !== true) {
-      // Another incremental load already holds the lock; a skipped cycle is not an
-      // error, so record it and exit cleanly (process exits 0).
-      console.log(JSON.stringify({ event: "incremental_load_lock_busy", key: INCREMENTAL_LOAD_LOCK_KEY }));
-      await lockClient.end();
-      if (incrementalStatusUri !== null) {
-        await writeIncrementalStatus(incrementalStatusUri, { processed: 0, skipped: true });
-      }
-      return;
-    }
-    console.log(JSON.stringify({ event: "incremental_load_lock_acquired", key: INCREMENTAL_LOAD_LOCK_KEY }));
-  }
-
   try {
     const scopeSelection = options.scopeManifest === null
       ? null
@@ -274,12 +268,36 @@ async function main(): Promise<void> {
 
     const stageFile = options.stageFile ?? buildDefaultStageFile(options.stageDir);
 
-    // Incremental mode: load the set of appraisal artifact URIs already present in Neon
-    // ONCE up front, then filter the S3 listing so cadence re-runs only process new work.
-    const incrementalCounters: MutableIncrementalCounters = { skipped: 0, processed: 0 };
+    // Incremental mode: load the set of artifact URIs already processed for this
+    // (jurisdiction, track) ONCE up front, then filter the S3 listing so cadence re-runs
+    // only process new work. One execution loads ONE track; the incremental track is that
+    // single track, or `appraisal` when a legacy multi-track run includes it.
+    const incrementalCounters: MutableIncrementalCounters = { skipped: 0, processed: 0, changedRows: 0 };
+    // Artifact URIs actually staged by non-appraisal tracks this cycle; appended to the
+    // track ledger after a successful merge (appraisal appends per-batch inside its path).
+    const stagedArtifactUris: string[] = [];
+    // Only appraisal and permits participate in incremental artifact-URI filtering: appraisal
+    // filters+ledgers per batch, permits filters+ledgers in stagePermits. Sunbiz/bbb have no
+    // per-artifact watermark yet, so a single sunbiz/bbb execution fully reloads each cycle.
+    const singleTrack = options.tracks.length === 1 ? options.tracks[0] : null;
+    const incrementalTrack: TrackName | null =
+      singleTrack === "appraisal" || singleTrack === "permits"
+        ? singleTrack
+        : options.tracks.includes("appraisal")
+          ? "appraisal"
+          : null;
+    const incrementalLedgerUri =
+      incrementalStatusUri !== null && incrementalTrack !== null
+        ? deriveIncrementalLedgerUri(incrementalStatusUri, options.jurisdictionKey, incrementalTrack)
+        : null;
     const loadedArtifactUris =
-      options.incremental && options.tracks.includes("appraisal") && options.phase !== "load"
-        ? await loadIncrementalWatermark({ databaseUrl, jurisdictionKey: options.jurisdictionKey })
+      options.incremental && incrementalTrack !== null && options.phase !== "load"
+        ? await loadIncrementalWatermark({
+            databaseUrl,
+            jurisdictionKey: options.jurisdictionKey,
+            track: incrementalTrack,
+            ledgerUri: incrementalLedgerUri,
+          })
         : null;
 
     console.log(JSON.stringify({
@@ -304,6 +322,7 @@ async function main(): Promise<void> {
         counters,
         databaseUrl,
         incrementalCounters,
+        incrementalLedgerUri,
         loadedArtifactUris,
         options,
         scopeSelection,
@@ -313,7 +332,8 @@ async function main(): Promise<void> {
       if (remainingTracks.length > 0) {
         const remainingOptions = { ...options, tracks: remainingTracks };
         if (remainingOptions.phase === "all" || remainingOptions.phase === "stage") {
-          // Appraisal is handled above in batch mode; remaining tracks are never filtered.
+          // Appraisal is handled above in batch mode; remaining tracks are never filtered
+          // in this combined path (the incremental watermark applies to appraisal only here).
           await stageSelectedTracks({
             counters,
             incrementalCounters,
@@ -321,47 +341,89 @@ async function main(): Promise<void> {
             options: remainingOptions,
             scopeSelection,
             stageFile,
+            stagedArtifactUris,
           });
         }
         if (remainingOptions.phase === "all" || remainingOptions.phase === "load") {
-          const mergeResults = await copyAndMergeStageFile({
-            databaseUrl,
-            stageDir: options.stageDir,
-            stageFile,
-            stageTable: options.stageTable,
-            tableOrder: tableOrderForTracks(remainingTracks),
-          });
-          console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
+          const runRemainingMerge = async (): Promise<void> => {
+            const mergeResults = await copyAndMergeStageFile({
+              databaseUrl,
+              stageDir: options.stageDir,
+              stageFile,
+              stageTable: options.stageTable,
+              tableOrder: tableOrderForTracks(remainingTracks),
+            });
+            for (const result of mergeResults) incrementalCounters.changedRows += result.changedRows;
+            console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
+          };
+          if (options.incremental) {
+            await withIncrementalLoadLock(databaseUrl, runRemainingMerge);
+          } else {
+            await runRemainingMerge();
+          }
         }
       }
     } else {
       // Legacy single-batch path (used for sunbiz/bbb/permits standalone, or explicit --batch-size 0).
       if (options.phase === "all" || options.phase === "stage") {
-        await stageSelectedTracks({ counters, incrementalCounters, loadedArtifactUris, options, scopeSelection, stageFile });
+        await stageSelectedTracks({ counters, incrementalCounters, loadedArtifactUris, options, scopeSelection, stageFile, stagedArtifactUris });
       }
-      if (options.phase === "all" || options.phase === "load") {
-        const mergeResults = await copyAndMergeStageFile({
-          databaseUrl,
-          stageDir: options.stageDir,
-          stageFile,
-          stageTable: options.stageTable,
-          tableOrder: tableOrderForTracks(options.tracks),
-        });
-        console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
+      // Skip the merge entirely on an incremental cadence run that filtered out every
+      // artifact — an empty COPY+merge would be a pointless DB round-trip.
+      const nothingPending =
+        options.incremental && loadedArtifactUris !== null && stagedArtifactUris.length === 0;
+      if ((options.phase === "all" || options.phase === "load") && !nothingPending) {
+        const runLegacyMerge = async (): Promise<void> => {
+          const mergeResults = await copyAndMergeStageFile({
+            databaseUrl,
+            stageDir: options.stageDir,
+            stageFile,
+            stageTable: options.stageTable,
+            tableOrder: tableOrderForTracks(options.tracks),
+          });
+          for (const result of mergeResults) incrementalCounters.changedRows += result.changedRows;
+          console.log(JSON.stringify({ event: "bulk_merge_finished", mergeResults }));
+        };
+        if (options.incremental) {
+          await withIncrementalLoadLock(databaseUrl, runLegacyMerge);
+        } else {
+          await runLegacyMerge();
+        }
+        // Record the freshly merged artifact URIs so the next cadence run skips them.
+        if (options.incremental && incrementalLedgerUri !== null && stagedArtifactUris.length > 0) {
+          await appendIncrementalArtifactLedger(incrementalLedgerUri, stagedArtifactUris);
+        }
+      } else if (nothingPending) {
+        console.log(JSON.stringify({ event: "incremental_nothing_pending", track: incrementalTrack }));
       }
     }
 
     console.log(JSON.stringify({ event: "bulk_loader_finished", counters, stageFile: useAppraisalBatchMode ? "(batched)" : stageFile }));
 
     if (incrementalStatusUri !== null) {
+      const effectiveProcessed = resolveEffectiveIncrementalProcessed(incrementalCounters);
       await writeIncrementalStatus(incrementalStatusUri, {
-        processed: incrementalCounters.processed,
+        processed: effectiveProcessed,
         skipped: false,
       });
+      if (effectiveProcessed !== incrementalCounters.processed) {
+        console.log(JSON.stringify({
+          event: "incremental_status_noop_adjusted",
+          artifactsTouched: incrementalCounters.processed,
+          changedRows: incrementalCounters.changedRows,
+          reportedProcessed: effectiveProcessed,
+        }));
+      }
     }
-  } finally {
-    // Closing the session releases the global advisory lock held for this run.
-    if (lockClient !== null) await lockClient.end();
+  } catch (error) {
+    if (error instanceof IncrementalLoadLockBusyError) {
+      console.log(JSON.stringify({ event: "incremental_load_lock_busy", key: INCREMENTAL_LOAD_LOCK_KEY }));
+      if (incrementalStatusUri !== null) {
+        await writeIncrementalStatus(incrementalStatusUri, { processed: 0, skipped: true });
+      }
+      return;
+    }
+    throw error;
   }
 }
 
@@ -378,6 +440,8 @@ async function stageSelectedTracks(params: {
   readonly options: BulkLoaderOptions;
   readonly scopeSelection: ScopedLoadSelection | null;
   readonly stageFile: string;
+  /** Accumulator of artifact URIs staged by non-appraisal tracks (for the track ledger). */
+  readonly stagedArtifactUris: string[];
 }): Promise<void> {
   await mkdir(dirname(params.stageFile), { recursive: true });
   const s3 = new S3Client({});
@@ -525,11 +589,20 @@ async function stageAndMergeAppraisalBatched(params: {
   readonly counters: MutableBulkCounters;
   readonly databaseUrl: string;
   readonly incrementalCounters: MutableIncrementalCounters;
+  readonly incrementalLedgerUri: string | null;
   readonly loadedArtifactUris: ReadonlySet<string> | null;
   readonly options: BulkLoaderOptions;
   readonly scopeSelection: ScopedLoadSelection | null;
 }): Promise<void> {
-  const { counters, databaseUrl, incrementalCounters, loadedArtifactUris, options, scopeSelection } = params;
+  const {
+    counters,
+    databaseUrl,
+    incrementalCounters,
+    incrementalLedgerUri,
+    loadedArtifactUris,
+    options,
+    scopeSelection,
+  } = params;
   const s3 = new S3Client({});
 
   assertAppraisalPrefixIsScoped(options.appraisalPrefix);
@@ -559,6 +632,29 @@ async function stageAndMergeAppraisalBatched(params: {
   const artifactIterator = loadedArtifactUris === null
     ? baseArtifacts
     : filterAlreadyLoaded(baseArtifacts, loadedArtifactUris, incrementalCounters);
+
+  // Incremental cadence: materialize the pending set up front so we can log the filter
+  // summary and exit before touching Postgres when there is nothing new to merge.
+  let artifactsForBatching: AsyncIterable<S3ObjectListing> | readonly S3ObjectListing[];
+  if (options.incremental && loadedArtifactUris !== null) {
+    const pendingArtifacts = await collectAsyncIterable(artifactIterator);
+    console.log(JSON.stringify({
+      event: "incremental_filter_summary",
+      skipped: incrementalCounters.skipped,
+      processed: incrementalCounters.processed,
+    }));
+    if (pendingArtifacts.length === 0) {
+      console.log(JSON.stringify({
+        event: "appraisal_batch_mode_finished",
+        totalBatches: 0,
+        reason: "incremental_nothing_pending",
+      }));
+      return;
+    }
+    artifactsForBatching = pendingArtifacts;
+  } else {
+    artifactsForBatching = artifactIterator;
+  }
 
   let batchIndex = 0;
   let batchBuffer: S3ObjectListing[] = [];
@@ -680,34 +776,38 @@ async function stageAndMergeAppraisalBatched(params: {
       batchStageFile,
     }));
 
-    // COPY → merge → drop stage table → delete CSV.
-    await copyToStagingTable({ databaseUrl, stageFile: batchStageFile, stageTableName, stageDir: options.stageDir });
+    // COPY → merge → drop stage table → delete CSV. The global advisory lock is held
+    // only for this DB phase so S3 staging does not keep a Neon session open idle.
+    await withIncrementalLoadLock(databaseUrl, async () => {
+      await copyToStagingTable({ databaseUrl, stageFile: batchStageFile, stageTableName, stageDir: options.stageDir });
 
-    const batchCheckpoint = join(options.stageDir, `${stageTableName}-checkpoint.json`);
-    const alreadyMerged = await readCheckpoint(batchCheckpoint);
-    const metaClient = await createKeepaliveClient(databaseUrl);
-    let columnsByTable: ReadonlyMap<LogicalTableName, readonly BulkTableColumn[]>;
-    try {
-      columnsByTable = await readBulkTableColumns(createQueryClient(metaClient), APPRAISAL_TABLE_ORDER);
-    } finally {
-      await metaClient.end();
-    }
-
-    const committed = new Set(alreadyMerged);
-    for (const tableName of APPRAISAL_TABLE_ORDER) {
-      if (committed.has(tableName)) {
-        console.log(JSON.stringify({ event: "bulk_table_skipped_already_merged", tableName, batchIndex: currentBatch }));
-        continue;
+      const batchCheckpoint = join(options.stageDir, `${stageTableName}-checkpoint.json`);
+      const alreadyMerged = await readCheckpoint(batchCheckpoint);
+      const metaClient = await createKeepaliveClient(databaseUrl);
+      let columnsByTable: ReadonlyMap<LogicalTableName, readonly BulkTableColumn[]>;
+      try {
+        columnsByTable = await readBulkTableColumns(createQueryClient(metaClient), APPRAISAL_TABLE_ORDER);
+      } finally {
+        await metaClient.end();
       }
-      const columns = columnsByTable.get(tableName);
-      if (columns === undefined) throw new Error(`Missing columns for ${tableName}`);
-      const result = await mergeOneTable({ databaseUrl, stageTableName, tableName, columns });
-      committed.add(tableName);
-      writeCheckpoint(batchCheckpoint, committed);
-      console.log(JSON.stringify({ event: "bulk_table_merged", ...result, batchIndex: currentBatch }));
-    }
 
-    await dropStagingTable(databaseUrl, stageTableName);
+      const committed = new Set(alreadyMerged);
+      for (const tableName of APPRAISAL_TABLE_ORDER) {
+        if (committed.has(tableName)) {
+          console.log(JSON.stringify({ event: "bulk_table_skipped_already_merged", tableName, batchIndex: currentBatch }));
+          continue;
+        }
+        const columns = columnsByTable.get(tableName);
+        if (columns === undefined) throw new Error(`Missing columns for ${tableName}`);
+        const result = await mergeOneTable({ databaseUrl, stageTableName, tableName, columns });
+        incrementalCounters.changedRows += result.changedRows;
+        committed.add(tableName);
+        writeCheckpoint(batchCheckpoint, committed);
+        console.log(JSON.stringify({ event: "bulk_table_merged", ...result, batchIndex: currentBatch }));
+      }
+
+      await dropStagingTable(databaseUrl, stageTableName);
+    });
 
     // Delete the batch CSV now that it is fully merged — keeps disk usage flat.
     unlink(batchStageFile, (err) => {
@@ -724,6 +824,11 @@ async function stageAndMergeAppraisalBatched(params: {
     // later non-incremental resume) — see the completedBatches init above.
     if (!options.incremental) {
       writeBatchCheckpoint(batchCheckpointPath, completedBatches);
+    } else if (incrementalLedgerUri !== null) {
+      await appendIncrementalArtifactLedger(
+        incrementalLedgerUri,
+        artifacts.map((artifact) => artifact.uri),
+      );
     }
 
     console.log(JSON.stringify({
@@ -734,7 +839,7 @@ async function stageAndMergeAppraisalBatched(params: {
   };
 
   // Collect artifacts into batches and flush each one.
-  for await (const artifact of artifactIterator) {
+  for await (const artifact of artifactsForBatching) {
     batchBuffer.push(artifact);
     if (batchBuffer.length >= options.batchSize) {
       await flushBatch(batchBuffer);
@@ -746,7 +851,7 @@ async function stageAndMergeAppraisalBatched(params: {
     await flushBatch(batchBuffer);
   }
 
-  if (loadedArtifactUris !== null) {
+  if (loadedArtifactUris !== null && !options.incremental) {
     console.log(JSON.stringify({
       event: "incremental_filter_summary",
       skipped: incrementalCounters.skipped,
@@ -795,19 +900,45 @@ function writeBatchCheckpoint(checkpointPath: string, completed: ReadonlySet<num
  */
 async function stagePermits(params: {
   readonly counters: MutableBulkCounters;
+  readonly incrementalCounters: MutableIncrementalCounters;
+  readonly loadedArtifactUris: ReadonlySet<string> | null;
   readonly options: BulkLoaderOptions;
   readonly scopeSelection: ScopedLoadSelection | null;
   readonly s3: S3Client;
+  readonly stagedArtifactUris: string[];
   readonly writeRows: (rows: readonly PreparedRow[]) => Promise<void>;
 }): Promise<void> {
   const reader = createS3ArtifactReader({ client: params.s3 });
-  const artifacts = await listS3Objects({
+  const allArtifacts = await listS3Objects({
     bucket: params.options.bucket,
     limit: params.options.limit,
     prefix: params.options.permitPrefix,
     s3: params.s3,
     suffix: ".json",
   });
+
+  // Incremental cadence: skip permit artifacts already recorded in the track ledger and
+  // remember the pending ones so the caller can append them after a successful merge.
+  const incremental = params.loadedArtifactUris !== null;
+  const artifacts = incremental
+    ? allArtifacts.filter((artifact) => {
+        if (params.loadedArtifactUris?.has(artifact.uri) === true) {
+          params.incrementalCounters.skipped += 1;
+          return false;
+        }
+        params.incrementalCounters.processed += 1;
+        params.stagedArtifactUris.push(artifact.uri);
+        return true;
+      })
+    : allArtifacts;
+  if (incremental) {
+    console.log(JSON.stringify({
+      event: "incremental_filter_summary",
+      track: "permits",
+      skipped: params.incrementalCounters.skipped,
+      processed: params.incrementalCounters.processed,
+    }));
+  }
   console.log(JSON.stringify({ event: "bulk_track_started", track: "permits", artifactCount: artifacts.length }));
 
   await processIterable(artifacts, params.options.concurrency, async (artifact) => {
@@ -1222,6 +1353,70 @@ async function stageArtifact(
 }
 
 /**
+ * Default appraisal batch size for the given loader mode.
+ *
+ * @param incremental - Whether `--incremental` is set.
+ * @returns Batch size used when `--batch-size` is omitted.
+ */
+export function defaultBatchSize(incremental: boolean): number {
+  return incremental ? DEFAULT_INCREMENTAL_BATCH_SIZE : DEFAULT_FULL_RELOAD_BATCH_SIZE;
+}
+
+/**
+ * Acquire the global incremental advisory lock, run `fn`, then release the lock.
+ *
+ * The lock session is short-lived (COPY + merge only) so Neon does not drop an idle
+ * connection held open during long S3 listing or CSV staging work.
+ *
+ * @param databaseUrl - Postgres connection string.
+ * @param fn - Work that must run while the lock is held.
+ * @returns The value returned by `fn`.
+ */
+export async function withIncrementalLoadLock<T>(
+  databaseUrl: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lockClient = await createKeepaliveClient(databaseUrl);
+  lockClient.on("error", (err: Error) => {
+    console.error(JSON.stringify({
+      event: "incremental_load_lock_client_error",
+      error: err.message,
+    }));
+  });
+  try {
+    const lockResult = await lockClient.query<{ acquired: boolean }>(
+      "SELECT pg_try_advisory_lock($1) AS acquired",
+      [INCREMENTAL_LOAD_LOCK_KEY],
+    );
+    if (lockResult.rows[0]?.acquired !== true) {
+      throw new IncrementalLoadLockBusyError();
+    }
+    console.log(JSON.stringify({ event: "incremental_load_lock_acquired", key: INCREMENTAL_LOAD_LOCK_KEY }));
+    return await fn();
+  } finally {
+    try {
+      await lockClient.query("SELECT pg_advisory_unlock($1)", [INCREMENTAL_LOAD_LOCK_KEY]);
+      console.log(JSON.stringify({ event: "incremental_load_lock_released", key: INCREMENTAL_LOAD_LOCK_KEY }));
+    } catch {
+      // Best-effort unlock; closing the session also releases advisory locks.
+    }
+    await lockClient.end();
+  }
+}
+
+/**
+ * Collect every item from an async iterable into an array.
+ *
+ * @param iterable - Source async iterable.
+ * @returns All yielded items in encounter order.
+ */
+async function collectAsyncIterable<Item>(iterable: AsyncIterable<Item>): Promise<Item[]> {
+  const items: Item[] = [];
+  for await (const item of iterable) items.push(item);
+  return items;
+}
+
+/**
  * Create a dedicated pg Client with TCP keepalive enabled.
  *
  * Neon drops idle TCP connections after ~5 minutes. Keepalive probes prevent
@@ -1243,38 +1438,171 @@ async function createKeepaliveClient(databaseUrl: string): Promise<Client> {
 }
 
 /**
- * Load the set of appraisal artifact URIs already present in Neon for a jurisdiction.
+ * Derive the S3 URI for the per-(jurisdiction, track) incremental artifact ledger.
  *
- * Used by incremental cadence runs as a watermark: any artifact whose
- * `source_artifact_uri` is already recorded on `parcels` has been loaded and can be
- * skipped. The exact S3 URI is stored at load time, so an exact-match set is reliable.
+ * Each source track keeps its own ledger so a cheap delta cadence run can skip artifact
+ * URIs it already processed. The `appraisal` track keeps the original track-less path so
+ * ledgers written before tracks were namespaced are still honored; every other track is
+ * namespaced under its track name.
  *
- * @param params - Database URL and the parcel jurisdiction_key to scope the watermark.
- * @returns Set of already-loaded artifact URIs.
+ * @param statusUri - `INCREMENTAL_STATUS_URI` for this cycle (`s3://bucket/.../status.json`).
+ * @param jurisdictionKey - Loader jurisdiction key (e.g. `miami_dade_appraiser`).
+ * @param track - Source track this ledger belongs to (appraisal|permits|sunbiz|bbb).
+ * @returns Ledger object URI storing every artifact URI this (jurisdiction, track) has processed.
+ */
+export function deriveIncrementalLedgerUri(
+  statusUri: string,
+  jurisdictionKey: string,
+  track: TrackName,
+): string {
+  const { bucket } = parseS3Uri(statusUri);
+  const trackSegment = track === "appraisal" ? "" : `${track}/`;
+  return `s3://${bucket}/incremental-ledgers/${jurisdictionKey}/${trackSegment}artifact-uris.json`;
+}
+
+/**
+ * Status `processed` count for the Step Functions contract: artifacts touched but zero DB
+ * changes are reported as `0` so publish is not triggered for no-op cycles.
+ *
+ * @param counters - Incremental skip/process/changed-row counters for the cycle.
+ * @returns Value to write as `{ processed }` in the incremental status JSON.
+ */
+export function resolveEffectiveIncrementalProcessed(
+  counters: Readonly<MutableIncrementalCounters>,
+): number {
+  if (counters.processed > 0 && counters.changedRows === 0) return 0;
+  return counters.processed;
+}
+
+type IncrementalArtifactLedgerFile = {
+  readonly artifactUris: readonly string[];
+};
+
+/**
+ * Read artifact URIs previously recorded for a jurisdiction's incremental runs.
+ *
+ * @param ledgerUri - `s3://` ledger object written by {@link appendIncrementalArtifactLedger}.
+ * @returns Set of artifact URIs; empty when the ledger does not exist yet.
+ */
+async function readIncrementalArtifactLedger(ledgerUri: string): Promise<Set<string>> {
+  const { bucket, key } = parseS3Uri(ledgerUri);
+  const s3 = new S3Client({});
+  try {
+    const response = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const body: unknown = response.Body;
+    if (body === undefined) return new Set();
+    let text: string;
+    if (isS3BodyWithByteArray(body)) {
+      text = Buffer.from(await body.transformToByteArray()).toString("utf8");
+    } else {
+      return new Set();
+    }
+    const parsed: unknown = JSON.parse(text);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      !("artifactUris" in parsed) ||
+      !Array.isArray((parsed as IncrementalArtifactLedgerFile).artifactUris)
+    ) {
+      return new Set();
+    }
+    const uris = new Set<string>();
+    for (const uri of (parsed as IncrementalArtifactLedgerFile).artifactUris) {
+      if (typeof uri === "string" && uri.length > 0) uris.add(uri);
+    }
+    return uris;
+  } catch (caught) {
+    const errorName =
+      typeof caught === "object" && caught !== null && "name" in caught
+        ? String((caught as { readonly name: unknown }).name)
+        : "";
+    if (errorName === "NoSuchKey" || errorName === "NotFound") return new Set();
+    throw caught;
+  }
+}
+
+/**
+ * Append newly processed artifact URIs to the jurisdiction ledger (deduped).
+ *
+ * @param ledgerUri - Destination ledger `s3://` URI.
+ * @param artifactUris - Artifact URIs merged in the batch that just finished.
+ * @returns Promise that resolves once the ledger object has been rewritten.
+ */
+async function appendIncrementalArtifactLedger(
+  ledgerUri: string,
+  artifactUris: readonly string[],
+): Promise<void> {
+  if (artifactUris.length === 0) return;
+  const existing = await readIncrementalArtifactLedger(ledgerUri);
+  for (const uri of artifactUris) existing.add(uri);
+  const { bucket, key } = parseS3Uri(ledgerUri);
+  const s3 = new S3Client({});
+  const body: IncrementalArtifactLedgerFile = { artifactUris: [...existing].sort() };
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: key,
+    Body: JSON.stringify(body),
+    ContentType: "application/json",
+  }));
+  console.log(JSON.stringify({
+    event: "incremental_artifact_ledger_updated",
+    ledgerUri,
+    added: artifactUris.length,
+    total: body.artifactUris.length,
+  }));
+}
+
+/**
+ * Load artifact URIs already processed for a (jurisdiction, track) pair.
+ *
+ * The `appraisal` track seeds the watermark from `parcels.source_artifact_uri` in Neon
+ * (so counties loaded before the ledger existed are still de-duplicated) AND the S3
+ * ledger. Every other track (permits, sunbiz, bbb) has no per-artifact URI column in
+ * Neon, so its watermark is the S3 ledger alone — which the loader appends to after each
+ * successful merge. A missing/extra URI is only a work-avoidance miss, never a
+ * correctness bug, because the merges are idempotent.
+ *
+ * @param params - Database URL, jurisdiction key, track, and optional S3 ledger URI.
+ * @returns Union set used to skip already-processed artifacts.
  */
 async function loadIncrementalWatermark(params: {
   readonly databaseUrl: string;
   readonly jurisdictionKey: string;
+  readonly track: TrackName;
+  readonly ledgerUri: string | null;
 }): Promise<Set<string>> {
-  const client = await createKeepaliveClient(params.databaseUrl);
-  try {
-    const result = await client.query<{ source_artifact_uri: string }>(
-      "SELECT source_artifact_uri FROM parcels WHERE jurisdiction_key = $1 AND source_artifact_uri IS NOT NULL",
-      [params.jurisdictionKey],
-    );
-    const loadedUris = new Set<string>();
-    for (const row of result.rows) {
-      if (typeof row.source_artifact_uri === "string") loadedUris.add(row.source_artifact_uri);
+  const loadedUris = new Set<string>();
+  let fromParcels = 0;
+  if (params.track === "appraisal") {
+    const client = await createKeepaliveClient(params.databaseUrl);
+    try {
+      const result = await client.query<{ source_artifact_uri: string }>(
+        "SELECT source_artifact_uri FROM parcels WHERE jurisdiction_key = $1 AND source_artifact_uri IS NOT NULL",
+        [params.jurisdictionKey],
+      );
+      for (const row of result.rows) {
+        if (typeof row.source_artifact_uri === "string") loadedUris.add(row.source_artifact_uri);
+      }
+    } finally {
+      await client.end();
     }
-    console.log(JSON.stringify({
-      event: "incremental_watermark_loaded",
-      jurisdictionKey: params.jurisdictionKey,
-      alreadyLoaded: loadedUris.size,
-    }));
-    return loadedUris;
-  } finally {
-    await client.end();
+    fromParcels = loadedUris.size;
   }
+  let fromLedger = 0;
+  if (params.ledgerUri !== null) {
+    const ledgerUris = await readIncrementalArtifactLedger(params.ledgerUri);
+    fromLedger = ledgerUris.size;
+    for (const uri of ledgerUris) loadedUris.add(uri);
+  }
+  console.log(JSON.stringify({
+    event: "incremental_watermark_loaded",
+    jurisdictionKey: params.jurisdictionKey,
+    track: params.track,
+    alreadyLoaded: loadedUris.size,
+    fromParcels,
+    fromLedger,
+  }));
+  return loadedUris;
 }
 
 /**
@@ -1829,7 +2157,7 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
 
   return {
     appraisalPrefix: values.get("appraisal-prefix") ?? DEFAULT_APPRAISAL_PREFIX,
-    batchSize: parseBatchSize(values.get("batch-size")),
+    batchSize: parseBatchSize(values.get("batch-size"), values.get("incremental") === "true"),
     bbbPrefix: values.get("bbb-prefix") ?? DEFAULT_BBB_PREFIX,
     bucket: values.get("bucket") ?? DEFAULT_BUCKET,
     concurrency: parseConcurrency(values.get("concurrency")),
@@ -1912,13 +2240,14 @@ function parseConcurrency(value: string | undefined): number {
  * N causes appraisal artifacts to be processed in groups of N, each staged to its
  * own temporary CSV that is deleted after merging to keep peak disk usage bounded.
  *
- * Defaults to 20000 when the flag is omitted.
+ * Defaults to 20000 for full reloads and 500 for incremental cadence runs when omitted.
  *
  * @param value - Raw batch-size string from the CLI.
+ * @param incremental - Whether `--incremental` is set.
  * @returns Non-negative batch size.
  */
-function parseBatchSize(value: string | undefined): number {
-  if (value === undefined || value.trim().length === 0) return 20_000;
+function parseBatchSize(value: string | undefined, incremental: boolean): number {
+  if (value === undefined || value.trim().length === 0) return defaultBatchSize(incremental);
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) {
     throw new Error(`Invalid --batch-size value: ${value} (must be a non-negative integer; 0 = disable batching)`);

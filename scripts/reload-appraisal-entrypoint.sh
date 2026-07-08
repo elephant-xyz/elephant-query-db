@@ -55,7 +55,11 @@ if [ "$STEP" = "clear" ]; then
 fi
 
 : "${APPRAISAL_PREFIX:?APPRAISAL_PREFIX is required}"
-: "${BATCH_SIZE:=20000}"
+if [ -n "${INCREMENTAL:-}" ]; then
+  : "${BATCH_SIZE:=500}"
+else
+  : "${BATCH_SIZE:=20000}"
+fi
 
 build_load_args() {
   # NOTE: use if/then, NOT `[ ... ] && ...` — under `set -e` a false test as the
