@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Build + push the shared reload image to ECR, then deploy the incremental-county stack.
 #
-# ONE image (Dockerfile.reload) carries ALL entrypoints:
+# ONE image (Dockerfile.reload) carries the entrypoints this stack uses:
 #   scripts/incremental-load-entrypoint.sh    (source-agnostic incremental LOAD task)
 #   scripts/query-table-publish-entrypoint.sh (county-query-table-publish — PUBLISH task)
-#   scripts/reload-appraisal-entrypoint.sh    (appraisal full-reload; not used by this stack)
-#   scripts/open-data-publish-entrypoint.sh   (consolidation open-data publish; not used by this stack)
+# reload-appraisal-entrypoint.sh ships in the same image for the separate appraisal-reload stack.
 #
 # Usage:
 #   AWS_PROFILE=elephant-oracle-node \
