@@ -4,10 +4,17 @@ export type JsonObject = Record<string, unknown>;
 // derives them from the `--jurisdiction-key` / `--permit-source-system` CLI
 // options (defaulting to `lee_appraiser` / `lee_accela`). The template-literal
 // arms admit any `<county>_appraiser` / `<county>_accela` value (e.g.
-// `orange_appraiser`) while still excluding unrelated strings. `bbb` and
-// `sunbiz` remain fixed. Existing `lee_appraiser` / `lee_accela` literals stay
-// assignable via the template arms.
-export type SourceSystem = "bbb" | "sunbiz" | `${string}_appraiser` | `${string}_accela`;
+// `orange_appraiser`) while still excluding unrelated strings. The
+// `<county>_permits` arm covers bulk city permit-portal pulls that are not
+// Accela harvests (e.g. `santa_clara_permits`). `bbb` and `sunbiz` remain
+// fixed. Existing `lee_appraiser` / `lee_accela` literals stay assignable via
+// the template arms.
+export type SourceSystem =
+  | "bbb"
+  | "sunbiz"
+  | `${string}_appraiser`
+  | `${string}_accela`
+  | `${string}_permits`;
 
 export type LogicalTableName =
   | "addresses"
