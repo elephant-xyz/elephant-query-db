@@ -36,11 +36,74 @@ export function defaultCoverageLocalPath(county: string): string {
 }
 
 /**
+ * Raw coverage row as returned by the pg driver. `ingested_count` /
+ * `expected_count` map to Postgres `bigint` columns, which node-postgres
+ * surfaces as JS strings (not numbers) to avoid precision loss.
+ */
+type RawCoverageRow = {
+  readonly county: string;
+  readonly source: string;
+  readonly ingested_count: string | number | null;
+  readonly expected_count: string | number | null;
+  readonly first_loaded_at: string | null;
+  readonly last_loaded_at: string | null;
+  readonly cid: string | null;
+  readonly ipns_label: string | null;
+};
+
+/**
+ * Coerce a bigint-as-text / numeric DB value into a finite JS number.
+ *
+ * @param value - Raw column value (string, number, null, or undefined).
+ * @param fallback - Value returned when the input is null/undefined/non-finite.
+ * @returns A finite number, or the fallback.
+ */
+export function coerceCount(
+  value: string | number | null | undefined,
+  fallback: number | null,
+): number | null {
+  if (value === null || value === undefined) {
+    return fallback;
+  }
+  if (typeof value === "string" && value.trim().length === 0) {
+    return fallback;
+  }
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/**
+ * Normalize a raw pg coverage row into the numeric MCP contract shape.
+ *
+ * Postgres returns `bigint` columns as strings; the published snapshot MUST
+ * carry numeric counts so the MCP's `OracleDatasetCoverageSnapshotSchema`
+ * (`ingested_count: z.number()`) accepts it. Without this, the snapshot fails
+ * schema validation and `getOracleDatasetInfo` silently drops `datasets[]`.
+ *
+ * @param row - Raw coverage row from Postgres.
+ * @returns Coverage row with numeric `ingested_count` / `expected_count`.
+ */
+export function normalizeCoverageRow(
+  row: RawCoverageRow,
+): OracleDatasetCoverageRow {
+  return {
+    county: row.county,
+    source: row.source,
+    ingested_count: coerceCount(row.ingested_count, 0) ?? 0,
+    expected_count: coerceCount(row.expected_count, null),
+    first_loaded_at: row.first_loaded_at,
+    last_loaded_at: row.last_loaded_at,
+    cid: row.cid,
+    ipns_label: row.ipns_label,
+  };
+}
+
+/**
  * Load all coverage rows for a county from Neon.
  *
  * @param databaseUrl - Direct Postgres connection string.
  * @param county - Hyphen county slug.
- * @returns Coverage rows for the county.
+ * @returns Coverage rows for the county, with numeric counts.
  */
 export async function loadCoverageRowsForCounty(
   databaseUrl: string,
@@ -48,7 +111,7 @@ export async function loadCoverageRowsForCounty(
 ): Promise<readonly OracleDatasetCoverageRow[]> {
   const pool = new Pool({ connectionString: databaseUrl });
   try {
-    const result = await pool.query<OracleDatasetCoverageRow>(
+    const result = await pool.query<RawCoverageRow>(
       `SELECT county, source, ingested_count, expected_count,
               first_loaded_at::text AS first_loaded_at,
               last_loaded_at::text AS last_loaded_at,
@@ -58,7 +121,7 @@ export async function loadCoverageRowsForCounty(
        ORDER BY source`,
       [county],
     );
-    return result.rows;
+    return result.rows.map(normalizeCoverageRow);
   } finally {
     await pool.end();
   }
