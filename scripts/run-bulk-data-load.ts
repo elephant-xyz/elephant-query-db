@@ -23,6 +23,7 @@ import {
   mapAppraisalTransformedFile,
   mapBbbBusinessProfile,
   mapLeePermitDetail,
+  mapNormalizedCityPermit,
   mapSunbizAnnualReportsFromRegistration,
   mapSunbizClassRecord,
   mergeBulkStageTable,
@@ -58,6 +59,15 @@ type TrackName = "appraisal" | "bbb" | "permits" | "sunbiz";
 
 type BulkLoaderPhase = "all" | "stage" | "load";
 
+/**
+ * Shape of the artifacts under `--permit-prefix`:
+ * - `accela-detail` — one `.json` per permit harvested from an Accela portal
+ *   (Lee-style camelCase detail records; the default).
+ * - `normalized-jsonl` — flat `.jsonl` bulk city-portal pulls with snake_case
+ *   fields (e.g. Santa Clara's San Jose / Palo Alto normalizers).
+ */
+type PermitFormat = "accela-detail" | "normalized-jsonl";
+
 type BulkLoaderOptions = {
   readonly appraisalPrefix: string;
   /** Artifacts per batch for disk-bounded appraisal loading. 0 = single-batch (legacy). */
@@ -72,6 +82,8 @@ type BulkLoaderOptions = {
   readonly jurisdictionKey: string;
   readonly limit: number | null;
   readonly permitPrefix: string;
+  /** Artifact shape under the permit prefix. Defaults to "accela-detail" (Lee behavior). */
+  readonly permitFormat: PermitFormat;
   /** Permit source_system. Defaults to "lee_accela" to preserve Lee behavior. */
   readonly permitSourceSystem: string;
   readonly phase: BulkLoaderPhase;
@@ -927,12 +939,13 @@ async function stagePermits(params: {
   readonly writeRows: (rows: readonly PreparedRow[]) => Promise<void>;
 }): Promise<void> {
   const reader = createS3ArtifactReader({ client: params.s3 });
+  const normalizedJsonl = params.options.permitFormat === "normalized-jsonl";
   const allArtifacts = await listS3Objects({
     bucket: params.options.bucket,
     limit: params.options.limit,
     prefix: params.options.permitPrefix,
     s3: params.s3,
-    suffix: ".json",
+    suffix: normalizedJsonl ? ".jsonl" : ".json",
   });
 
   // Incremental cadence: skip permit artifacts already recorded in the track ledger and
@@ -961,7 +974,11 @@ async function stagePermits(params: {
 
   await processIterable(artifacts, params.options.concurrency, async (artifact) => {
     await stageArtifact(params, artifact.uri, async () => {
-      const records = await readJsonArtifactRecords(reader, artifact.uri, "json");
+      const records = await readJsonArtifactRecords(
+        reader,
+        artifact.uri,
+        normalizedJsonl ? "jsonl" : "json",
+      );
       const rows: PreparedRow[] = [];
       let filteredRecords = 0;
       let skippedRecords = 0;
@@ -973,11 +990,17 @@ async function stagePermits(params: {
           filteredRecords += 1;
           continue;
         }
-        const bundle = mapLeePermitDetail({
-          artifactUri: artifact.uri,
-          record: record.record,
-          sourceSystem: params.options.permitSourceSystem,
-        });
+        const bundle = normalizedJsonl
+          ? mapNormalizedCityPermit({
+              artifactUri: artifact.uri,
+              record: record.record,
+              sourceSystem: params.options.permitSourceSystem,
+            })
+          : mapLeePermitDetail({
+              artifactUri: artifact.uri,
+              record: record.record,
+              sourceSystem: params.options.permitSourceSystem,
+            });
         rows.push(...bundle.rows);
         skippedRecords += bundle.skippedRecords.length;
       }
@@ -2263,6 +2286,7 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
     incremental: values.get("incremental") === "true",
     jurisdictionKey: values.get("jurisdiction-key") ?? "lee_appraiser",
     limit: parseLimit(values.get("limit")),
+    permitFormat: parsePermitFormat(values.get("permit-format") ?? "accela-detail"),
     permitPrefix: values.get("permit-prefix") ?? DEFAULT_PERMIT_PREFIX,
     permitSourceSystem: values.get("permit-source-system") ?? "lee_accela",
     phase: parsePhase(values.get("phase") ?? "all"),
@@ -2301,6 +2325,17 @@ function parseTracks(value: string): readonly TrackName[] {
 function parsePhase(value: string): BulkLoaderPhase {
   if (value === "all" || value === "stage" || value === "load") return value;
   throw new Error(`Unsupported phase: ${value}`);
+}
+
+/**
+ * Parse the permit artifact format option.
+ *
+ * @param value - Raw `--permit-format` string from the CLI.
+ * @returns Validated permit format.
+ */
+function parsePermitFormat(value: string): PermitFormat {
+  if (value === "accela-detail" || value === "normalized-jsonl") return value;
+  throw new Error(`Unsupported --permit-format: ${value}`);
 }
 
 /**
@@ -2399,6 +2434,7 @@ function redactedOptions(options: BulkLoaderOptions): JsonObject {
     incremental: options.incremental,
     jurisdictionKey: options.jurisdictionKey,
     limit: options.limit,
+    permitFormat: options.permitFormat,
     permitPrefix: options.permitPrefix,
     permitSourceSystem: options.permitSourceSystem,
     phase: options.phase,

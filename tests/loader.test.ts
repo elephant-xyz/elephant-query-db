@@ -36,6 +36,7 @@ import {
   mapAppraisalTransformedFile,
   mapBbbBusinessProfile,
   mapLeePermitDetail,
+  mapNormalizedCityPermit,
   mapSunbizAnnualReportsFromRegistration,
   mapSunbizClassRecord,
   isStorablePermitDocumentUrl,
@@ -818,6 +819,98 @@ describe("source mappers", () => {
     expect(permitFees[0]?.values.paid_amount).toBe(125.5);
     expect(permitLinks).toHaveLength(1);
     expect(permitLinks[0]?.values.url).toBe("https://example.test/doc.pdf");
+  });
+
+  it("maps a normalized city permit JSONL record into permit and address rows", () => {
+    const record = {
+      source_system: "paloalto_permits",
+      source_url: "https://data.paloalto.gov/dataviews/265480/",
+      city: "Palo Alto",
+      permit_number: "26BLD-01794",
+      parcel_identifier: "124-37-065",
+      work_location: "155 CALIFORNIA AV, UNIT G200, PALO ALTO, CA 94306",
+      permit_issue_date: "2026-07-06",
+      record_status: "Permit Issued",
+      record_type: "Building",
+      project_description: "Kitchen remodel.",
+      is_roof_permit: false,
+      raw: { "RECORD ID": "26BLD-01794" },
+    };
+    const bundle = mapNormalizedCityPermit({
+      artifactUri: "s3://bucket/open-data/santa-clara/permits/palo-alto-permits-normalized.jsonl#L1",
+      record,
+      sourceSystem: "santa_clara_permits",
+    });
+
+    const address = findRow(bundle.rows, "addresses");
+    const permit = findRow(bundle.rows, "property_improvements");
+
+    expect(bundle.skippedRecords).toEqual([]);
+    expect(bundle.rows.map((row) => row.tableName)).toEqual([
+      "addresses",
+      "property_improvements",
+    ]);
+    expect(permit.values.source_system).toBe("santa_clara_permits");
+    expect(permit.values.source_record_key).toBe(
+      "santa_clara_permits:permit:paloalto_permits:26BLD-01794",
+    );
+    expect(permit.values.permit_number).toBe("26BLD-01794");
+    expect(permit.values.parcel_identifier).toBe("12437065");
+    expect(permit.values.permit_issue_date).toBe("2026-07-06");
+    expect(permit.values.improvement_status).toBe("Permit Issued");
+    expect(permit.values.record_type).toBe("Building");
+    expect(permit.values.source).toBe("paloalto_permits");
+    expect(permit.values.more_details).toEqual({
+      city: "Palo Alto",
+      city_source_system: "paloalto_permits",
+      is_roof_permit: false,
+    });
+    expect(permit.references?.addressSourceRecordKey).toBe(
+      "santa_clara_permits:permit:paloalto_permits:26BLD-01794:work_location",
+    );
+    expect(address.values.state_code).toBe("CA");
+    expect(address.values.unnormalized_address).toBe(
+      "155 CALIFORNIA AV, UNIT G200, PALO ALTO, CA 94306",
+    );
+  });
+
+  it("skips the address row for placeholder city permit locations and keeps the permit", () => {
+    const bundle = mapNormalizedCityPermit({
+      artifactUri: null,
+      record: {
+        source_system: "sanjose_permits",
+        permit_number: "2018-112785-IR",
+        parcel_identifier: null,
+        work_location: ",",
+        permit_issue_date: "2018-04-10",
+        record_status: "Active",
+        record_type: "Voluntary",
+      },
+      sourceSystem: "santa_clara_permits",
+    });
+
+    const permit = findRow(bundle.rows, "property_improvements");
+
+    expect(bundle.rows.map((row) => row.tableName)).toEqual(["property_improvements"]);
+    expect(permit.references).toBeUndefined();
+    expect(permit.values.parcel_identifier).toBeNull();
+    expect(permit.values.source_record_key).toBe(
+      "santa_clara_permits:permit:sanjose_permits:2018-112785-IR",
+    );
+  });
+
+  it("skips normalized city permit records without a permit_number", () => {
+    const bundle = mapNormalizedCityPermit({
+      artifactUri: null,
+      record: { source_system: "sanjose_permits", record_status: "Active" },
+      sourceSystem: "santa_clara_permits",
+    });
+
+    expect(bundle.rows).toEqual([]);
+    expect(bundle.skippedRecords).toHaveLength(1);
+    expect(bundle.skippedRecords[0]?.reason).toBe(
+      "normalized city permit record is missing permit_number",
+    );
   });
 
   it("maps only the visible Accela status when historic pages include portal chrome", () => {

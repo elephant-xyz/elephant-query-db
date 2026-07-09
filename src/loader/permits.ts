@@ -563,7 +563,11 @@ function buildAddressRow(params: {
     normalized_address_key: normalizedAddressKey,
     normalized_address_hash: hashNormalizedAddressKey(normalizedAddressKey),
     postal_code: extractPostalCodeFromAddress(params.unnormalizedAddress),
-    state_code: /\bFL\b/i.test(params.unnormalizedAddress) ? "FL" : null,
+    state_code: /\bFL\b/i.test(params.unnormalizedAddress)
+      ? "FL"
+      : /\bCA\b/i.test(params.unnormalizedAddress)
+        ? "CA"
+        : null,
     country_code: "US",
     source_payload: params.sourcePayload,
   });
@@ -1074,4 +1078,132 @@ function mapPermitCustomFields(
 function sourceHttpRequestFromUrl(value: unknown): JsonObject | null {
   const url = readString(value);
   return url === null ? null : { method: "GET", url };
+}
+
+/**
+ * Map one normalized city permit-portal record (bulk CSV/API pull) into
+ * logical query-db rows.
+ *
+ * Unlike Lee Accela detail artifacts (one `.json` file per permit, camelCase
+ * fields, inspections/fees/contacts), bulk city pulls are flat JSONL rows with
+ * snake_case fields produced by a city normalizer (e.g. San Jose / Palo Alto
+ * for Santa Clara county):
+ *
+ * ```json
+ * {"source_system":"sanjose_permits","source_url":"…","city":"San Jose",
+ *  "permit_number":"2018-112785-IR","parcel_identifier":"12437065",
+ *  "work_location":"155 CALIFORNIA AV, …","permit_issue_date":"2018-04-10",
+ *  "record_status":"Active","record_type":"Voluntary",
+ *  "project_description":"…","is_roof_permit":false,"raw":{…}}
+ * ```
+ *
+ * The DB `source_system` comes from `--permit-source-system` (county-scoped,
+ * e.g. `santa_clara_permits`) so the permit-table export's anchored
+ * `^<county>_` prefix match finds these rows. The record's own city-level
+ * `source_system` (`sanjose_permits`, `paloalto_permits`, …) is preserved in
+ * the source key (so permit numbers can never collide across cities), in the
+ * `source` column, and in `more_details.city_source_system`.
+ *
+ * @param params - Source record, provenance URI, and county-scoped source system.
+ * @returns Prepared permit row plus a work-location address row when the address is usable.
+ */
+export function mapNormalizedCityPermit(params: {
+  readonly record: unknown;
+  readonly artifactUri: string | null;
+  readonly sourceSystem: string;
+}): PreparedRowBundle {
+  const sourceSystem = params.sourceSystem as SourceSystem;
+  if (!isJsonObject(params.record)) {
+    return {
+      rows: [],
+      skippedRecords: [
+        {
+          artifactUri: params.artifactUri,
+          reason: "normalized city permit record is not a JSON object",
+          sourcePayload: { value: params.record },
+        },
+      ],
+    };
+  }
+
+  const permitNumber = readString(params.record.permit_number);
+  if (permitNumber === null) {
+    return {
+      rows: [],
+      skippedRecords: [
+        {
+          artifactUri: params.artifactUri,
+          reason: "normalized city permit record is missing permit_number",
+          sourcePayload: params.record,
+        },
+      ],
+    };
+  }
+
+  const citySourceSystem = readString(params.record.source_system) ?? "unknown";
+  const permitKey = `${sourceSystem}:permit:${citySourceSystem}:${permitNumber}`;
+  const recordStatus = readString(params.record.record_status);
+  const recordType = readString(params.record.record_type);
+  const workLocation = readString(params.record.work_location);
+  const normalizedWorkLocationKey = buildNormalizedAddressKey(workLocation);
+  // Bulk city pulls contain placeholder locations like "," that normalize to
+  // an empty key — skip the address row for those instead of staging junk.
+  const workLocationKey =
+    normalizedWorkLocationKey !== null && normalizedWorkLocationKey.length > 0
+      ? `${permitKey}:work_location`
+      : null;
+  const rows: PreparedRow[] = [];
+
+  if (workLocation !== null && workLocationKey !== null) {
+    rows.push({
+      tableName: "addresses",
+      values: buildAddressRow({
+        sourceRecordKey: workLocationKey,
+        sourcePayload: params.record,
+        artifactUri: params.artifactUri,
+        unnormalizedAddress: workLocation,
+        sourceSystem,
+      }),
+    });
+  }
+
+  const permitValues = compactObject({
+    ...buildSourceMetadata({
+      sourceSystem,
+      sourceRecordKey: permitKey,
+      sourcePayload: params.record,
+      sourceArtifactUri: params.artifactUri,
+    }),
+    request_identifier: permitKey,
+    permit_number: permitNumber,
+    improvement_type: recordType,
+    improvement_status: recordStatus,
+    record_type: recordType,
+    source_status: recordStatus,
+    record_status: recordStatus,
+    source: citySourceSystem,
+    source_url: readString(params.record.source_url),
+    permit_issue_date: readDate(params.record.permit_issue_date),
+    work_location: workLocation,
+    parcel_identifier: normalizeParcelIdentifier(params.record.parcel_identifier),
+    project_description: readString(params.record.project_description),
+    more_details: compactObject({
+      city: readString(params.record.city),
+      city_source_system: citySourceSystem,
+      is_roof_permit: readBoolean(params.record.is_roof_permit),
+    }),
+    source_http_request: sourceHttpRequestFromUrl(params.record.source_url),
+    source_payload: params.record,
+  });
+  rows.push(
+    workLocationKey === null
+      ? { tableName: "property_improvements", values: permitValues }
+      : {
+          tableName: "property_improvements",
+          references: { addressSourceRecordKey: workLocationKey },
+          values: permitValues,
+        },
+  );
+
+  return { rows, skippedRecords: [] };
 }

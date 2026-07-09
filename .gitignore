@@ -3,7 +3,7 @@
 !.env.example
 node_modules/
 dist/
-coverage/
+/coverage/
 *.log
 .DS_Store
 .vercel
@@ -12,3 +12,4 @@ coverage/
 downloads/
 .property-consolidation-export/
 .upload-runs/
+.env*
