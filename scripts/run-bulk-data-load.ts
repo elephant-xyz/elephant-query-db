@@ -47,6 +47,13 @@ import {
   type TextArtifactReader,
 } from "../src/loader/index.js";
 
+import {
+  computeCoverage,
+  countySlugFromJurisdictionKey,
+  upsertCoverageRow,
+  type CoverageSource,
+} from "./oracle-dataset-coverage-upsert.js";
+
 type TrackName = "appraisal" | "bbb" | "permits" | "sunbiz";
 
 type BulkLoaderPhase = "all" | "stage" | "load";
@@ -399,6 +406,17 @@ async function main(): Promise<void> {
     }
 
     console.log(JSON.stringify({ event: "bulk_loader_finished", counters, stageFile: useAppraisalBatchMode ? "(batched)" : stageFile }));
+
+    // Keep the per-county coverage rows fresh after a load that could have changed rows.
+    // Best-effort: coverage is downstream bookkeeping consumed by the snapshot/publish path,
+    // so a failure here must never fail an otherwise-successful load.
+    if (options.phase === "all" || options.phase === "load") {
+      await upsertCoverageAfterLoad({
+        databaseUrl,
+        jurisdictionKey: options.jurisdictionKey,
+        tracks: options.tracks,
+      });
+    }
 
     if (incrementalStatusUri !== null) {
       const effectiveProcessed = resolveEffectiveIncrementalProcessed(incrementalCounters);
@@ -1401,6 +1419,86 @@ export async function withIncrementalLoadLock<T>(
       // Best-effort unlock; closing the session also releases advisory locks.
     }
     await lockClient.end();
+  }
+}
+
+/**
+ * Refresh `oracle_dataset_coverage` for the county+source(s) this execution loaded.
+ *
+ * One execution loads one or more tracks for a single jurisdiction. The county slug is
+ * derived from the jurisdiction key (inverse of `appraisalSourceForCounty`), and each
+ * loaded track maps 1:1 to a coverage source. Counts/timestamps are recomputed from the
+ * now-merged tables (never blindly incremented), so this is idempotent with the backfill.
+ * For sunbiz/bbb the per-county count is derived from `source_artifact_uri`, so a row is
+ * only written when this county actually has harvested business rows (no statewide fan-out,
+ * no zero rows).
+ *
+ * Best-effort by design: any failure is logged and swallowed so coverage bookkeeping can
+ * never fail an otherwise-successful load. The snapshot/publish path reads these rows.
+ *
+ * @param params - Direct database URL, loader jurisdiction key, and loaded tracks.
+ * @returns Promise that resolves after all coverage upserts have been attempted.
+ */
+async function upsertCoverageAfterLoad(params: {
+  readonly databaseUrl: string;
+  readonly jurisdictionKey: string;
+  readonly tracks: readonly TrackName[];
+}): Promise<void> {
+  const county = countySlugFromJurisdictionKey(params.jurisdictionKey);
+  if (county.length === 0) {
+    console.error(JSON.stringify({
+      event: "oracle_dataset_coverage_upsert_skipped",
+      reason: "empty county slug",
+      jurisdictionKey: params.jurisdictionKey,
+    }));
+    return;
+  }
+  const pool = new Pool({
+    application_name: "elephant-oracle-dataset-coverage-upsert",
+    connectionString: params.databaseUrl,
+    connectionTimeoutMillis: 30_000,
+    idleTimeoutMillis: 10_000,
+    max: 2,
+  });
+  pool.on("error", (caught) => {
+    const message = caught instanceof Error ? caught.message : String(caught);
+    console.error(JSON.stringify({ event: "oracle_dataset_coverage_pool_error", error: message }));
+  });
+  try {
+    for (const track of params.tracks) {
+      const source: CoverageSource = track;
+      try {
+        const computation = await computeCoverage(pool, county, source);
+        if (computation.ingestedCount <= 0) {
+          console.log(JSON.stringify({
+            event: "oracle_dataset_coverage_upsert_skipped",
+            reason: "no rows for county+source",
+            county,
+            source,
+          }));
+          continue;
+        }
+        await upsertCoverageRow(pool, computation);
+        console.log(JSON.stringify({
+          event: "oracle_dataset_coverage_upserted",
+          county,
+          source,
+          ingestedCount: computation.ingestedCount,
+          firstLoadedAt: computation.firstLoadedAt,
+          lastLoadedAt: computation.lastLoadedAt,
+        }));
+      } catch (caught) {
+        const message = caught instanceof Error ? caught.message : String(caught);
+        console.error(JSON.stringify({
+          event: "oracle_dataset_coverage_upsert_failed",
+          county,
+          source,
+          error: message,
+        }));
+      }
+    }
+  } finally {
+    await pool.end();
   }
 }
 
