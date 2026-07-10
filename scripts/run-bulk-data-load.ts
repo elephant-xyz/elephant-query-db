@@ -69,7 +69,9 @@ type BulkLoaderPhase = "all" | "stage" | "load";
 type PermitFormat = "accela-detail" | "normalized-jsonl";
 
 type BulkLoaderOptions = {
+  readonly appraisalCountyName: string | null;
   readonly appraisalPrefix: string;
+  readonly appraisalStateCode: string | null;
   /** Artifacts per batch for disk-bounded appraisal loading. 0 = single-batch (legacy). */
   readonly batchSize: number;
   readonly bbbPrefix: string;
@@ -152,6 +154,16 @@ const DEFAULT_SUNBIZ_PREFIX =
 const DEFAULT_BBB_PREFIX = "permit-harvest/bbb/category-data/browser-harvest-v1/profiles/";
 const DEFAULT_STAGE_DIR = ".loader-runs/bulk-staging";
 const STAGE_TABLE_PREFIX = "elephant_bulk_stage";
+const APPRAISAL_JURISDICTION_METADATA = new Map<
+  string,
+  { readonly countyName: string; readonly stateCode: string }
+>([
+  ["lee_appraiser", { countyName: "Lee", stateCode: "FL" }],
+  ["miami_dade_appraiser", { countyName: "Miami-Dade", stateCode: "FL" }],
+  ["orange_appraiser", { countyName: "Orange", stateCode: "FL" }],
+  ["palm_beach_appraiser", { countyName: "Palm Beach", stateCode: "FL" }],
+  ["santa_clara_appraiser", { countyName: "Santa Clara", stateCode: "CA" }],
+]);
 
 // Global cross-county serialization lock. Concurrent incremental county loads
 // deadlock on shared parent tables, so a single fixed-key Postgres advisory lock
@@ -552,9 +564,11 @@ async function stageAppraisal(params: {
           const record: unknown = JSON.parse(text);
           const bundle = mapAppraisalTransformedFile({
             artifactUri: artifact.uri,
+            countyName: params.options.appraisalCountyName,
             filePath: entry.entryName,
             record,
             sourceSystem: params.options.jurisdictionKey,
+            stateCode: params.options.appraisalStateCode,
           });
           rows.push(...bundle.rows);
           skippedRecords += bundle.skippedRecords.length;
@@ -749,9 +763,11 @@ async function stageAndMergeAppraisalBatched(params: {
             const record: unknown = JSON.parse(text);
             const bundle = mapAppraisalTransformedFile({
               artifactUri: artifact.uri,
+              countyName: params.options.appraisalCountyName,
               filePath: entry.entryName,
               record,
               sourceSystem: params.options.jurisdictionKey,
+              stateCode: params.options.appraisalStateCode,
             });
             rows.push(...bundle.rows);
             skippedRecords += bundle.skippedRecords.length;
@@ -2276,15 +2292,24 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
     }
   }
 
+  const jurisdictionKey = values.get("jurisdiction-key") ?? "lee_appraiser";
+  const jurisdictionMetadata = resolveAppraisalJurisdictionMetadata({
+    jurisdictionKey,
+    countyName: values.get("appraisal-county-name"),
+    stateCode: values.get("appraisal-state-code"),
+  });
+
   return {
+    appraisalCountyName: jurisdictionMetadata.countyName,
     appraisalPrefix: values.get("appraisal-prefix") ?? DEFAULT_APPRAISAL_PREFIX,
+    appraisalStateCode: jurisdictionMetadata.stateCode,
     batchSize: parseBatchSize(values.get("batch-size"), values.get("incremental") === "true"),
     bbbPrefix: values.get("bbb-prefix") ?? DEFAULT_BBB_PREFIX,
     bucket: values.get("bucket") ?? DEFAULT_BUCKET,
     concurrency: parseConcurrency(values.get("concurrency")),
     envFile: values.get("env-file") ?? ".env.local",
     incremental: values.get("incremental") === "true",
-    jurisdictionKey: values.get("jurisdiction-key") ?? "lee_appraiser",
+    jurisdictionKey,
     limit: parseLimit(values.get("limit")),
     permitFormat: parsePermitFormat(values.get("permit-format") ?? "accela-detail"),
     permitPrefix: values.get("permit-prefix") ?? DEFAULT_PERMIT_PREFIX,
@@ -2297,6 +2322,29 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
     sunbizPrefix: values.get("sunbiz-prefix") ?? DEFAULT_SUNBIZ_PREFIX,
     tracks: parseTracks(values.get("tracks") ?? "appraisal,permits,sunbiz"),
   };
+}
+
+/**
+ * Resolve county/state metadata for appraisal rows.
+ *
+ * Explicit CLI values win. Known deployed jurisdictions have safe defaults so
+ * replaying an existing command cannot silently fall back to Lee/Florida
+ * metadata. Unknown jurisdictions remain null until onboarding supplies
+ * `--appraisal-county-name` and `--appraisal-state-code`.
+ */
+export function resolveAppraisalJurisdictionMetadata(params: {
+  readonly jurisdictionKey: string;
+  readonly countyName?: string | null | undefined;
+  readonly stateCode?: string | null | undefined;
+}): { readonly countyName: string | null; readonly stateCode: string | null } {
+  const known = APPRAISAL_JURISDICTION_METADATA.get(params.jurisdictionKey);
+  const countyName = params.countyName?.trim() || known?.countyName || null;
+  const stateCode =
+    params.stateCode?.trim().toUpperCase() || known?.stateCode || null;
+  if (stateCode !== null && !/^[A-Z]{2}$/.test(stateCode)) {
+    throw new Error(`Invalid --appraisal-state-code: ${stateCode}`);
+  }
+  return { countyName, stateCode };
 }
 
 /**
@@ -2425,7 +2473,9 @@ function emptyCounters(): MutableBulkCounters {
  */
 function redactedOptions(options: BulkLoaderOptions): JsonObject {
   return {
+    appraisalCountyName: options.appraisalCountyName,
     appraisalPrefix: options.appraisalPrefix,
+    appraisalStateCode: options.appraisalStateCode,
     batchSize: options.batchSize,
     bbbPrefix: options.bbbPrefix,
     bucket: options.bucket,
