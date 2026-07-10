@@ -6,6 +6,7 @@ import {
   deriveIncrementalLedgerUri,
   filterAlreadyLoaded,
   type MutableIncrementalCounters,
+  resolveAppraisalJurisdictionMetadata,
   resolveEffectiveIncrementalProcessed,
 } from "../scripts/run-bulk-data-load.js";
 import {
@@ -868,6 +869,12 @@ describe("source mappers", () => {
     expect(permit.references?.addressSourceRecordKey).toBe(
       "santa_clara_permits:permit:paloalto_permits:26BLD-01794:work_location",
     );
+    expect(permit.references?.parcelSourceRecordKey).toBe(
+      "santa_clara_appraiser:12437065:parcel:property_seed",
+    );
+    expect(permit.references?.propertySourceRecordKey).toBe(
+      "santa_clara_appraiser:12437065:property:property",
+    );
     expect(address.values.state_code).toBe("CA");
     expect(address.values.unnormalized_address).toBe(
       "155 CALIFORNIA AV, UNIT G200, PALO ALTO, CA 94306",
@@ -983,6 +990,52 @@ describe("source mappers", () => {
     expect(parcel.values.source_record_key).toBe(
       "orange_appraiser:282201145000820:parcel:property_seed",
     );
+    expect(parcel.values.state_code).toBeNull();
+  });
+
+  it("uses explicit jurisdiction metadata for non-Florida appraisal rows", () => {
+    const parcelBundle = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/property_seed.json",
+      filePath: "property_seed.json",
+      requestIdentifier: "12437065",
+      record: {
+        parcel_id: "12437065",
+        request_identifier: "12437065",
+      },
+      sourceSystem: "santa_clara_appraiser",
+      countyName: "Santa Clara",
+      stateCode: "CA",
+    });
+    const addressBundle = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/address.json",
+      filePath: "address.json",
+      requestIdentifier: "12437065",
+      record: {
+        request_identifier: "12437065",
+        unnormalized_address: "155 CALIFORNIA AV, PALO ALTO 94306",
+      },
+      sourceSystem: "santa_clara_appraiser",
+      countyName: "Santa Clara",
+      stateCode: "CA",
+    });
+
+    const parcel = findRow(parcelBundle.rows, "parcels");
+    const address = findRow(addressBundle.rows, "addresses");
+    expect(parcel.values.county_name).toBe("Santa Clara");
+    expect(parcel.values.state_code).toBe("CA");
+    expect(address.values.county_name).toBe("Santa Clara");
+    expect(address.values.state_code).toBe("CA");
+  });
+
+  it("defaults the Santa Clara bulk-load jurisdiction to California", () => {
+    expect(
+      resolveAppraisalJurisdictionMetadata({
+        jurisdictionKey: "santa_clara_appraiser",
+      }),
+    ).toEqual({
+      countyName: "Santa Clara",
+      stateCode: "CA",
+    });
   });
 
   it("defaults appraisal identity to lee_appraiser when no jurisdiction-key is given", () => {

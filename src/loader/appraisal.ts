@@ -17,6 +17,11 @@ import type { JsonObject, LogicalTableName, PreparedRow, PreparedRowBundle, Sour
 
 const DEFAULT_APPRAISER_SOURCE_SYSTEM = "lee_appraiser";
 
+type AppraisalJurisdictionMetadata = {
+  readonly countyName: string | null;
+  readonly stateCode: string | null;
+};
+
 const PROPERTY_COLUMNS = [
   "property_legal_description_text",
   "property_structure_built_year",
@@ -416,6 +421,8 @@ export function mapAppraisalTransformedFile(params: {
   readonly artifactUri: string | null;
   readonly requestIdentifier?: string | null;
   readonly sourceSystem?: string;
+  readonly countyName?: string | null;
+  readonly stateCode?: string | null;
 }): PreparedRowBundle {
   if (!isJsonObject(params.record)) {
     return skipped(params, "appraisal transformed file is not a JSON object", { value: params.record });
@@ -432,7 +439,18 @@ export function mapAppraisalTransformedFile(params: {
   }
 
   const sourceSystem = (params.sourceSystem ?? DEFAULT_APPRAISER_SOURCE_SYSTEM) as SourceSystem;
-  const rows = mapKnownAppraisalRecord(fileName, params.record, requestIdentifier, params.artifactUri, sourceSystem);
+  const jurisdictionMetadata: AppraisalJurisdictionMetadata = {
+    countyName: readString(params.countyName),
+    stateCode: readStateCode(params.stateCode),
+  };
+  const rows = mapKnownAppraisalRecord(
+    fileName,
+    params.record,
+    requestIdentifier,
+    params.artifactUri,
+    sourceSystem,
+    jurisdictionMetadata,
+  );
   return rows === null
     ? skipped(params, `unrecognized appraisal transformed file: ${fileName}`, params.record)
     : { rows, skippedRecords: [] };
@@ -444,14 +462,34 @@ function mapKnownAppraisalRecord(
   requestIdentifier: string,
   artifactUri: string | null,
   sourceSystem: SourceSystem,
+  jurisdictionMetadata: AppraisalJurisdictionMetadata,
 ): readonly PreparedRow[] | null {
-  if (fileName === "property_seed.json") return [mapParcel(record, requestIdentifier, artifactUri, sourceSystem)];
+  if (fileName === "property_seed.json") {
+    return [
+      mapParcel(
+        record,
+        requestIdentifier,
+        artifactUri,
+        sourceSystem,
+        jurisdictionMetadata,
+      ),
+    ];
+  }
   if (fileName === "property.json") return [mapProperty(record, requestIdentifier, artifactUri, sourceSystem)];
   if (fileName === "unnormalized_address.json") {
     return [mapUnnormalizedAddress(record, requestIdentifier, artifactUri, sourceSystem)];
   }
   if (fileName === "address.json" || /^mailing_address_\d+\.json$/.test(fileName)) {
-    return [mapAddress(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
+    return [
+      mapAddress(
+        record,
+        fileName,
+        requestIdentifier,
+        artifactUri,
+        sourceSystem,
+        jurisdictionMetadata,
+      ),
+    ];
   }
   if (/^person_\d+\.json$/.test(fileName)) return mapAppraisalPersonOwnerRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
   if (/^company_\d+\.json$/.test(fileName)) return mapAppraisalCompanyOwnerRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
@@ -488,6 +526,7 @@ function mapParcel(
   requestIdentifier: string,
   artifactUri: string | null,
   sourceSystem: SourceSystem,
+  jurisdictionMetadata: AppraisalJurisdictionMetadata,
 ): PreparedRow {
   const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "parcel", "property_seed");
   return {
@@ -501,8 +540,10 @@ function mapParcel(
       // digits-only `normalizeParcelIdentifier` form is still used for cross-source
       // matching at read time (see scoped-load.ts).
       parcel_identifier: readString(record.parcel_id) ?? requestIdentifier,
-      county_name: readCountyName(record),
-      state_code: "FL",
+      county_name: jurisdictionMetadata.countyName ?? readCountyName(record),
+      state_code:
+        jurisdictionMetadata.stateCode ??
+        readAppraisalStateCode(record, sourceSystem),
       jurisdiction_key: sourceSystem,
       source_http_request: jsonObjectOrNull(record.source_http_request),
       source_payload: record,
@@ -563,6 +604,7 @@ function mapAddress(
   requestIdentifier: string,
   artifactUri: string | null,
   sourceSystem: SourceSystem,
+  jurisdictionMetadata: AppraisalJurisdictionMetadata,
 ): PreparedRow {
   const addressRole = fileName === "address.json" ? "site" : fileName.replace(/\.json$/, "");
   const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "address", addressRole);
@@ -575,8 +617,11 @@ function mapAddress(
     normalized_address_key: normalizedAddressKey,
     normalized_address_hash: hashNormalizedAddressKey(normalizedAddressKey),
     postal_code: extractPostalCodeFromAddress(unnormalizedAddress),
-    state_code: /\bFL\b/i.test(unnormalizedAddress ?? "") ? "FL" : null,
-    county_name: readString(record.county_name),
+    state_code:
+      jurisdictionMetadata.stateCode ??
+      (/\bFL\b/i.test(unnormalizedAddress ?? "") ? "FL" : null),
+    county_name:
+      jurisdictionMetadata.countyName ?? readString(record.county_name),
     country_code: readString(record.country_code) ?? "US",
     township: readString(record.township),
     range: readString(record.range),
@@ -1010,6 +1055,22 @@ function sourceKey(sourceSystem: SourceSystem, requestIdentifier: string, classT
 }
 
 function readCountyName(record: JsonObject): string | null {
+  const appName = readLegacyAppName(record);
+  return appName?.replace(/CountyFL$/i, "") ?? null;
+}
+
+function readAppraisalStateCode(
+  record: JsonObject,
+  sourceSystem: SourceSystem,
+): string | null {
+  const recordStateCode =
+    readString(record.state_code) ?? readString(record.state);
+  if (recordStateCode !== null) return readStateCode(recordStateCode);
+  if (readLegacyAppName(record)?.endsWith("CountyFL") === true) return "FL";
+  return sourceSystem === DEFAULT_APPRAISER_SOURCE_SYSTEM ? "FL" : null;
+}
+
+function readLegacyAppName(record: JsonObject): string | null {
   const entryHttpRequest = isJsonObject(record.entry_http_request) ? record.entry_http_request : null;
   const multiValueQueryString = isJsonObject(entryHttpRequest?.multiValueQueryString)
     ? entryHttpRequest.multiValueQueryString
@@ -1017,8 +1078,16 @@ function readCountyName(record: JsonObject): string | null {
   const appValues = Array.isArray(multiValueQueryString?.App)
     ? multiValueQueryString.App
     : [];
-  const appName = readString(appValues[0]);
-  return appName?.replace(/CountyFL$/i, "") ?? null;
+  return readString(appValues[0]);
+}
+
+function readStateCode(value: unknown): string | null {
+  const stateCode = readString(value)?.toUpperCase() ?? null;
+  if (stateCode === null) return null;
+  if (!/^[A-Z]{2}$/.test(stateCode)) {
+    throw new Error(`Invalid appraisal state code: ${stateCode}`);
+  }
+  return stateCode;
 }
 
 function jsonObjectOrNull(value: unknown): JsonObject | null {

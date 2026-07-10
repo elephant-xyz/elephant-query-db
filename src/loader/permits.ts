@@ -1144,6 +1144,7 @@ export function mapNormalizedCityPermit(params: {
   const permitKey = `${sourceSystem}:permit:${citySourceSystem}:${permitNumber}`;
   const recordStatus = readString(params.record.record_status);
   const recordType = readString(params.record.record_type);
+  const parcelIdentifier = normalizeParcelIdentifier(params.record.parcel_identifier);
   const workLocation = readString(params.record.work_location);
   const normalizedWorkLocationKey = buildNormalizedAddressKey(workLocation);
   // Bulk city pulls contain placeholder locations like "," that normalize to
@@ -1185,7 +1186,7 @@ export function mapNormalizedCityPermit(params: {
     source_url: readString(params.record.source_url),
     permit_issue_date: readDate(params.record.permit_issue_date),
     work_location: workLocation,
-    parcel_identifier: normalizeParcelIdentifier(params.record.parcel_identifier),
+    parcel_identifier: parcelIdentifier,
     project_description: readString(params.record.project_description),
     more_details: compactObject({
       city: readString(params.record.city),
@@ -1195,15 +1196,61 @@ export function mapNormalizedCityPermit(params: {
     source_http_request: sourceHttpRequestFromUrl(params.record.source_url),
     source_payload: params.record,
   });
+  const permitReferences = buildNormalizedCityPermitReferences({
+    parcelIdentifier,
+    permitSourceSystem: sourceSystem,
+    workLocationKey,
+  });
   rows.push(
-    workLocationKey === null
+    permitReferences === undefined
       ? { tableName: "property_improvements", values: permitValues }
       : {
           tableName: "property_improvements",
-          references: { addressSourceRecordKey: workLocationKey },
+          references: permitReferences,
           values: permitValues,
         },
   );
 
   return { rows, skippedRecords: [] };
+}
+
+/**
+ * Build cross-source references for a normalized city permit.
+ *
+ * County-scoped city permit systems use `<county>_permits`, while their
+ * appraisal parents use `<county>_appraiser`. When a normalized APN is
+ * available, the appraisal source keys are deterministic and let both the
+ * single-row and bulk loaders resolve `parcel_id` and `property_id` without a
+ * county-specific post-load linker.
+ */
+function buildNormalizedCityPermitReferences(params: {
+  readonly parcelIdentifier: string | null;
+  readonly permitSourceSystem: SourceSystem;
+  readonly workLocationKey: string | null;
+}): PreparedRow["references"] | undefined {
+  const appraiserSourceSystem = appraiserSourceSystemFromPermitSourceSystem(
+    params.permitSourceSystem,
+  );
+  const references = {
+    ...(params.workLocationKey === null
+      ? {}
+      : { addressSourceRecordKey: params.workLocationKey }),
+    ...(params.parcelIdentifier === null || appraiserSourceSystem === null
+      ? {}
+      : {
+          parcelSourceRecordKey: `${appraiserSourceSystem}:${params.parcelIdentifier}:parcel:property_seed`,
+          propertySourceRecordKey: `${appraiserSourceSystem}:${params.parcelIdentifier}:property:property`,
+        }),
+  };
+  return Object.keys(references).length === 0 ? undefined : references;
+}
+
+function appraiserSourceSystemFromPermitSourceSystem(
+  sourceSystem: SourceSystem,
+): SourceSystem | null {
+  const suffix = "_permits";
+  if (!sourceSystem.endsWith(suffix) || sourceSystem.length <= suffix.length) {
+    return null;
+  }
+  return `${sourceSystem.slice(0, -suffix.length)}_appraiser` as SourceSystem;
 }
