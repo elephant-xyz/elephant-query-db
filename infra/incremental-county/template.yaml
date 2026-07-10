@@ -553,7 +553,6 @@ Resources:
                       "Name": "publish",
                       "Environment": [
                         { "Name": "COUNTY", "Value.$": "$.county" },
-                        { "Name": "STATUS_BUCKET", "Value.$": "$.statusBucket" },
                         { "Name": "PUBLISH_APPROVED", "Value.$": "$.approval.approved" },
                         { "Name": "VALIDATE_MODE", "Value": "parquet-only" }
                       ]
