@@ -10,8 +10,10 @@
 - **PUBLISH machine** (`incremental-county-publish`) — **per-county singleton**. Run **one
   execution per county**. It polls the publish-pending flag; when set it clears the flag,
   exports+validates the county query-table Parquet, and re-points `oracle-query-table-<county>`
-  IPNS. It **coalesces** signals from every LOAD execution, so appraisal and permit loads never
-  race on the single shared county Parquet.
+  IPNS. It also writes the coverage JSON contract and publishes it to its own
+  `oracle-dataset-coverage-<county>` IPNS; no coverage JSON is written to S3. It **coalesces**
+  signals from every LOAD execution, so appraisal and permit loads never race on the single shared
+  county Parquet.
 
 Two Fargate task definitions share **one** image (`Dockerfile.reload`, which copies the
 whole `scripts/` dir so all entrypoints ship in the image). A Fargate command override
@@ -23,8 +25,10 @@ cannot *replace* the image `ENTRYPOINT`, so each task definition sets its own `E
   `INCREMENTAL_STATUS_URI` with **exactly** `{ "processed": <number>, "skipped": <boolean> }`.
 - **publish** → `scripts/query-table-publish-entrypoint.sh`, env-driven by `COUNTY`,
   `VALIDATE_MODE` (`parquet-only` | `full`), and `PUBLISH_APPROVED` (empty = dry-run).
-  Exports `query-table.parquet` from Neon, validates, uploads to Filebase, and re-points
-  `oracle-query-table-<county>` IPNS (`county-query-table-publish` skill).
+  Exports `query-table.parquet` from Neon, validates, uploads to Filebase, re-points
+  `oracle-query-table-<county>` IPNS (`county-query-table-publish` skill), then publishes
+  `.dataset-coverage/<county>/dataset-coverage.json` to Filebase/IPFS under
+  `oracle-dataset-coverage-<county>` for MCP/Miranda consumption.
 
 ## Why the split
 

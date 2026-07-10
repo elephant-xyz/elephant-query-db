@@ -4,14 +4,13 @@
 # Chains:
 #   1. query-table  export -> validate -> publish  (oracle-query-table-<county> IPNS)
 #   2. permit-table export -> validate -> publish  (oracle-permit-table-<county> IPNS)
-#   3. oracle_dataset_coverage snapshot -> S3 (incremental-status/<county>/dataset-coverage.json)
+#   3. oracle_dataset_coverage snapshot -> Filebase/IPFS coverage IPNS
 #
 # Env (inherited from query-table-publish-entrypoint + additions):
 #   COUNTY            (required)
 #   PUBLISH_APPROVED  empty => dry-run uploads
 #   VALIDATE_MODE     parquet-only (default) | full
 #   SKIP_PERMIT_PUBLISH set to "true" to skip permit-table when a county has no permit rows yet
-#   STATUS_BUCKET     AWS status bucket for coverage snapshot (from Step Functions)
 set -eu
 
 TSX="node_modules/.bin/tsx"
@@ -60,30 +59,26 @@ else
 fi
 
 # Coverage snapshot for Donphan / getOracleDatasetInfo contract (rows upserted in Neon).
-# Writes to the private status bucket AND a local file, then publishes that file
-# to public IPFS so the MCP can read it via DATASET_COVERAGE_MAP.
+# Writes only a local transient file, then publishes that file to public IPFS so
+# the MCP can read it via DATASET_COVERAGE_MAP.
 COVERAGE_PATH=".dataset-coverage/$COUNTY/dataset-coverage.json"
-if [ -n "${STATUS_BUCKET:-}" ]; then
-  # shellcheck disable=SC2086
-  $TSX scripts/write-oracle-dataset-coverage-snapshot.ts
+# shellcheck disable=SC2086
+$TSX scripts/write-oracle-dataset-coverage-snapshot.ts
 
-  # Publish the coverage JSON to its own IPNS (oracle-dataset-coverage-<county>).
-  # Self-contained env-file resolution: the permit block above may be skipped.
-  if [ -f "$COVERAGE_PATH" ]; then
-    COVERAGE_PUBLISH_ARGS="--county $COUNTY --coverage $COVERAGE_PATH"
-    if [ -z "${DATABASE_URL:-}" ]; then
-      COVERAGE_PUBLISH_ARGS="$COVERAGE_PUBLISH_ARGS --env-file ${PUBLISH_ENV_FILE:-${ENV_FILE:-.env.local}}"
-    fi
-    if [ -z "${PUBLISH_APPROVED:-}" ]; then
-      COVERAGE_PUBLISH_ARGS="$COVERAGE_PUBLISH_ARGS --dry-run"
-    fi
-    # shellcheck disable=SC2086
-    $TSX scripts/upload-coverage-to-filebase.ts $COVERAGE_PUBLISH_ARGS
-  else
-    echo "{\"event\":\"oracle_dataset_coverage_publish_skipped\",\"reason\":\"snapshot file missing\",\"path\":\"$COVERAGE_PATH\"}"
+# Publish the coverage JSON to its own IPNS (oracle-dataset-coverage-<county>).
+# Self-contained env-file resolution: the permit block above may be skipped.
+if [ -f "$COVERAGE_PATH" ]; then
+  COVERAGE_PUBLISH_ARGS="--county $COUNTY --coverage $COVERAGE_PATH"
+  if [ -z "${DATABASE_URL:-}" ]; then
+    COVERAGE_PUBLISH_ARGS="$COVERAGE_PUBLISH_ARGS --env-file ${PUBLISH_ENV_FILE:-${ENV_FILE:-.env.local}}"
   fi
+  if [ -z "${PUBLISH_APPROVED:-}" ]; then
+    COVERAGE_PUBLISH_ARGS="$COVERAGE_PUBLISH_ARGS --dry-run"
+  fi
+  # shellcheck disable=SC2086
+  $TSX scripts/upload-coverage-to-filebase.ts $COVERAGE_PUBLISH_ARGS
 else
-  echo "{\"event\":\"oracle_dataset_coverage_snapshot_skipped\",\"reason\":\"STATUS_BUCKET unset\"}"
+  echo "{\"event\":\"oracle_dataset_coverage_publish_skipped\",\"reason\":\"snapshot file missing\",\"path\":\"$COVERAGE_PATH\"}"
 fi
 
 echo "{\"event\":\"county_publish_entrypoint_finished\",\"county\":\"$COUNTY\"}"
