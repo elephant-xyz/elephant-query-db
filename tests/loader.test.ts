@@ -1868,3 +1868,67 @@ describe("incremental appraisal filter", () => {
     expect(defaultBatchSize(false)).toBe(20_000);
   });
 });
+
+describe("appraisal entity dispatch by file name", () => {
+  const base = {
+    artifactUri: "s3://bucket/appraisal/transformed_output.zip",
+    requestIdentifier: "10211376",
+  } as const;
+
+  it("loads the aggregate tax entity in index form", () => {
+    const bundle = mapAppraisalTransformedFile({
+      ...base,
+      filePath: "data/tax_1.json",
+      record: { request_identifier: "10211376", tax_year: "2025" },
+    });
+    expect(bundle.skippedRecords).toEqual([]);
+    expect(findRow(bundle.rows, "taxes").values.tax_year).toBe(2025);
+  });
+
+  it("loads the aggregate tax entity in year form", () => {
+    const bundle = mapAppraisalTransformedFile({
+      ...base,
+      filePath: "data/tax_2025.json",
+      record: { request_identifier: "10211376", tax_year: "2025" },
+    });
+    expect(bundle.skippedRecords).toEqual([]);
+    expect(findRow(bundle.rows, "taxes").values.tax_year).toBe(2025);
+  });
+
+  it("skips per-authority tax jurisdiction and exemption entities", () => {
+    for (const fileName of [
+      "tax_jurisdiction_1.json",
+      "tax_jurisdiction.json",
+      "tax_exemption_1.json",
+      // Not a name any county emits; it pins the trailing anchor, so a future
+      // relaxation of the pattern cannot start matching `tax_<digits>_<suffix>`.
+      "tax_2025_tax_jurisdiction.json",
+    ]) {
+      const bundle = mapAppraisalTransformedFile({
+        ...base,
+        filePath: `data/${fileName}`,
+        record: { request_identifier: "10211376", tax_year: "2025" },
+      });
+      expect(bundle.rows).toEqual([]);
+      expect(bundle.skippedRecords).toHaveLength(1);
+    }
+  });
+
+  it("loads single-cardinality structure and utility entities", () => {
+    const structure = mapAppraisalTransformedFile({
+      ...base,
+      filePath: "data/structure.json",
+      record: { request_identifier: "10211376" },
+    });
+    expect(structure.skippedRecords).toEqual([]);
+    expect(findRow(structure.rows, "structures")).toBeDefined();
+
+    const utility = mapAppraisalTransformedFile({
+      ...base,
+      filePath: "data/utility.json",
+      record: { request_identifier: "10211376" },
+    });
+    expect(utility.skippedRecords).toEqual([]);
+    expect(findRow(utility.rows, "utilities")).toBeDefined();
+  });
+});
