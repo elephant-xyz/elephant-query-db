@@ -493,7 +493,13 @@ function mapKnownAppraisalRecord(
   }
   if (/^person_\d+\.json$/.test(fileName)) return mapAppraisalPersonOwnerRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
   if (/^company_\d+\.json$/.test(fileName)) return mapAppraisalCompanyOwnerRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
-  if (/^tax_/.test(fileName)) return mapTaxRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
+  // Match ONLY the aggregate tax entity: `tax_<year>.json` (Lee, Alachua, Bay, Clay, ...) or
+  // index-form `tax_<n>.json` (Broward, Collier, Hillsborough, Highlands, ...). The per-authority
+  // `tax_jurisdiction*` / `tax_exemption*` County entities also start with `tax_` but have no
+  // query-db table; they should fall through to skip rather than each producing a `taxes` row.
+  // `tax_exemption` carries `tax_year` and collides on the (property_id, tax_year) unique key;
+  // `tax_jurisdiction` has no year and inserts null-year rows.
+  if (/^tax_\d+\.json$/.test(fileName)) return mapTaxRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
   if (/^property_valuation_/.test(fileName)) {
     return [mapPropertyChild("property_valuations", record, fileName, requestIdentifier, artifactUri, PROPERTY_VALUATION_COLUMNS, sourceSystem)];
   }
@@ -503,8 +509,12 @@ function mapKnownAppraisalRecord(
   if (/^property_improvement_/.test(fileName)) {
     return [mapAppraisalPropertyImprovement(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
   }
-  if (/^structure_/.test(fileName)) return [mapPropertyChild("structures", record, fileName, requestIdentifier, artifactUri, STRUCTURE_COLUMNS, sourceSystem)];
-  if (/^utility_/.test(fileName)) return [mapPropertyChild("utilities", record, fileName, requestIdentifier, artifactUri, UTILITY_COLUMNS, sourceSystem)];
+  // `property_has_structure` and `property_has_utility` are single-cardinality in the County
+  // data group, so these entities are emitted bare, with no index. Match both forms, as `lot`
+  // already does below; otherwise a lone `structure.json` / `utility.json` is recorded as an
+  // unrecognized file and never loaded.
+  if (fileName === "structure.json" || /^structure_/.test(fileName)) return [mapPropertyChild("structures", record, fileName, requestIdentifier, artifactUri, STRUCTURE_COLUMNS, sourceSystem)];
+  if (fileName === "utility.json" || /^utility_/.test(fileName)) return [mapPropertyChild("utilities", record, fileName, requestIdentifier, artifactUri, UTILITY_COLUMNS, sourceSystem)];
   if (/^layout_/.test(fileName)) return [mapPropertyChild("layouts", record, fileName, requestIdentifier, artifactUri, LAYOUT_COLUMNS, sourceSystem)];
   if (fileName === "lot.json" || /^lot_/.test(fileName)) {
     return [mapPropertyChild("lots", record, fileName, requestIdentifier, artifactUri, LOT_COLUMNS, sourceSystem)];
