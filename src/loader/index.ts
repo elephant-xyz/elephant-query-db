@@ -9,6 +9,7 @@ export * from "./media.js";
 export * from "./normalizers.js";
 export * from "./permit-documents.js";
 export * from "./permits.js";
+export * from "./places.js";
 export * from "./scoped-load.js";
 export * from "./sql.js";
 export * from "./sunbiz.js";

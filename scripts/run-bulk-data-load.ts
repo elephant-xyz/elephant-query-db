@@ -1,8 +1,9 @@
 import { createReadStream, createWriteStream, readFileSync, unlink, writeFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 
 import AdmZip from "adm-zip";
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -17,6 +18,7 @@ import {
   buildScopedLoadSelectionFromManifest,
   createS3ArtifactReader,
   expandBbbBusinessProfileRecords,
+  expandOverturePlaceRecords,
   isLeePermitRecordSelected,
   isSunbizAddressRecordSelected,
   isSunbizClassRecordSelected,
@@ -24,10 +26,13 @@ import {
   mapBbbBusinessProfile,
   mapLeePermitDetail,
   mapNormalizedCityPermit,
+  mapOverturePlace,
+  mapOverturePlaceExtraction,
   mapSunbizAnnualReportsFromRegistration,
   mapSunbizClassRecord,
   mergeBulkStageTable,
   parseS3Uri,
+  PLACES_TABLE_ORDER,
   preparedRowsContainSelectedParcel,
   readBulkTableColumns,
   readJsonArtifactRecords,
@@ -55,7 +60,7 @@ import {
   type CoverageSource,
 } from "./oracle-dataset-coverage-upsert.js";
 
-type TrackName = "appraisal" | "bbb" | "permits" | "sunbiz";
+type TrackName = "appraisal" | "bbb" | "permits" | "places" | "sunbiz";
 
 type BulkLoaderPhase = "all" | "stage" | "load";
 
@@ -75,6 +80,7 @@ type BulkLoaderOptions = {
   /** Artifacts per batch for disk-bounded appraisal loading. 0 = single-batch (legacy). */
   readonly batchSize: number;
   readonly bbbPrefix: string;
+  readonly placesPrefix: string;
   readonly bucket: string;
   readonly concurrency: number;
   readonly envFile: string;
@@ -152,6 +158,7 @@ const DEFAULT_PERMIT_PREFIX =
 const DEFAULT_SUNBIZ_PREFIX =
   "permit-harvest/sunbiz-lee-corporate-quarterly-2026q2-expanded/lexicon-transform/business-registration-v1/classes/";
 const DEFAULT_BBB_PREFIX = "permit-harvest/bbb/category-data/browser-harvest-v1/profiles/";
+const DEFAULT_PLACES_PREFIX = "overture-places/lee/";
 const DEFAULT_STAGE_DIR = ".loader-runs/bulk-staging";
 const STAGE_TABLE_PREFIX = "elephant_bulk_stage";
 const APPRAISAL_JURISDICTION_METADATA = new Map<
@@ -259,6 +266,8 @@ const BBB_TABLE_ORDER: readonly LogicalTableName[] = [
   "business_reputation_external_links",
   "contractor_quality_scores",
 ];
+
+const PLACES_TRACK_TABLE_ORDER: readonly LogicalTableName[] = PLACES_TABLE_ORDER;
 
 /**
  * Run the local bulk loader from S3 artifacts into Neon/Postgres.
@@ -435,6 +444,9 @@ async function main(): Promise<void> {
     // Best-effort: coverage is downstream bookkeeping consumed by the snapshot/publish path,
     // so a failure here must never fail an otherwise-successful load.
     if (options.phase === "all" || options.phase === "load") {
+      if (options.tracks.includes("places")) {
+        await finalizePlacesAfterLoad({ databaseUrl });
+      }
       await upsertCoverageAfterLoad({
         databaseUrl,
         jurisdictionKey: options.jurisdictionKey,
@@ -513,6 +525,9 @@ async function stageSelectedTracks(params: {
     }
     if (params.options.tracks.includes("bbb")) {
       await stageBbb({ ...params, s3, writeRows });
+    }
+    if (params.options.tracks.includes("places")) {
+      await stagePlaces({ ...params, s3, writeRows });
     }
   } finally {
     writer.end();
@@ -1196,6 +1211,74 @@ async function stageBbb(params: {
 }
 
 /**
+ * Stage Overture places JSONL artifacts into the generic CSV file.
+ *
+ * Places inputs are extract JSONL (`places/places-part-NNNN.jsonl`) plus an
+ * optional `manifest/summary.json` run record. The mapper never writes
+ * `companies` or `company_id`.
+ *
+ * @param params - Shared S3 client, options, counters, and row writer callback.
+ * @returns Promise that resolves after places artifacts have been visited.
+ */
+async function stagePlaces(params: {
+  readonly counters: MutableBulkCounters;
+  readonly options: BulkLoaderOptions;
+  readonly s3: S3Client;
+  readonly writeRows: (rows: readonly PreparedRow[]) => Promise<void>;
+}): Promise<void> {
+  const reader = createS3ArtifactReader({ client: params.s3 });
+  const artifacts = await listS3Objects({
+    bucket: params.options.bucket,
+    limit: params.options.limit,
+    prefix: params.options.placesPrefix,
+    s3: params.s3,
+    suffix: [".json", ".jsonl"],
+  });
+  console.log(JSON.stringify({ event: "bulk_track_started", track: "places", artifactCount: artifacts.length }));
+
+  await processIterable(artifacts, params.options.concurrency, async (artifact) => {
+    await stageArtifact(params, artifact.uri, async () => {
+      const artifactRecords = await readJsonArtifactRecords(reader, artifact.uri, "auto");
+      const rows: PreparedRow[] = [];
+      let inputRecords = 0;
+      let skippedRecords = 0;
+      const isSummary = artifact.uri.endsWith("summary.json") || artifact.uri.includes("/manifest/");
+      for (const artifactRecord of artifactRecords) {
+        if (isSummary) {
+          const bundle = mapOverturePlaceExtraction({
+            artifactUri: artifact.uri,
+            record: artifactRecord.record,
+          });
+          rows.push(...bundle.rows);
+          skippedRecords += bundle.skippedRecords.length;
+          inputRecords += 1;
+          continue;
+        }
+        const placeRecords = expandOverturePlaceRecords(artifactRecord.record);
+        inputRecords += placeRecords.length;
+        for (const placeRecord of placeRecords) {
+          const bundle = mapOverturePlace({ artifactUri: artifact.uri, record: placeRecord });
+          rows.push(...bundle.rows);
+          skippedRecords += bundle.skippedRecords.length;
+        }
+      }
+      const sortedRows = sortRows(rows, PLACES_TRACK_TABLE_ORDER);
+      await params.writeRows(sortedRows);
+      params.counters.inputRecords += inputRecords;
+      params.counters.preparedRows += rows.length;
+      params.counters.skippedRecords += skippedRecords;
+      return {
+        filteredRecords: 0,
+        inputRecords,
+        preparedRows: rows.length,
+        skippedRecords,
+      };
+    });
+  });
+  console.log(JSON.stringify({ event: "bulk_track_finished", track: "places", artifactCount: artifacts.length }));
+}
+
+/**
  * Build the complete Sunbiz row-to-address reference map from transform relationship files.
  *
  * Full Sunbiz loads do not use the scoped-property filter, but they still need
@@ -1505,7 +1588,8 @@ async function upsertCoverageAfterLoad(params: {
   });
   try {
     for (const track of params.tracks) {
-      const source: CoverageSource = track;
+      const source = coverageSourceForTrack(track);
+      if (source === null) continue;
       try {
         const computation = await computeCoverage(pool, county, source);
         if (computation.ingestedCount <= 0) {
@@ -2229,6 +2313,7 @@ function tableOrderForTracks(tracks: readonly TrackName[]): readonly LogicalTabl
   if (tracks.includes("permits")) append(PERMIT_TABLE_ORDER);
   if (tracks.includes("sunbiz")) append(SUNBIZ_TABLE_ORDER);
   if (tracks.includes("bbb")) append(BBB_TABLE_ORDER);
+  if (tracks.includes("places")) append(PLACES_TRACK_TABLE_ORDER);
   return order;
 }
 
@@ -2305,6 +2390,7 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
     appraisalStateCode: jurisdictionMetadata.stateCode,
     batchSize: parseBatchSize(values.get("batch-size"), values.get("incremental") === "true"),
     bbbPrefix: values.get("bbb-prefix") ?? DEFAULT_BBB_PREFIX,
+    placesPrefix: values.get("places-prefix") ?? DEFAULT_PLACES_PREFIX,
     bucket: values.get("bucket") ?? DEFAULT_BUCKET,
     concurrency: parseConcurrency(values.get("concurrency")),
     envFile: values.get("env-file") ?? ".env.local",
@@ -2357,11 +2443,77 @@ function parseTracks(value: string): readonly TrackName[] {
   const tracks = value.split(",").map((track) => track.trim()).filter(Boolean);
   if (tracks.length === 0) throw new Error("At least one track is required");
   return tracks.map((track): TrackName => {
-    if (track !== "appraisal" && track !== "bbb" && track !== "permits" && track !== "sunbiz") {
+    if (track !== "appraisal" && track !== "bbb" && track !== "permits" && track !== "places" && track !== "sunbiz") {
       throw new Error(`Unsupported track: ${track}`);
     }
     return track;
   });
+}
+
+/**
+ * Map a loader track name onto the coverage-table source spelling.
+ *
+ * Places uses `overture_places` in Neon and the published snapshot (one spelling).
+ * The pre-existing sunbiz/`corporate` mismatch is not repeated here.
+ *
+ * @param track - Bulk-loader track.
+ * @returns Coverage source, or null when the track has no coverage row.
+ */
+function coverageSourceForTrack(track: TrackName): CoverageSource | null {
+  if (track === "places") return "overture_places";
+  if (track === "appraisal" || track === "permits" || track === "sunbiz" || track === "bbb") {
+    return track;
+  }
+  return null;
+}
+
+/**
+ * Fill PostGIS geometry from lon/lat and mark stale GERS rows `is_current=false`.
+ * Absence is not closure; `operating_status` remains the closure field.
+ * `is_current` uses a grouped max(last_seen_release) join, not a correlated
+ * subquery — the nested form was CPU-bound for ~15 minutes on the Lee 40k load.
+ *
+ * @param params - Direct database URL.
+ * @returns Promise that resolves after the refresh SQL commits.
+ */
+async function finalizePlacesAfterLoad(params: {
+  readonly databaseUrl: string;
+}): Promise<void> {
+  const client = await createKeepaliveClient(params.databaseUrl);
+  try {
+    await client.query(
+      `UPDATE business_locations
+       SET geometry = ST_SetSRID(ST_MakePoint(longitude::double precision, latitude::double precision), 4326)
+       WHERE source_system = 'overture_places'
+         AND longitude IS NOT NULL
+         AND latitude IS NOT NULL
+         AND (
+           geometry IS NULL
+           OR NOT ST_Equals(
+             geometry,
+             ST_SetSRID(ST_MakePoint(longitude::double precision, latitude::double precision), 4326)
+           )
+         )`,
+      [],
+    );
+    await client.query(
+      `UPDATE business_locations loc
+       SET is_current = (loc.last_seen_release = county_max.max_release)
+       FROM (
+         SELECT county_key, max(last_seen_release) AS max_release
+         FROM business_locations
+         WHERE source_system = 'overture_places'
+         GROUP BY county_key
+       ) county_max
+       WHERE loc.source_system = 'overture_places'
+         AND loc.county_key = county_max.county_key
+         AND loc.is_current IS DISTINCT FROM (loc.last_seen_release = county_max.max_release)`,
+      [],
+    );
+    console.log(JSON.stringify({ event: "overture_places_refresh_finalized" }));
+  } finally {
+    await client.end();
+  }
 }
 
 /**
@@ -2478,6 +2630,7 @@ function redactedOptions(options: BulkLoaderOptions): JsonObject {
     appraisalStateCode: options.appraisalStateCode,
     batchSize: options.batchSize,
     bbbPrefix: options.bbbPrefix,
+    placesPrefix: options.placesPrefix,
     bucket: options.bucket,
     concurrency: options.concurrency,
     envFile: options.envFile,
@@ -2605,7 +2758,22 @@ function onceFinish(writer: Writable): Promise<void> {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * True when this module is the CLI entrypoint.
+ *
+ * Compares resolved filesystem paths so percent-encoded spaces in
+ * `import.meta.url` and relative `process.argv[1]` values still match.
+ *
+ * @param metaUrl - `import.meta.url` of the module under test.
+ * @param argv1 - `process.argv[1]` as invoked (relative or absolute).
+ * @returns Whether the two paths refer to the same file.
+ */
+export function isCliEntrypoint(metaUrl: string, argv1: string | undefined): boolean {
+  if (argv1 === undefined || argv1.trim().length === 0) return false;
+  return fileURLToPath(metaUrl) === resolve(argv1);
+}
+
+if (isCliEntrypoint(import.meta.url, process.argv[1])) {
   main().catch((caught: unknown) => {
     const message = caught instanceof Error ? caught.message : String(caught);
     console.error(JSON.stringify({ event: "bulk_loader_failed", error: message }));

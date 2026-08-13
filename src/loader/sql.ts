@@ -11,10 +11,12 @@ import type {
 } from "./types.js";
 
 const JSONB_COLUMNS = new Set<string>([
+  "confidence_distribution",
   "entry_http_request",
   "factor_payload",
   "field_payload",
   "more_details",
+  "operating_status_counts",
   "source_http_request",
   "source_payload",
   "source_search_result",
@@ -23,6 +25,12 @@ const JSONB_COLUMNS = new Set<string>([
 const TEXT_ARRAY_COLUMNS = new Set<string>([
   "matched_address_roles",
   "matched_zip_prefixes",
+  "taxonomy_hierarchy",
+  "websites",
+  "socials",
+  "emails",
+  "phones",
+  "distinct_source_datasets",
 ]);
 
 const TABLES_WITH_UPDATED_AT = new Set<LogicalTableName>([
@@ -43,6 +51,10 @@ const TABLES_WITH_UPDATED_AT = new Set<LogicalTableName>([
   "business_reputation_rating_reasons",
   "business_reputation_reviews",
   "business_reputation_service_areas",
+  "business_location_categories",
+  "business_location_parcel_links",
+  "business_location_sources",
+  "business_locations",
   "companies",
   "contractor_quality_scores",
   "deeds",
@@ -53,6 +65,7 @@ const TABLES_WITH_UPDATED_AT = new Set<LogicalTableName>([
   "layouts",
   "lots",
   "ownerships",
+  "overture_place_extractions",
   "parcels",
   "people",
   "property_improvements",
@@ -71,6 +84,7 @@ const TABLES_WITH_ADDRESS_ID = new Set<LogicalTableName>([
   "business_reputation_service_areas",
   "business_registration_addresses",
   "business_registration_parties",
+  "business_locations",
   "permit_contacts",
   "properties",
   "property_improvements",
@@ -153,6 +167,12 @@ const TABLES_WITH_BUSINESS_REPUTATION_COMPLAINT_ID = new Set<LogicalTableName>([
   "business_reputation_complaint_events",
 ]);
 
+const TABLES_WITH_BUSINESS_LOCATION_ID = new Set<LogicalTableName>([
+  "business_location_categories",
+  "business_location_parcel_links",
+  "business_location_sources",
+]);
+
 export const DEFAULT_TABLE_WRITE_SPECS: ReadonlyMap<LogicalTableName, TableWriteSpec> =
   new Map<LogicalTableName, TableWriteSpec>([
     ["addresses", defaultSpec("addresses", ["address_id"])],
@@ -174,6 +194,11 @@ export const DEFAULT_TABLE_WRITE_SPECS: ReadonlyMap<LogicalTableName, TableWrite
     ["business_reputation_rating_reasons", defaultSpec("business_reputation_rating_reasons", ["business_reputation_rating_reason_id"])],
     ["business_reputation_reviews", defaultSpec("business_reputation_reviews", ["business_reputation_review_id"])],
     ["business_reputation_service_areas", defaultSpec("business_reputation_service_areas", ["business_reputation_service_area_id"])],
+    ["business_location_categories", defaultSpec("business_location_categories", ["business_location_category_id"])],
+    ["business_location_parcel_links", defaultSpec("business_location_parcel_links", ["business_location_parcel_link_id"])],
+    ["business_location_sources", defaultSpec("business_location_sources", ["business_location_source_id"])],
+    ["business_locations", defaultSpec("business_locations", ["business_location_id"])],
+    ["overture_place_extractions", defaultSpec("overture_place_extractions", ["overture_place_extraction_id"])],
     ["companies", defaultSpec("companies", ["company_id"])],
     ["contractor_quality_scores", defaultSpec("contractor_quality_scores", ["contractor_quality_score_id"])],
     ["deeds", defaultSpec("deeds", ["deed_id"])],
@@ -248,6 +273,7 @@ function buildUpdateGuardColumnsByTable(): ReadonlyMap<LogicalTableName, readonl
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_BUSINESS_REGISTRATION_ID, ["business_registration_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_BUSINESS_REPUTATION_PROFILE_ID, ["business_reputation_profile_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_BUSINESS_REPUTATION_COMPLAINT_ID, ["business_reputation_complaint_id"]);
+  addUpdateGuardColumns(columnsByTable, TABLES_WITH_BUSINESS_LOCATION_ID, ["business_location_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_COMPANY_ID, ["company_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_CONTRACTOR_COMPANY_ID, ["contractor_company_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_OWNER_COMPANY_ID, ["owner_company_id"]);
@@ -528,6 +554,17 @@ export async function resolvePreparedRowReferences(
     targetIdColumnName: "business_reputation_complaint_id",
     targetTableName: "business_reputation_complaints",
     targetTables: TABLES_WITH_BUSINESS_REPUTATION_COMPLAINT_ID,
+    missingReferenceBehavior,
+  });
+  await setSourceKeyReference({
+    client,
+    row,
+    values,
+    referenceSourceRecordKey: row.references.businessLocationSourceRecordKey,
+    targetColumnName: "business_location_id",
+    targetIdColumnName: "business_location_id",
+    targetTableName: "business_locations",
+    targetTables: TABLES_WITH_BUSINESS_LOCATION_ID,
     missingReferenceBehavior,
   });
 

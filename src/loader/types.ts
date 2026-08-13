@@ -12,12 +12,17 @@ export type JsonObject = Record<string, unknown>;
 export type SourceSystem =
   | "bbb"
   | "sunbiz"
+  | "overture_places"
   | `${string}_appraiser`
   | `${string}_accela`
   | `${string}_permits`;
 
 export type LogicalTableName =
   | "addresses"
+  | "business_location_categories"
+  | "business_location_parcel_links"
+  | "business_location_sources"
+  | "business_locations"
   | "business_registration_addresses"
   | "business_registration_annual_reports"
   | "business_registration_events"
@@ -47,6 +52,7 @@ export type LogicalTableName =
   | "layouts"
   | "lots"
   | "ownerships"
+  | "overture_place_extractions"
   | "parcels"
   | "people"
   | "permit_contacts"
@@ -80,6 +86,7 @@ export type PreparedRow = {
 
 export type PreparedRowReferences = {
   readonly addressSourceRecordKey?: string;
+  readonly businessLocationSourceRecordKey?: string;
   readonly businessReputationComplaintSourceRecordKey?: string;
   readonly businessReputationProfileSourceRecordKey?: string;
   readonly companySourceRecordKey?: string;
