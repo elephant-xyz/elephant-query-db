@@ -71,6 +71,8 @@ Places do **not** map onto an existing lexicon class. `company` is a party (name
 
 Follow the Sunbiz precedent: tables land in Neon now; the lexicon class is a separate tracked PR. The Sunbiz analogue classes (`business_registration*`) were described as added locally and are **not** on `lexicon` `main` as of 2026-08-12 — track the places lexicon PR URL or this one will not land either.
 
+Tracked lexicon proposal: [`elephant-xyz/lexicon#173`](https://github.com/elephant-xyz/lexicon/pull/173).
+
 Proposed class (not landed in this pass): `business_location`.
 
 Facts preserved in Postgres now:
