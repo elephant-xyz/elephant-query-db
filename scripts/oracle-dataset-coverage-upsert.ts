@@ -33,7 +33,7 @@ import { permitSourcePrefixForCounty } from "./run-permit-table-export.js";
  */
 
 /** The dataset sources this module knows how to count from Neon. */
-export type CoverageSource = "appraisal" | "permits" | "sunbiz" | "bbb";
+export type CoverageSource = "appraisal" | "permits" | "sunbiz" | "bbb" | "overture_places";
 
 /** All countable sources, in a stable order. */
 export const COVERAGE_SOURCES: readonly CoverageSource[] = [
@@ -41,6 +41,7 @@ export const COVERAGE_SOURCES: readonly CoverageSource[] = [
   "permits",
   "sunbiz",
   "bbb",
+  "overture_places",
 ] as const;
 
 /**
@@ -56,24 +57,25 @@ export const COUNTY_KEYED_SOURCES: readonly CoverageSource[] = [
  * Sources ingested under one fixed statewide `source_system`, whose per-county
  * attribution must be parsed out of `source_artifact_uri` instead.
  */
-export type GlobalCoverageSource = "sunbiz" | "bbb";
+export type GlobalCoverageSource = "sunbiz" | "bbb" | "overture_places";
 
 /** Global (artifact-URI-derived) sources, in a stable order. */
 export const GLOBAL_COVERAGE_SOURCES: readonly GlobalCoverageSource[] = [
   "sunbiz",
   "bbb",
+  "overture_places",
 ] as const;
 
 /**
  * Type guard: is this a global source whose county comes from `source_artifact_uri`?
  *
  * @param source - Any coverage source.
- * @returns True for `sunbiz`/`bbb`.
+ * @returns True for `sunbiz`/`bbb`/`overture_places`.
  */
 export function isGlobalCoverageSource(
   source: CoverageSource,
 ): source is GlobalCoverageSource {
-  return source === "sunbiz" || source === "bbb";
+  return source === "sunbiz" || source === "bbb" || source === "overture_places";
 }
 
 /** Physical table + county-derivation config for each global source. */
@@ -103,6 +105,16 @@ const SUNBIZ_COUNTY_SQL_EXPR =
 const BBB_COUNTY_SQL_EXPR =
   "lower(regexp_replace(substring(source_artifact_uri from 'category-data/([^/]+)'), '-county.*$', ''))";
 
+/**
+ * SQL fragment deriving the county slug from an Overture places artifact URI, e.g.
+ * `.../overture-places/lee/2026-07-22.0/places/places-part-0001.jsonl` -> `lee`.
+ * Use ONE spelling `overture_places` in Neon and the published snapshot.
+ * Note the pre-existing mismatch: Neon coverage uses `sunbiz` while the snapshot
+ * writer emits `corporate` for the same track. Do not propagate that here.
+ */
+const OVERTURE_PLACES_COUNTY_SQL_EXPR =
+  "lower(substring(source_artifact_uri from 'overture-places/([^/]+)'))";
+
 /** Per-global-source physical table + county-derivation SQL. */
 const GLOBAL_SOURCE_CONFIG: Record<GlobalCoverageSource, GlobalSourceConfig> = {
   sunbiz: {
@@ -112,6 +124,10 @@ const GLOBAL_SOURCE_CONFIG: Record<GlobalCoverageSource, GlobalSourceConfig> = {
   bbb: {
     table: "business_reputation_profiles",
     countyExpr: BBB_COUNTY_SQL_EXPR,
+  },
+  overture_places: {
+    table: "business_locations",
+    countyExpr: OVERTURE_PLACES_COUNTY_SQL_EXPR,
   },
 };
 
@@ -133,8 +149,9 @@ export function globalSourceCountyExpr(source: GlobalCoverageSource): string {
  * Supported shapes:
  *  - sunbiz: `.../sunbiz-<county>-corporate-quarterly-...` (e.g. `miami-dade`, `palm-beach`, `lee`).
  *  - bbb:    `.../bbb/category-data/<county>-county[-permit-seeded]/...` (e.g. `lee`, `miami-dade`).
+ *  - overture_places: `.../overture-places/<county>/<release>/...` (e.g. `lee`).
  *
- * @param source - Global source (`sunbiz` or `bbb`).
+ * @param source - Global source (`sunbiz`, `bbb`, or `overture_places`).
  * @param artifactUri - The `source_artifact_uri` value for a harvested row.
  * @returns Lowercase hyphen county slug, or `null` when it cannot be parsed.
  */
@@ -145,6 +162,11 @@ export function countySlugFromArtifactUri(
   if (typeof artifactUri !== "string" || artifactUri.length === 0) return null;
   if (source === "sunbiz") {
     const match = /sunbiz-(.+?)-corporate/i.exec(artifactUri);
+    const slug = match?.[1]?.toLowerCase().trim();
+    return slug && slug.length > 0 ? slug : null;
+  }
+  if (source === "overture_places") {
+    const match = /overture-places\/([^/]+)/i.exec(artifactUri);
     const slug = match?.[1]?.toLowerCase().trim();
     return slug && slug.length > 0 ? slug : null;
   }
@@ -256,7 +278,8 @@ export function buildCoverageCountSql(
         values: [permitSourcePrefixForCounty(county)],
       };
     case "sunbiz":
-    case "bbb": {
+    case "bbb":
+    case "overture_places": {
       const config = GLOBAL_SOURCE_CONFIG[source];
       return {
         text: `
@@ -304,7 +327,8 @@ export function buildCoverageTimestampSql(
         values: [permitSourcePrefixForCounty(county)],
       };
     case "sunbiz":
-    case "bbb": {
+    case "bbb":
+    case "overture_places": {
       const config = GLOBAL_SOURCE_CONFIG[source];
       return {
         text: `
@@ -332,6 +356,18 @@ export const COVERAGE_UPSERT_SQL = `
     ingested_count = EXCLUDED.ingested_count,
     first_loaded_at = COALESCE(${ORACLE_DATASET_COVERAGE_TABLE}.first_loaded_at, EXCLUDED.first_loaded_at),
     last_loaded_at = COALESCE(EXCLUDED.last_loaded_at, ${ORACLE_DATASET_COVERAGE_TABLE}.last_loaded_at)
+`;
+
+/**
+ * Publish-pointer update owned by the Filebase/IPNS step. Does not touch
+ * `ingested_count` or `expected_count`.
+ */
+export const COVERAGE_PUBLISH_POINTER_SQL = `
+  UPDATE ${ORACLE_DATASET_COVERAGE_TABLE}
+  SET cid = $1,
+      ipns_label = $2
+  WHERE county = $3
+    AND source = $4
 `;
 
 /**
@@ -442,6 +478,30 @@ export async function upsertCoverageRow(
   computation: CoverageComputation,
 ): Promise<void> {
   await client.query(COVERAGE_UPSERT_SQL, buildCoverageUpsertValues(computation));
+}
+
+/**
+ * Stamp the published CID and IPNS label onto an existing coverage row without
+ * changing counts.
+ *
+ * @param client Query client.
+ * @param params County, source, CID, and IPNS label.
+ */
+export async function updateCoveragePublishPointer(
+  client: CoverageQueryClient,
+  params: {
+    readonly county: string;
+    readonly source: CoverageSource;
+    readonly cid: string;
+    readonly ipnsLabel: string;
+  },
+): Promise<void> {
+  await client.query(COVERAGE_PUBLISH_POINTER_SQL, [
+    params.cid,
+    params.ipnsLabel,
+    params.county,
+    params.source,
+  ]);
 }
 
 /**

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   COUNTY_KEYED_SOURCES,
+  COVERAGE_PUBLISH_POINTER_SQL,
   COVERAGE_SOURCES,
   COVERAGE_UPSERT_SQL,
   GLOBAL_COVERAGE_SOURCES,
@@ -225,6 +226,13 @@ describe("coverage upsert contract", () => {
     expect(COVERAGE_UPSERT_SQL).not.toContain("cid =");
     expect(COVERAGE_UPSERT_SQL).not.toContain("ipns_label =");
     expect(COVERAGE_UPSERT_SQL).not.toContain("expected_count =");
+  });
+
+  it("stamps cid and ipns_label without rewriting counts", () => {
+    expect(COVERAGE_PUBLISH_POINTER_SQL).toContain("SET cid = $1");
+    expect(COVERAGE_PUBLISH_POINTER_SQL).toContain("ipns_label = $2");
+    expect(COVERAGE_PUBLISH_POINTER_SQL).not.toContain("ingested_count");
+    expect(COVERAGE_PUBLISH_POINTER_SQL).not.toContain("expected_count");
   });
 
   it("binds values in [county, source, count, first, last] order", () => {
@@ -500,10 +508,11 @@ describe("backfillCoverage", () => {
       { county: "palm-beach", source: "sunbiz", count: 1198914 },
     ]);
 
-    // Stale-row pruning runs for both global sources with the derived keep-sets.
+    // Stale-row pruning runs for every global source with the derived keep-sets.
     expect(deletes).toEqual([
       { source: "sunbiz", keep: ["lee", "miami-dade", "palm-beach"] },
       { source: "bbb", keep: ["lee", "miami-dade"] },
+      { source: "overture_places", keep: [] },
     ]);
   });
 });
@@ -513,16 +522,23 @@ describe("backfillCoverage", () => {
 // ---------------------------------------------------------------------------
 
 describe("coverage source sets", () => {
-  it("lists the four supported sources", () => {
-    const expected: readonly CoverageSource[] = ["appraisal", "permits", "sunbiz", "bbb"];
+  it("lists the five supported sources", () => {
+    const expected: readonly CoverageSource[] = [
+      "appraisal",
+      "permits",
+      "sunbiz",
+      "bbb",
+      "overture_places",
+    ];
     expect(COVERAGE_SOURCES).toEqual(expected);
   });
 
   it("partitions sources into county-keyed and global (artifact-URI-derived)", () => {
     expect(COUNTY_KEYED_SOURCES).toEqual(["appraisal", "permits"]);
-    expect(GLOBAL_COVERAGE_SOURCES).toEqual(["sunbiz", "bbb"]);
+    expect(GLOBAL_COVERAGE_SOURCES).toEqual(["sunbiz", "bbb", "overture_places"]);
     expect(isGlobalCoverageSource("sunbiz")).toBe(true);
     expect(isGlobalCoverageSource("bbb")).toBe(true);
+    expect(isGlobalCoverageSource("overture_places")).toBe(true);
     expect(isGlobalCoverageSource("appraisal")).toBe(false);
     expect(isGlobalCoverageSource("permits")).toBe(false);
   });
