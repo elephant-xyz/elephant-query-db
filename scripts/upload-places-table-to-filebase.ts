@@ -57,6 +57,7 @@ export type PlacesPublishResult = {
   readonly cid: string;
   readonly ipnsLabel: string;
   readonly ipnsName: string;
+  readonly previousCid: string | null;
   readonly keys: readonly string[];
   readonly gatewayUrls: PlacesGatewayUrls;
 };
@@ -70,7 +71,7 @@ type FilebaseFetchResponse = {
   json: () => Promise<unknown>;
 };
 
-type PlacesFetch = (
+export type PlacesFetch = (
   url: string | URL,
   init?: { method?: string; headers?: Record<string, string>; body?: string },
 ) => Promise<FilebaseFetchResponse>;
@@ -378,15 +379,43 @@ async function upsertPlacesIpnsPointer(
   apiToken: string,
   label: string,
   cid: string,
-): Promise<string> {
+): Promise<{ readonly networkKey: string; readonly previousCid: string | null }> {
   const names = await listIpnsNames(fetchImpl, apiToken);
   const existing = names.find((name) => name.label === label);
   if (existing === undefined) {
     const created = await createIpnsName(fetchImpl, apiToken, label, cid);
-    return created.network_key;
+    return { networkKey: created.network_key, previousCid: null };
   }
   await updateIpnsName(fetchImpl, apiToken, label, cid);
-  return existing.network_key;
+  return { networkKey: existing.network_key, previousCid: existing.cid };
+}
+
+/**
+ * Restore the previous dedicated places IPNS CID after a downstream verify or
+ * finalize failure. This never deletes the newly uploaded immutable CID.
+ *
+ * @param opts Rollback inputs.
+ */
+export async function restorePlacesIpnsPointer(opts: {
+  readonly fetchImpl: PlacesFetch;
+  readonly env: PlacesPublishEnv;
+  readonly county: string;
+  readonly previousCid: string;
+}): Promise<void> {
+  assertFilebaseCredentials(opts.env);
+  const label = resolvePlacesIpnsLabel(opts.env, opts.county);
+  const apiToken = requireCredential(opts.env, "FILEBASE_API_TOKEN");
+  const names = await listIpnsNames(opts.fetchImpl, apiToken);
+  const existing = names.find((name) => name.label === label);
+  if (existing === undefined) {
+    throw new Error(`Cannot roll back missing places IPNS label ${label}`);
+  }
+  await updateIpnsName(
+    opts.fetchImpl,
+    apiToken,
+    label,
+    opts.previousCid,
+  );
 }
 
 export async function ensureDedicatedPlacesBucket(opts: {
@@ -440,14 +469,20 @@ export async function uploadPlacesTable(opts: {
   }
 
   const cid = await generateBucketDirectoryCid(opts.client, bucket);
-  const ipnsName = await upsertPlacesIpnsPointer(opts.fetchImpl, apiToken, ipnsLabel, cid);
+  const pointer = await upsertPlacesIpnsPointer(
+    opts.fetchImpl,
+    apiToken,
+    ipnsLabel,
+    cid,
+  );
   return {
     bucket,
     cid,
     ipnsLabel,
-    ipnsName,
+    ipnsName: pointer.networkKey,
+    previousCid: pointer.previousCid,
     keys: plan.objects.map((object) => object.key),
-    gatewayUrls: buildPlacesGatewayUrls(ipnsName, opts.county),
+    gatewayUrls: buildPlacesGatewayUrls(pointer.networkKey, opts.county),
   };
 }
 

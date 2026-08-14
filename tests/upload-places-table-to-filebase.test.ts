@@ -13,6 +13,7 @@ import {
   planPlacesUpload,
   propertyIpnsLabel,
   resolvePlacesIpnsLabel,
+  restorePlacesIpnsPointer,
   uploadPlacesTable,
 } from "../scripts/upload-places-table-to-filebase.js";
 
@@ -197,5 +198,109 @@ describe("uploadPlacesTable", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("does not report success when the IPNS pointer update fails", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "places-publish-failure-"));
+    try {
+      await mkdir(join(dir, "lee"));
+      await writeFile(join(dir, "NOTICE.txt"), "notice\n");
+      await writeFile(join(dir, "lee", "index.json"), "{}\n");
+      await writeFile(join(dir, "lee", "places-table.parquet"), Buffer.from("PAR1"));
+      const client = createMockS3Client();
+      const calls: string[] = [];
+      const failingFetch = async (
+        url: string | URL,
+        init?: { method?: string },
+      ) => {
+        const method = init?.method ?? "GET";
+        calls.push(method);
+        if (method === "GET") {
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            json: async () => [
+              {
+                enabled: true,
+                label: PLACES_LABEL,
+                network_key: NETWORK_KEY,
+                cid: "QmPreviousWorkingCid",
+                sequence: 3,
+                published_at: "2026-07-22T00:00:00.000Z",
+                created_at: "2026-07-22T00:00:00.000Z",
+                updated_at: "2026-07-22T00:00:00.000Z",
+              },
+            ],
+          };
+        }
+        return {
+          ok: false,
+          status: 503,
+          statusText: "Unavailable",
+          json: async () => ({ error: "temporary failure" }),
+        };
+      };
+      await expect(
+        uploadPlacesTable({
+          client: asClient(client),
+          fetchImpl: asFetch(failingFetch),
+          env: fullEnv(),
+          county: "lee",
+          artifactDir: dir,
+        }),
+      ).rejects.toThrow();
+      expect(calls).toEqual(["GET", "PUT"]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("restores the previous CID after a downstream failure", async () => {
+    const requests: Array<{ method: string; body: Record<string, unknown> | null }> = [];
+    const fetchImpl = async (
+      _url: string | URL,
+      init?: { method?: string; body?: string },
+    ) => {
+      const method = init?.method ?? "GET";
+      const body =
+        init?.body === undefined
+          ? null
+          : (JSON.parse(init.body) as Record<string, unknown>);
+      requests.push({ method, body });
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () =>
+          method === "GET"
+            ? [
+                {
+                  enabled: true,
+                  label: PLACES_LABEL,
+                  network_key: NETWORK_KEY,
+                  cid: BUCKET_CID,
+                  sequence: 4,
+                  published_at: "2026-08-13T00:00:00.000Z",
+                  created_at: "2026-07-22T00:00:00.000Z",
+                  updated_at: "2026-08-13T00:00:00.000Z",
+                },
+              ]
+            : {},
+      };
+    };
+    await restorePlacesIpnsPointer({
+      fetchImpl: asFetch(fetchImpl),
+      env: fullEnv(),
+      county: "lee",
+      previousCid: "QmPreviousWorkingCid",
+    });
+    expect(requests).toEqual([
+      { method: "GET", body: null },
+      {
+        method: "PUT",
+        body: { cid: "QmPreviousWorkingCid", enabled: true },
+      },
+    ]);
   });
 });

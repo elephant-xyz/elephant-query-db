@@ -20,6 +20,7 @@ const JSONB_COLUMNS = new Set<string>([
   "source_http_request",
   "source_payload",
   "source_search_result",
+  "taxonomy_drift",
 ]);
 
 const TEXT_ARRAY_COLUMNS = new Set<string>([

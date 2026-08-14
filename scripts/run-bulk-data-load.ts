@@ -28,6 +28,7 @@ import {
   mapNormalizedCityPermit,
   mapOverturePlace,
   mapOverturePlaceExtraction,
+  parsePlacesDeactivationManifest,
   mapSunbizAnnualReportsFromRegistration,
   mapSunbizClassRecord,
   mergeBulkStageTable,
@@ -81,6 +82,8 @@ type BulkLoaderOptions = {
   readonly batchSize: number;
   readonly bbbPrefix: string;
   readonly placesPrefix: string;
+  readonly placesDeactivationManifest: string | null;
+  readonly placesRelease: string | null;
   readonly bucket: string;
   readonly concurrency: number;
   readonly envFile: string;
@@ -445,7 +448,11 @@ async function main(): Promise<void> {
     // so a failure here must never fail an otherwise-successful load.
     if (options.phase === "all" || options.phase === "load") {
       if (options.tracks.includes("places")) {
-        await finalizePlacesAfterLoad({ databaseUrl });
+        await finalizePlacesAfterLoad({
+          databaseUrl,
+          deactivationManifestUri: options.placesDeactivationManifest,
+          release: options.placesRelease,
+        });
       }
       await upsertCoverageAfterLoad({
         databaseUrl,
@@ -2391,6 +2398,9 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
     batchSize: parseBatchSize(values.get("batch-size"), values.get("incremental") === "true"),
     bbbPrefix: values.get("bbb-prefix") ?? DEFAULT_BBB_PREFIX,
     placesPrefix: values.get("places-prefix") ?? DEFAULT_PLACES_PREFIX,
+    placesDeactivationManifest:
+      values.get("places-deactivation-manifest") ?? null,
+    placesRelease: values.get("places-release") ?? null,
     bucket: values.get("bucket") ?? DEFAULT_BUCKET,
     concurrency: parseConcurrency(values.get("concurrency")),
     envFile: values.get("env-file") ?? ".env.local",
@@ -2468,19 +2478,80 @@ function coverageSourceForTrack(track: TrackName): CoverageSource | null {
 }
 
 /**
- * Fill PostGIS geometry from lon/lat and mark stale GERS rows `is_current=false`.
- * Absence is not closure; `operating_status` remains the closure field.
- * `is_current` uses a grouped max(last_seen_release) join, not a correlated
- * subquery — the nested form was CPU-bound for ~15 minutes on the Lee 40k load.
+ * Fill PostGIS geometry from lon/lat and apply only explicit changelog
+ * deactivations. Unchanged rows keep their current state even when their
+ * `last_seen_release` is older than the run release. Absence is never closure.
  *
- * @param params - Direct database URL.
+ * @param params - Direct database URL and optional S3 deactivation manifest.
  * @returns Promise that resolves after the refresh SQL commits.
  */
 async function finalizePlacesAfterLoad(params: {
   readonly databaseUrl: string;
+  readonly deactivationManifestUri: string | null;
+  readonly release: string | null;
 }): Promise<void> {
+  if (params.release === null) {
+    throw new Error("--places-release is required when loading the places track");
+  }
   const client = await createKeepaliveClient(params.databaseUrl);
   try {
+    await client.query("BEGIN", []);
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext('overture_places_refresh'))`,
+      [],
+    );
+    const staleCategories = await client.query(
+      `DELETE FROM business_location_categories category
+       USING business_locations location
+       WHERE category.business_location_id = location.business_location_id
+         AND location.source_system = 'overture_places'
+         AND location.last_seen_release = $1
+         AND category.source_system = 'overture_places'
+         AND NOT (
+           category.source_record_key =
+             location.source_record_key || ':category:0:' ||
+             COALESCE(location.source_payload->>'taxonomy_primary', '')
+           OR EXISTS (
+             SELECT 1
+             FROM jsonb_array_elements_text(
+               CASE
+                 WHEN jsonb_typeof(location.source_payload->'taxonomy_alternate') = 'array'
+                 THEN location.source_payload->'taxonomy_alternate'
+                 ELSE '[]'::jsonb
+               END
+             ) WITH ORDINALITY alternate(label, ordinal)
+             WHERE alternate.label IS DISTINCT FROM
+                   location.source_payload->>'taxonomy_primary'
+               AND category.source_record_key =
+                   location.source_record_key || ':category:' ||
+                   alternate.ordinal::text || ':' || alternate.label
+           )
+         )`,
+      [params.release],
+    );
+    const staleSources = await client.query(
+      `DELETE FROM business_location_sources source
+       USING business_locations location
+       WHERE source.business_location_id = location.business_location_id
+         AND location.source_system = 'overture_places'
+         AND location.last_seen_release = $1
+         AND source.source_system = 'overture_places'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(
+             CASE
+               WHEN jsonb_typeof(location.source_payload->'sources') = 'array'
+               THEN location.source_payload->'sources'
+               ELSE '[]'::jsonb
+             END
+           ) WITH ORDINALITY expected(value, ordinal)
+           WHERE source.source_record_key =
+                 location.source_record_key || ':source:' ||
+                 (expected.ordinal - 1)::text || ':' ||
+                 COALESCE(expected.value->>'dataset', '')
+         )`,
+      [params.release],
+    );
     await client.query(
       `UPDATE business_locations
        SET geometry = ST_SetSRID(ST_MakePoint(longitude::double precision, latitude::double precision), 4326)
@@ -2496,21 +2567,48 @@ async function finalizePlacesAfterLoad(params: {
          )`,
       [],
     );
-    await client.query(
-      `UPDATE business_locations loc
-       SET is_current = (loc.last_seen_release = county_max.max_release)
-       FROM (
-         SELECT county_key, max(last_seen_release) AS max_release
-         FROM business_locations
-         WHERE source_system = 'overture_places'
-         GROUP BY county_key
-       ) county_max
-       WHERE loc.source_system = 'overture_places'
-         AND loc.county_key = county_max.county_key
-         AND loc.is_current IS DISTINCT FROM (loc.last_seen_release = county_max.max_release)`,
-      [],
+    let deactivatedCount = 0;
+    if (params.deactivationManifestUri !== null) {
+      const { bucket, key } = parseS3Uri(params.deactivationManifestUri);
+      const s3 = new S3Client({});
+      const response = await s3.send(
+        new GetObjectCommand({ Bucket: bucket, Key: key }),
+      );
+      if (response.Body === undefined) {
+        throw new Error(
+          `Places deactivation manifest has no body: ${params.deactivationManifestUri}`,
+        );
+      }
+      const parsed = parsePlacesDeactivationManifest(
+        JSON.parse(await response.Body.transformToString()),
+      );
+      const gersIds = parsed.records.map((record) => record.gersId);
+      if (gersIds.length > 0) {
+        const result = await client.query(
+          `UPDATE business_locations
+           SET is_current = false,
+               updated_at = now()
+           WHERE source_system = 'overture_places'
+             AND county_key = $1
+             AND gers_id = ANY($2::text[])
+             AND is_current = true`,
+          [parsed.county, gersIds],
+        );
+        deactivatedCount = result.rowCount ?? 0;
+      }
+    }
+    await client.query("COMMIT", []);
+    console.log(
+      JSON.stringify({
+        event: "overture_places_refresh_finalized",
+        deactivatedCount,
+        deletedStaleCategoryCount: staleCategories.rowCount ?? 0,
+        deletedStaleSourceCount: staleSources.rowCount ?? 0,
+      }),
     );
-    console.log(JSON.stringify({ event: "overture_places_refresh_finalized" }));
+  } catch (caught) {
+    await client.query("ROLLBACK", []).catch(() => undefined);
+    throw caught;
   } finally {
     await client.end();
   }
