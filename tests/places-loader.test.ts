@@ -5,6 +5,7 @@ import {
   expandOverturePlaceRecords,
   mapOverturePlace,
   mapOverturePlaceExtraction,
+  parsePlacesDeactivationManifest,
 } from "../src/loader/places.js";
 import { PUBLIC_COVERAGE_ENRICHMENT_TRACKS } from "../scripts/write-public-coverage-snapshot.js";
 import {
@@ -110,6 +111,64 @@ describe("places licence gate helper", () => {
     expect(assertApprovedPlaceDatasets(["osm"]).passed).toBe(false);
     expect(assertApprovedPlaceDatasets(["osm"]).osmPresent).toBe(true);
     expect(assertApprovedPlaceDatasets(["not-a-provider"]).passed).toBe(false);
+  });
+});
+
+describe("places incremental refresh", () => {
+  it("accepts only explicit removed and moved-out deactivations", () => {
+    expect(
+      parsePlacesDeactivationManifest({
+        schemaVersion: "overture-places-deactivation/v1",
+        county: "lee",
+        release: "2026-08-19.0",
+        records: [
+          { gersId: "removed-1", reason: "removed" },
+          { gersId: "moved-1", reason: "moved_out" },
+        ],
+      }),
+    ).toMatchObject({
+      county: "lee",
+      records: [
+        { gersId: "removed-1", reason: "removed" },
+        { gersId: "moved-1", reason: "moved_out" },
+      ],
+    });
+  });
+
+  it("rejects absence-based and duplicate deactivations", () => {
+    expect(() =>
+      parsePlacesDeactivationManifest({
+        schemaVersion: "overture-places-deactivation/v1",
+        county: "lee",
+        release: "2026-08-19.0",
+        records: [{ gersId: "missing-1", reason: "absent" }],
+      }),
+    ).toThrow(/invalid/);
+    expect(() =>
+      parsePlacesDeactivationManifest({
+        schemaVersion: "overture-places-deactivation/v1",
+        county: "lee",
+        release: "2026-08-19.0",
+        records: [
+          { gersId: "duplicate-1", reason: "removed" },
+          { gersId: "duplicate-1", reason: "moved_out" },
+        ],
+      }),
+    ).toThrow(/Duplicate/);
+  });
+
+  it("hard-stops mapping before load when a changed row contains OSM", () => {
+    expect(() =>
+      mapOverturePlace({
+        artifactUri: "s3://internal/places.jsonl",
+        record: {
+          gers_id: "gers-osm",
+          overture_release: "2026-08-19.0",
+          county_key: "lee",
+          sources: [{ dataset: "OpenStreetMap" }],
+        },
+      }),
+    ).toThrow(/licence gate FAILED/);
   });
 });
 

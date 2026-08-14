@@ -46,6 +46,18 @@ export type PlacesLicenceGateResult = {
   readonly message: string;
 };
 
+export type PlacesDeactivation = {
+  readonly gersId: string;
+  readonly reason: "removed" | "moved_out";
+};
+
+export type PlacesDeactivationManifest = {
+  readonly schemaVersion: "overture-places-deactivation/v1";
+  readonly county: string;
+  readonly release: string;
+  readonly records: readonly PlacesDeactivation[];
+};
+
 /**
  * Assert that distinct Overture `sources[].dataset` values are a subset of the
  * approved publishable providers. Comparison is case-insensitive. Twin of
@@ -135,6 +147,24 @@ export function mapOverturePlace(params: {
     };
   }
 
+  const sourceCandidates = Array.isArray(params.record.sources)
+    ? params.record.sources
+    : [];
+  const sourceDatasets = sourceCandidates.map((source, index) => {
+    if (!isJsonObject(source)) {
+      throw new Error(`Overture place ${gersId} source ${index} is not an object`);
+    }
+    const dataset = readString(source.dataset);
+    if (dataset === null) {
+      throw new Error(`Overture place ${gersId} source ${index} has no dataset`);
+    }
+    return dataset;
+  });
+  const licenceGate = assertApprovedPlaceDatasets(sourceDatasets);
+  if (!licenceGate.passed) {
+    throw new Error(licenceGate.message);
+  }
+
   const locationKey = `overture_places:${gersId}`;
   const addressKey = `${locationKey}:address`;
   const release = readString(params.record.overture_release) ?? "unknown";
@@ -173,6 +203,9 @@ export function mapOverturePlaceExtraction(params: {
     ? params.record.licenceGate
     : {};
   const datasets = readStringArray(params.record.distinctSourceDatasets);
+  const changeCounts = isJsonObject(params.record.changeCounts)
+    ? params.record.changeCounts
+    : {};
   return {
     rows: [
       {
@@ -187,10 +220,19 @@ export function mapOverturePlaceExtraction(params: {
           county_key: countyKey,
           county_fips: readString(params.record.countyFips),
           overture_release: release,
+          previous_release: readString(params.record.previousRelease),
+          run_status: "loaded",
           tiger_boundary_source: readString(params.record.boundarySource) ?? "unknown",
           tiger_vintage: readString(params.record.tigerYear) ?? "unknown",
           bbox_count: readNumber(params.record.bboxCount) ?? 0,
           clip_count: readNumber(params.record.clipCount) ?? 0,
+          active_change_count: readNumber(params.record.activeChangeCount) ?? 0,
+          deactivation_count: readNumber(params.record.deactivationCount) ?? 0,
+          added_count: readNumber(changeCounts.added) ?? 0,
+          data_changed_count: readNumber(changeCounts.data_changed) ?? 0,
+          removed_count: readNumber(changeCounts.removed) ?? 0,
+          moved_in_count: readNumber(params.record.movedInCount) ?? 0,
+          moved_out_count: readNumber(params.record.movedOutCount) ?? 0,
           distinct_taxonomy_primary: readNumber(params.record.distinctTaxonomyPrimary),
           distinct_source_datasets: datasets,
           operating_status_counts: isJsonObject(params.record.operatingStatusCounts)
@@ -198,6 +240,9 @@ export function mapOverturePlaceExtraction(params: {
             : {},
           confidence_distribution: isJsonObject(params.record.confidenceDistribution)
             ? params.record.confidenceDistribution
+            : {},
+          taxonomy_drift: isJsonObject(params.record.taxonomyDrift)
+            ? params.record.taxonomyDrift
             : {},
           duration_ms: readNumber(params.record.durationMs),
           licence_gate_passed: readBoolean(licenceGate.passed) ?? false,
@@ -207,6 +252,54 @@ export function mapOverturePlaceExtraction(params: {
       },
     ],
     skippedRecords: [],
+  };
+}
+
+/**
+ * Parse the explicit removed/moved-out manifest produced by oracle-node.
+ * Duplicate GERS IDs and unsupported reasons are rejected before mutation.
+ *
+ * @param value Untrusted manifest JSON.
+ * @returns Validated deactivation manifest.
+ */
+export function parsePlacesDeactivationManifest(
+  value: unknown,
+): PlacesDeactivationManifest {
+  if (!isJsonObject(value)) {
+    throw new Error("Places deactivation manifest must be an object");
+  }
+  if (value.schemaVersion !== "overture-places-deactivation/v1") {
+    throw new Error("Unsupported places deactivation manifest schemaVersion");
+  }
+  const county = readString(value.county);
+  const release = readString(value.release);
+  if (county === null || release === null || !Array.isArray(value.records)) {
+    throw new Error("Places deactivation manifest is missing county/release/records");
+  }
+  const seen = new Set<string>();
+  const records = value.records.map((candidate, index): PlacesDeactivation => {
+    if (!isJsonObject(candidate)) {
+      throw new Error(`Places deactivation record ${index} must be an object`);
+    }
+    const gersId = readString(candidate.gersId);
+    const reason = readString(candidate.reason);
+    if (
+      gersId === null ||
+      (reason !== "removed" && reason !== "moved_out")
+    ) {
+      throw new Error(`Places deactivation record ${index} is invalid`);
+    }
+    if (seen.has(gersId)) {
+      throw new Error(`Duplicate places deactivation GERS ID: ${gersId}`);
+    }
+    seen.add(gersId);
+    return { gersId, reason };
+  });
+  return {
+    schemaVersion: "overture-places-deactivation/v1",
+    county,
+    release,
+    records,
   };
 }
 

@@ -61,6 +61,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1054.0",
+    "@aws-sdk/client-sfn": "3.1054.0",
     "@dsnp/parquetjs": "^1.8.7",
     "@vercel/blob": "^2.4.0",
     "adm-zip": "^0.5.17",
