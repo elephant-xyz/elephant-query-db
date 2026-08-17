@@ -12,11 +12,13 @@ import type {
 
 const JSONB_COLUMNS = new Set<string>([
   "confidence_distribution",
+  "coordinates",
   "entry_http_request",
   "factor_payload",
   "field_payload",
   "more_details",
   "operating_status_counts",
+  "record_fields",
   "source_http_request",
   "source_payload",
   "source_search_result",
@@ -63,6 +65,8 @@ const TABLES_WITH_UPDATED_AT = new Set<LogicalTableName>([
   "files",
   "flood_storm_information",
   "geometries",
+  "geometry_rings",
+  "illinois_sos_component_records",
   "layouts",
   "lots",
   "ownerships",
@@ -110,6 +114,8 @@ const TABLES_WITH_CONTRACTOR_COMPANY_ID = new Set<LogicalTableName>(["property_i
 const TABLES_WITH_OWNER_COMPANY_ID = new Set<LogicalTableName>(["ownerships"]);
 
 const TABLES_WITH_DEED_ID = new Set<LogicalTableName>(["files"]);
+
+const TABLES_WITH_GEOMETRY_ID = new Set<LogicalTableName>(["geometry_rings"]);
 
 const TABLES_WITH_PARCEL_ID = new Set<LogicalTableName>([
   "properties",
@@ -207,6 +213,8 @@ export const DEFAULT_TABLE_WRITE_SPECS: ReadonlyMap<LogicalTableName, TableWrite
     ["files", defaultSpec("files", ["file_id"])],
     ["flood_storm_information", defaultSpec("flood_storm_information", ["flood_storm_information_id"])],
     ["geometries", defaultSpec("geometries", ["geometry_id"])],
+    ["geometry_rings", defaultSpec("geometry_rings", ["geometry_ring_id"])],
+    ["illinois_sos_component_records", defaultSpec("illinois_sos_component_records", ["illinois_sos_component_record_id"])],
     ["inspections", defaultSpec("inspections", ["inspection_id"])],
     ["layouts", defaultSpec("layouts", ["layout_id"])],
     ["lots", defaultSpec("lots", ["lot_id"])],
@@ -279,6 +287,7 @@ function buildUpdateGuardColumnsByTable(): ReadonlyMap<LogicalTableName, readonl
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_CONTRACTOR_COMPANY_ID, ["contractor_company_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_OWNER_COMPANY_ID, ["owner_company_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_DEED_ID, ["deed_id"]);
+  addUpdateGuardColumns(columnsByTable, TABLES_WITH_GEOMETRY_ID, ["geometry_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_PARCEL_ID, ["parcel_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_PERSON_ID, ["person_id"]);
   addUpdateGuardColumns(columnsByTable, TABLES_WITH_OWNER_PERSON_ID, ["owner_person_id"]);
@@ -434,6 +443,17 @@ export async function resolvePreparedRowReferences(
     targetIdColumnName: "address_id",
     targetTableName: "addresses",
     targetTables: TABLES_WITH_ADDRESS_ID,
+    missingReferenceBehavior,
+  });
+  await setSourceKeyReference({
+    client,
+    row,
+    values,
+    referenceSourceRecordKey: row.references.geometrySourceRecordKey,
+    targetColumnName: "geometry_id",
+    targetIdColumnName: "geometry_id",
+    targetTableName: "geometries",
+    targetTables: TABLES_WITH_GEOMETRY_ID,
     missingReferenceBehavior,
   });
   await setSourceKeyReference({
@@ -747,7 +767,7 @@ const APPRAISER_SOURCE_SYSTEM_SUFFIX = "_appraiser";
 const PERMIT_SOURCE_SYSTEM_SUFFIX = "_accela";
 
 function readSourceSystem(value: unknown): SourceSystem | null {
-  if (value === "bbb" || value === "sunbiz") return value;
+  if (value === "bbb" || value === "illinois_sos" || value === "sunbiz") return value;
   if (typeof value !== "string") return null;
   // Admit county-parameterized appraiser/permit systems (`<county>_appraiser`,
   // `<county>_accela`) but require a non-empty county prefix so bare suffixes

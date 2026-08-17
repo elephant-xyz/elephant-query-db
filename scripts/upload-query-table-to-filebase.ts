@@ -183,8 +183,10 @@ export function buildQueryTableGatewayUrls(networkKey: string): QueryTableGatewa
  * geo-index label, so the query-table pointer can never clobber another dataset.
  */
 export function resolveQueryTableIpnsLabel(env: QueryTablePublishEnv, county: string): string {
-  const label =
-    trimToUndefined(env["FILEBASE_QUERY_TABLE_IPNS_LABEL"]) ?? defaultQueryTableIpnsLabel(county);
+  const label = trimToUndefined(env["FILEBASE_QUERY_TABLE_IPNS_LABEL"]);
+  if (label === undefined) {
+    throw new Error("FILEBASE_QUERY_TABLE_IPNS_LABEL is required");
+  }
 
   const property = propertyIpnsLabel(county);
   if (label === property) {
@@ -226,6 +228,9 @@ function requireCredential(env: QueryTablePublishEnv, name: string): string {
 export function assertFilebaseCredentials(env: QueryTablePublishEnv): void {
   for (const name of REQUIRED_CREDENTIALS) {
     requireCredential(env, name);
+  }
+  if (requireCredential(env, "S3_ENDPOINT") !== "https://s3.filebase.com") {
+    throw new Error("S3_ENDPOINT must use the supported Filebase endpoint");
   }
 }
 
@@ -379,12 +384,21 @@ async function upsertQueryTableIpnsPointer(
   const existing = names.find((name) => name.label === label);
 
   if (existing === undefined) {
-    const created = await createIpnsName(fetchImpl, apiToken, label, cid);
-    return created.network_key;
+    await createIpnsName(fetchImpl, apiToken, label, cid);
+  } else {
+    await updateIpnsName(fetchImpl, apiToken, label, cid);
   }
-
-  await updateIpnsName(fetchImpl, apiToken, label, cid);
-  return existing.network_key;
+  const verified = (await listIpnsNames(fetchImpl, apiToken)).find(
+    (name) => name.label === label,
+  );
+  if (
+    verified === undefined ||
+    verified.cid !== cid ||
+    verified.network_key.trim().length === 0
+  ) {
+    throw new Error("Query-table IPNS readback CID mismatch");
+  }
+  return verified.network_key;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +429,13 @@ export async function uploadQueryTable(opts: {
 
   const headerCid = await putQueryTableObject(opts.client, { bucket, key, body: opts.body });
   const localCid = await computeIpfsCid(opts.body);
+  if (
+    headerCid !== undefined &&
+    localCid !== undefined &&
+    headerCid !== localCid
+  ) {
+    throw new Error("Filebase query-table upload CID disagrees with local content CID");
+  }
   const cid = localCid ?? trimToUndefined(headerCid);
 
   if (cid === undefined) {

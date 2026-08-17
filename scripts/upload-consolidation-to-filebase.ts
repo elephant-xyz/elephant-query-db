@@ -44,6 +44,26 @@ type CheckpointRecord = {
   readonly uploadedAt: string;
 };
 
+/**
+ * Reject a stale property checkpoint instead of silently skipping changed bytes.
+ *
+ * @param existing - Persisted upload checkpoint for the property key.
+ * @param currentCid - CID from the current immutable manifest.
+ * @param key - Stable property object key.
+ * @returns Nothing when the checkpoint is absent or exactly current.
+ */
+export function assertPropertyCheckpointCid(
+  existing: CheckpointRecord | undefined,
+  currentCid: string,
+  key: string,
+): void {
+  if (existing !== undefined && existing.cid !== currentCid) {
+    throw new Error(
+      `Stale property checkpoint CID mismatch for ${key}: refusing changed content`,
+    );
+  }
+}
+
 // Fixed-key files (index.json, manifest.json, shards/shard-*.json) share stable keys
 // across runs, so a plain skip-by-key would re-point IPNS at a STALE index whenever a
 // bucket still holds an older checkpoint (e.g. a sample export). These files must be
@@ -399,10 +419,64 @@ async function upsertIpnsPointer(apiToken: string, label: string, indexCid: stri
 
   // Re-read to get the resolved IPNS name (network_key, e.g. k51q…) and confirm the pointer.
   const record = await getIpnsName(apiToken, label);
-  const ipnsName = record?.network_key ?? label;
+  if (
+    record === null ||
+    record.label !== label ||
+    record.cid !== indexCid ||
+    record.network_key.trim().length === 0
+  ) {
+    throw new Error("Filebase IPNS readback did not match label and index CID");
+  }
+  const ipnsName = record.network_key;
 
   console.log(JSON.stringify({ event: "ipns_updated", label, ipnsName, indexCid }));
   return ipnsName;
+}
+
+/**
+ * Verify the remotely retrievable index bytes, CID, and property count.
+ *
+ * @param indexCid - CID returned for the uploaded index object.
+ * @param expectedPropertyCount - Count from the approved local manifest.
+ * @returns Nothing after a matching gateway readback.
+ */
+export async function verifyRemoteIndex(
+  indexCid: string,
+  expectedPropertyCount: number,
+): Promise<void> {
+  const response = await fetch(`https://ipfs.filebase.io/ipfs/${indexCid}`);
+  if (!response.ok) {
+    throw new Error(
+      `Filebase index readback failed: ${response.status} ${response.statusText}`,
+    );
+  }
+  const body = Buffer.from(await response.arrayBuffer());
+  await assertRemoteIndexAgreement(body, indexCid, expectedPropertyCount);
+}
+
+/**
+ * Assert remote index bytes agree with their CID and expected count.
+ *
+ * @param body - Remotely read index bytes.
+ * @param indexCid - Expected immutable CID.
+ * @param expectedPropertyCount - Approved manifest count.
+ * @returns Nothing when both checks agree.
+ */
+export async function assertRemoteIndexAgreement(
+  body: Buffer,
+  indexCid: string,
+  expectedPropertyCount: number,
+): Promise<void> {
+  const remoteCid = await computeIpfsCid(body);
+  const parsed = JSON.parse(body.toString("utf8")) as {
+    readonly propertyCount?: unknown;
+  };
+  if (
+    remoteCid !== indexCid ||
+    parsed.propertyCount !== expectedPropertyCount
+  ) {
+    throw new Error("Remote index CID/propertyCount agreement failed");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,14 +533,18 @@ function parseOptions(argv: readonly string[]): UploadOptions {
   const filebaseApiToken =
     resolveOptionalEnvVar("FILEBASE_API_TOKEN") ??
     Buffer.from(`${accessKeyId}:${secretAccessKey}`).toString("base64");
-  const filebaseIpnsLabel = resolveOptionalEnvVar("FILEBASE_IPNS_LABEL");
+  const filebaseIpnsLabel = resolveEnvVar("FILEBASE_IPNS_LABEL");
+  const endpoint = resolveEnvVar("S3_ENDPOINT");
+  if (endpoint !== "https://s3.filebase.com") {
+    throw new Error("S3_ENDPOINT must use the supported Filebase endpoint");
+  }
 
   return {
     exportDir: values.get("export-dir") ?? ".property-consolidation-export",
     concurrency,
     dryRun: values.get("dry-run") === "true",
     limit,
-    endpoint: process.env["S3_ENDPOINT"] ?? "https://s3.filebase.io",
+    endpoint,
     bucket: resolveEnvVar("S3_BUCKET"),
     accessKeyId,
     secretAccessKey,
@@ -571,6 +649,13 @@ async function main(): Promise<void> {
   const startedAt = new Date().toISOString();
 
   const alreadyUploaded = new Map<string, CheckpointRecord>(checkpoint);
+  for (const entry of entries) {
+    const key = `properties/${entry.propertyId}.json`;
+    if (entry.cid === null) {
+      throw new Error(`Property manifest CID is required for ${key}`);
+    }
+    assertPropertyCheckpointCid(alreadyUploaded.get(key), entry.cid, key);
+  }
   const client = buildS3Client(options);
 
   const progress: ProgressState = {
@@ -810,20 +895,15 @@ async function main(): Promise<void> {
   // 5. IPNS upsert (if API token is set and index was uploaded)
   let ipnsName: string | undefined;
   if (hasShardedIndex && indexCid !== undefined) {
-    if (options.filebaseApiToken !== null) {
-      if (options.filebaseIpnsLabel === null) {
-        console.warn("[ipns] FILEBASE_IPNS_LABEL is not set — skipping IPNS update. Set it to a label like \"oracle-open-data-lee\".");
-      } else {
-        try {
-          ipnsName = await upsertIpnsPointer(options.filebaseApiToken, options.filebaseIpnsLabel, indexCid);
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          console.error(JSON.stringify({ event: "ipns_update_failed", error: message }));
-        }
-      }
-    } else {
-      console.log("[ipns] FILEBASE_API_TOKEN not set — skipping IPNS update.");
+    if (options.filebaseApiToken === null || options.filebaseIpnsLabel === null) {
+      throw new Error("Filebase API token and IPNS label are required");
     }
+    ipnsName = await upsertIpnsPointer(
+      options.filebaseApiToken,
+      options.filebaseIpnsLabel,
+      indexCid,
+    );
+    await verifyRemoteIndex(indexCid, manifest.propertyCount);
   }
 
   // Final summary

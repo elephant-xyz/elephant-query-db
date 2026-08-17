@@ -8,12 +8,14 @@ import { GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, S3Client } f
 import { Pool } from "pg";
 
 import {
+  APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
   assertAppraisalPrefixIsScoped,
   createS3ArtifactReader,
   mapAppraisalTransformedFile,
   mapLeePermitDetail,
   mapSunbizAnnualReportsFromRegistration,
   mapSunbizClassRecord,
+  parseAppraisalSourcePayloadSidecar,
   parseS3Uri,
   readJsonArtifactRecords,
   upsertPreparedRows,
@@ -89,6 +91,7 @@ const APPRAISAL_TABLE_ORDER: readonly LogicalTableName[] = [
   "deeds",
   "fact_sheets",
   "geometries",
+  "geometry_rings",
   "sales_histories",
   "taxes",
   "property_valuations",
@@ -207,6 +210,15 @@ async function loadAppraisal(params: {
     await runArtifact(params, artifact.uri, async () => {
       const buffer = await readS3ObjectBuffer(params.s3, artifact.uri);
       const zip = new AdmZip(buffer);
+      const sourcePayloadEntry = zip.getEntry(
+        APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
+      );
+      const artifactSourcePayload =
+        sourcePayloadEntry === null
+          ? undefined
+          : parseAppraisalSourcePayloadSidecar(
+              sourcePayloadEntry.getData().toString("utf8"),
+            );
       const rows: PreparedRow[] = [];
       let skippedRecords = 0;
       const entries = zip
@@ -218,6 +230,7 @@ async function loadAppraisal(params: {
         const text = entry.getData().toString("utf8");
         const record: unknown = JSON.parse(text);
         const bundle = mapAppraisalTransformedFile({
+          artifactSourcePayload,
           artifactUri: artifact.uri,
           filePath: entry.entryName,
           record,

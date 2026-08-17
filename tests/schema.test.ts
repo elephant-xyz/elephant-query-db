@@ -15,6 +15,8 @@ import {
   files,
   floodStormInformation,
   geometries,
+  geometryRings,
+  illinoisSosComponentRecords,
   inspections,
   layouts,
   lexiconClasses,
@@ -53,6 +55,8 @@ const sourceTrackedTables = [
   files,
   floodStormInformation,
   geometries,
+  geometryRings,
+  illinoisSosComponentRecords,
   inspections,
   layouts,
   lots,
@@ -115,6 +119,10 @@ describe("query database schema", () => {
     expect(taxes.sourcePayload.name).toBe("source_payload");
     expect(factSheets.sourcePayload.name).toBe("source_payload");
     expect(geometries.sourcePayload.name).toBe("source_payload");
+    expect(geometryRings.sourcePayload.name).toBe("source_payload");
+    expect(illinoisSosComponentRecords.sourcePayload.name).toBe(
+      "source_payload",
+    );
     expect(deeds.sourcePayload.name).toBe("source_payload");
     expect(files.sourcePayload.name).toBe("source_payload");
     expect(floodStormInformation.sourcePayload.name).toBe("source_payload");
@@ -146,6 +154,14 @@ describe("query database schema", () => {
 
     expect(properties.propertyId.name).toBe("property_id");
     expect(properties.addressId.name).toBe("address_id");
+    expect(geometryRings.geometryId.name).toBe("geometry_id");
+    expect(geometryRings.coordinates.name).toBe("coordinates");
+    expect(illinoisSosComponentRecords.recordFields.name).toBe(
+      "record_fields",
+    );
+    expect(illinoisSosComponentRecords.publicationApproved.name).toBe(
+      "publication_approved",
+    );
     expect(addresses.normalizedAddressHash.name).toBe("normalized_address_hash");
     expect(propertyImprovements.propertyImprovementId.name).toBe("property_improvement_id");
     expect(businessRegistrations.businessRegistrationId.name).toBe("business_registration_id");

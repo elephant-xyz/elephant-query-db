@@ -13,14 +13,50 @@ import {
   readNumber,
   readString,
 } from "./normalizers.js";
+import { mapAppraisalGeometryRingRows } from "./appraisal-geometry.js";
 import type { JsonObject, LogicalTableName, PreparedRow, PreparedRowBundle, SourceSystem } from "./types.js";
 
 const DEFAULT_APPRAISER_SOURCE_SYSTEM = "lee_appraiser";
+export const APPRAISAL_SOURCE_PAYLOAD_SIDECAR =
+  "data/source_payload.ndjson";
 
 type AppraisalJurisdictionMetadata = {
   readonly countyName: string | null;
   readonly stateCode: string | null;
 };
+
+/**
+ * Parse the optional provenance sidecar bundled with an appraisal transform.
+ *
+ * The sidecar contains exactly one JSON object and is deliberately NDJSON
+ * rather than a Lexicon entity. This allows county transforms to retain raw,
+ * non-PII source facts that have no current Lexicon property without weakening
+ * schema validation for the graph data group.
+ *
+ * @param text - Complete `data/source_payload.ndjson` contents.
+ * @returns The single source payload object.
+ * @throws Error when the sidecar is empty, contains multiple records, or is not an object.
+ */
+export function parseAppraisalSourcePayloadSidecar(text: string): JsonObject {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length !== 1) {
+    throw new Error(
+      `Appraisal source payload sidecar must contain exactly one record; received ${lines.length}`,
+    );
+  }
+  const [line] = lines;
+  if (line === undefined) {
+    throw new Error("Appraisal source payload sidecar record is unavailable");
+  }
+  const value: unknown = JSON.parse(line);
+  if (!isJsonObject(value)) {
+    throw new Error("Appraisal source payload sidecar must contain a JSON object");
+  }
+  return value;
+}
 
 const PROPERTY_COLUMNS = [
   "property_legal_description_text",
@@ -416,6 +452,7 @@ const APPRAISAL_BOOLEAN_COLUMNS = new Set<string>([
  * @returns Prepared rows for recognized appraisal files, or a skipped-record entry for unsupported files.
  */
 export function mapAppraisalTransformedFile(params: {
+  readonly artifactSourcePayload?: unknown;
   readonly filePath: string;
   readonly record: unknown;
   readonly artifactUri: string | null;
@@ -427,13 +464,30 @@ export function mapAppraisalTransformedFile(params: {
   if (!isJsonObject(params.record)) {
     return skipped(params, "appraisal transformed file is not a JSON object", { value: params.record });
   }
+  if (
+    params.artifactSourcePayload !== undefined &&
+    !isJsonObject(params.artifactSourcePayload)
+  ) {
+    return skipped(
+      params,
+      "appraisal artifact source payload is not a JSON object",
+      { value: params.artifactSourcePayload },
+    );
+  }
+  const record =
+    params.artifactSourcePayload === undefined
+      ? params.record
+      : {
+          ...params.record,
+          source_payload: params.artifactSourcePayload,
+        };
   const fileName = params.filePath.split("/").pop() ?? params.filePath;
   if (fileName.startsWith("relationship_")) {
     return skipped(params, "relationship files are represented through direct foreign-key references", params.record);
   }
 
   const requestIdentifier =
-    readString(params.record.request_identifier) ?? params.requestIdentifier ?? null;
+    readString(record.request_identifier) ?? params.requestIdentifier ?? null;
   if (requestIdentifier === null) {
     return skipped(params, "appraisal record is missing request_identifier", params.record);
   }
@@ -445,7 +499,7 @@ export function mapAppraisalTransformedFile(params: {
   };
   const rows = mapKnownAppraisalRecord(
     fileName,
-    params.record,
+    record,
     requestIdentifier,
     params.artifactUri,
     sourceSystem,
@@ -524,7 +578,13 @@ function mapKnownAppraisalRecord(
   }
   if (fileName === "fact_sheet.json") return [mapFactSheet(record, requestIdentifier, artifactUri, sourceSystem)];
   if (fileName === "geometry.json" || /^geometry_\d+\.json$/.test(fileName)) {
-    return [mapGeometry(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
+    return mapGeometryRows(
+      record,
+      fileName,
+      requestIdentifier,
+      artifactUri,
+      sourceSystem,
+    );
   }
   if (/^deed_/.test(fileName)) return [mapDeed(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
   if (/^file_/.test(fileName)) return [mapFile(record, fileName, requestIdentifier, artifactUri, sourceSystem)];
@@ -938,19 +998,29 @@ function mapFactSheet(
   };
 }
 
-function mapGeometry(
+/**
+ * Map the existing geometry compatibility row plus normalized exact ring rows.
+ *
+ * @param record - Enriched transformed geometry and raw source provenance.
+ * @param fileName - Geometry component filename.
+ * @param requestIdentifier - Canonical appraisal request identifier.
+ * @param artifactUri - Source artifact URI.
+ * @param sourceSystem - County appraiser source system.
+ * @returns Parent geometry followed by all recoverable ring children.
+ */
+function mapGeometryRows(
   record: JsonObject,
   fileName: string,
   requestIdentifier: string,
   artifactUri: string | null,
   sourceSystem: SourceSystem,
-): PreparedRow {
+): readonly PreparedRow[] {
   // Derive the key part from the file name so multiple geometries per parcel
   // (`geometry_1.json`, `geometry_2.json`, …) don't collide. The legacy
   // single `geometry.json` still maps to key part "geometry" (backward compat).
   const geometryKeyPart = fileName.replace(/\.json$/, "");
   const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "geometry", geometryKeyPart);
-  return {
+  const geometry: PreparedRow = {
     tableName: "geometries",
     references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
     values: compactObject({
@@ -962,6 +1032,15 @@ function mapGeometry(
       source_payload: record,
     }),
   };
+  const rings = mapAppraisalGeometryRingRows({
+    artifactUri,
+    fileName,
+    geometrySourceRecordKey: sourceRecordKey,
+    record,
+    requestIdentifier,
+    sourceSystem,
+  });
+  return [geometry, ...rings];
 }
 
 function mapDeed(
