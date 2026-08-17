@@ -51,6 +51,7 @@ const DELETE_ORDER: readonly string[] = [
   "property_valuations",
   "taxes",
   "sales_histories",
+  "geometry_rings",
   "geometries",
   "fact_sheets",
   "deeds",

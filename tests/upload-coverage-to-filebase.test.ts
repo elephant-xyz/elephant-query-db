@@ -40,7 +40,7 @@ const asFetch = (f: unknown): UploadArgs["fetchImpl"] => f as UploadArgs["fetchI
 
 type SentCommand = { readonly bucket: string | undefined; readonly key: string | undefined };
 
-function createMockS3Client(headerCid = "QmCoverageHeaderCidXXXXXXXXXXXXXXXXXXXXXXXXX") {
+function createMockS3Client(headerCid?: string) {
   const sent: SentCommand[] = [];
   const middlewares: { name: string; fn: (next: unknown, ctx: unknown) => unknown }[] = [];
 
@@ -61,7 +61,11 @@ function createMockS3Client(headerCid = "QmCoverageHeaderCidXXXXXXXXXXXXXXXXXXXX
 
       const terminal = async (_args: unknown) => ({
         output: { $metadata: { httpStatusCode: 200 } },
-        response: { statusCode: 200, headers: { "x-amz-meta-cid": headerCid } },
+        response: {
+          statusCode: 200,
+          headers:
+            headerCid === undefined ? {} : { "x-amz-meta-cid": headerCid },
+        },
       });
 
       let handler: (args: unknown) => Promise<unknown> = terminal;
@@ -94,6 +98,7 @@ function createMockFetch(networkKey = NETWORK_KEY) {
     created_at: "2026-07-02T00:00:00.000Z",
     updated_at: "2026-07-02T00:00:00.000Z",
   });
+  let names: ReturnType<typeof nameObject>[] = [];
 
   const fetchImpl = async (url: string | URL, init?: { method?: string; body?: unknown }) => {
     const method = init?.method ?? "GET";
@@ -107,8 +112,17 @@ function createMockFetch(networkKey = NETWORK_KEY) {
     }
     calls.push({ url: String(url), method, body });
 
-    if (method === "GET") return jsonResponse([]);
-    return jsonResponse(nameObject(body?.["label"], body?.["cid"]));
+    if (method === "GET") return jsonResponse(names);
+    if (method === "POST") {
+      const created = nameObject(body?.["label"], body?.["cid"]);
+      names = [...names, created];
+      return jsonResponse(created);
+    }
+    const label = decodeURIComponent(String(url).split("/").at(-1) ?? "");
+    names = names.map((name) =>
+      name.label === label ? { ...name, cid: body?.["cid"] ?? "" } : name,
+    );
+    return jsonResponse({});
   };
 
   return { fetchImpl, calls };
@@ -116,11 +130,12 @@ function createMockFetch(networkKey = NETWORK_KEY) {
 
 function fullEnv(overrides: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   return {
-    S3_ENDPOINT: "https://s3.filebase.io",
+    S3_ENDPOINT: "https://s3.filebase.com",
     S3_BUCKET: "elephant-oracle-query-table",
     S3_ACCESS_KEY_ID: "AKIA_TEST",
     S3_SECRET_ACCESS_KEY: "secret-test",
     FILEBASE_API_TOKEN: "filebase-token-test",
+    FILEBASE_COVERAGE_IPNS_LABEL: COVERAGE_LABEL,
     ...overrides,
   };
 }
@@ -140,8 +155,13 @@ describe("buildCoverageKey — single JSON object", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveCoverageIpnsLabel — separate-label contract", () => {
-  it("defaults to oracle-dataset-coverage-<county> when the override is unset", () => {
-    expect(resolveCoverageIpnsLabel(fullEnv(), "lee")).toBe(COVERAGE_LABEL);
+  it("requires an explicit nonempty per-county label", () => {
+    expect(() =>
+      resolveCoverageIpnsLabel(
+        fullEnv({ FILEBASE_COVERAGE_IPNS_LABEL: undefined }),
+        "lee",
+      ),
+    ).toThrow(/is required/u);
     expect(defaultCoverageIpnsLabel("lee")).toBe(COVERAGE_LABEL);
   });
 

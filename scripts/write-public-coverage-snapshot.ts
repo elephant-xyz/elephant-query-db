@@ -5,10 +5,10 @@ import { pathToFileURL } from "node:url";
 import type { OracleDatasetCoverageSnapshot } from "../src/coverage/oracleDatasetCoverage.js";
 
 /**
- * Non-appraisal coverage tracks emitted as honestly incomplete (`expected_count: null`).
+ * Non-appraisal coverage tracks emitted with an unknown expected count.
  *
- * `corporate` is the published-snapshot spelling of the Neon `sunbiz` track — a
- * pre-existing mismatch. Places uses one spelling, `overture_places`, in both.
+ * `corporate` is the published-snapshot spelling of the Neon registration
+ * source. Places uses `overture_places` in both Neon and the snapshot.
  */
 export const PUBLIC_COVERAGE_ENRICHMENT_TRACKS = [
   "permits",
@@ -20,6 +20,12 @@ export const PUBLIC_COVERAGE_ENRICHMENT_TRACKS = [
 export type PublicCoverageOptions = {
   readonly county: string;
   readonly appraisalCount: number;
+  readonly corporateCount?: number;
+  readonly corporateCid?: string | null;
+  readonly corporateIpnsLabel?: string | null;
+  readonly corporateFirstSnapshotAt?: string | null;
+  readonly corporateLastSnapshotAt?: string | null;
+  readonly exportedAt?: string;
   readonly outputPath: string;
 };
 
@@ -52,9 +58,48 @@ export function parsePublicCoverageOptions(
   if (!Number.isInteger(appraisalCount) || appraisalCount < 1) {
     throw new Error("--appraisal-count must be a positive integer");
   }
+  const corporateCount = Number.parseInt(
+    values.get("corporate-count") ?? "0",
+    10,
+  );
+  if (!Number.isInteger(corporateCount) || corporateCount < 0) {
+    throw new Error("--corporate-count must be a non-negative integer");
+  }
+  const corporateCid = values.get("corporate-cid") ?? null;
+  const corporateIpnsLabel =
+    values.get("corporate-ipns-label") ?? null;
+  const corporateFirstSnapshotAt =
+    values.get("corporate-first-snapshot-at") ?? null;
+  const corporateLastSnapshotAt =
+    values.get("corporate-last-snapshot-at") ?? null;
+  const exportedAt = values.get("exported-at");
+  if (
+    exportedAt !== undefined &&
+    (!Number.isFinite(Date.parse(exportedAt)) ||
+      new Date(exportedAt).toISOString() !== exportedAt)
+  ) {
+    throw new Error("--exported-at must be an exact ISO timestamp");
+  }
+  if (
+    corporateCount > 0 &&
+    (corporateCid === null ||
+      corporateIpnsLabel === null ||
+      corporateFirstSnapshotAt === null ||
+      corporateLastSnapshotAt === null)
+  ) {
+    throw new Error(
+      "Published corporate coverage requires CID, IPNS label, and component snapshot timestamps",
+    );
+  }
   return {
     county,
     appraisalCount,
+    corporateCount,
+    corporateCid,
+    corporateIpnsLabel,
+    corporateFirstSnapshotAt,
+    corporateLastSnapshotAt,
+    ...(exportedAt === undefined ? {} : { exportedAt }),
     outputPath:
       values.get("output") ??
       join(".dataset-coverage", county, "dataset-coverage.json"),
@@ -65,8 +110,7 @@ export function parsePublicCoverageOptions(
  * Build an honest appraisal-only coverage snapshot.
  *
  * Non-appraisal datasets are explicitly present at zero with unknown expected
- * counts, which means "not ingested" rather than "complete at zero". Copy Santa
- * Clara (`expected_count: null`), not the older 100%-by-construction rows.
+ * counts, which means "not ingested" rather than "complete at zero".
  *
  * @param options - County and exact reconciled appraisal count.
  * @param exportedAt - Deterministic snapshot timestamp.
@@ -100,7 +144,19 @@ export function buildPublicCoverageSnapshot(
         cid: null,
         ipns_label: null,
       },
-      ...PUBLIC_COVERAGE_ENRICHMENT_TRACKS.map((source) => emptyTrack(source)),
+      emptyTrack("permits"),
+      {
+        county: options.county,
+        source: "corporate",
+        ingested_count: options.corporateCount ?? 0,
+        expected_count: null,
+        first_loaded_at: options.corporateFirstSnapshotAt ?? null,
+        last_loaded_at: options.corporateLastSnapshotAt ?? null,
+        cid: options.corporateCid ?? null,
+        ipns_label: options.corporateIpnsLabel ?? null,
+      },
+      emptyTrack("bbb"),
+      emptyTrack("overture_places"),
     ],
   };
 }
@@ -119,7 +175,7 @@ export async function writePublicCoverageSnapshot(
 }> {
   const snapshot = buildPublicCoverageSnapshot(
     options,
-    new Date().toISOString(),
+    options.exportedAt ?? new Date().toISOString(),
   );
   const body = Buffer.from(`${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
   await mkdir(dirname(options.outputPath), { recursive: true });

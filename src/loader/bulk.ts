@@ -95,6 +95,7 @@ const TABLES_WITH_UPDATED_AT = new Set<LogicalTableName>([
   "files",
   "flood_storm_information",
   "geometries",
+  "geometry_rings",
   "layouts",
   "lots",
   "ownerships",
@@ -142,6 +143,8 @@ const TABLES_WITH_CONTRACTOR_COMPANY_ID = new Set<LogicalTableName>(["property_i
 const TABLES_WITH_OWNER_COMPANY_ID = new Set<LogicalTableName>(["ownerships"]);
 
 const TABLES_WITH_DEED_ID = new Set<LogicalTableName>(["files"]);
+
+const TABLES_WITH_GEOMETRY_ID = new Set<LogicalTableName>(["geometry_rings"]);
 
 const TABLES_WITH_PARCEL_ID = new Set<LogicalTableName>([
   "properties",
@@ -246,6 +249,14 @@ const SOURCE_KEY_REFERENCE_RESOLUTIONS: readonly ReferenceResolution[] = [
     targetTableName: "deeds",
     targetTables: TABLES_WITH_DEED_ID,
     alias: "ref_deed",
+  },
+  {
+    referenceJsonKey: "geometrySourceRecordKey",
+    targetColumnName: "geometry_id",
+    targetIdColumnName: "geometry_id",
+    targetTableName: "geometries",
+    targetTables: TABLES_WITH_GEOMETRY_ID,
+    alias: "ref_geometry",
   },
   {
     referenceJsonKey: "parcelSourceRecordKey",

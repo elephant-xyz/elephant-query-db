@@ -41,7 +41,7 @@ const asFetch = (f: unknown): UploadArgs["fetchImpl"] => f as UploadArgs["fetchI
 
 type SentCommand = { readonly bucket: string | undefined; readonly key: string | undefined };
 
-function createMockS3Client(headerCid = "QmQueryTableHeaderCidXXXXXXXXXXXXXXXXXXXXXXX") {
+function createMockS3Client(headerCid?: string) {
   const sent: SentCommand[] = [];
   const middlewares: { name: string; fn: (next: unknown, ctx: unknown) => unknown }[] = [];
 
@@ -62,7 +62,11 @@ function createMockS3Client(headerCid = "QmQueryTableHeaderCidXXXXXXXXXXXXXXXXXX
 
       const terminal = async (_args: unknown) => ({
         output: { $metadata: { httpStatusCode: 200 } },
-        response: { statusCode: 200, headers: { "x-amz-meta-cid": headerCid } },
+        response: {
+          statusCode: 200,
+          headers:
+            headerCid === undefined ? {} : { "x-amz-meta-cid": headerCid },
+        },
       });
 
       let handler: (args: unknown) => Promise<unknown> = terminal;
@@ -84,6 +88,7 @@ function jsonResponse(payload: unknown) {
 
 function createMockFetch(networkKey = NETWORK_KEY) {
   const calls: FetchCall[] = [];
+  let names: ReturnType<typeof nameObject>[] = [];
 
   const nameObject = (label: unknown, cid: unknown) => ({
     enabled: true,
@@ -108,8 +113,17 @@ function createMockFetch(networkKey = NETWORK_KEY) {
     }
     calls.push({ url: String(url), method, body });
 
-    if (method === "GET") return jsonResponse([]);
-    return jsonResponse(nameObject(body?.["label"], body?.["cid"]));
+    if (method === "GET") return jsonResponse(names);
+    if (method === "POST") {
+      const created = nameObject(body?.["label"], body?.["cid"]);
+      names = [...names, created];
+      return jsonResponse(created);
+    }
+    const label = decodeURIComponent(String(url).split("/").at(-1) ?? "");
+    names = names.map((name) =>
+      name.label === label ? { ...name, cid: body?.["cid"] ?? "" } : name,
+    );
+    return jsonResponse({});
   };
 
   return { fetchImpl, calls };
@@ -117,11 +131,12 @@ function createMockFetch(networkKey = NETWORK_KEY) {
 
 function fullEnv(overrides: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   return {
-    S3_ENDPOINT: "https://s3.filebase.io",
+    S3_ENDPOINT: "https://s3.filebase.com",
     S3_BUCKET: "elephant-oracle-query-table",
     S3_ACCESS_KEY_ID: "AKIA_TEST",
     S3_SECRET_ACCESS_KEY: "secret-test",
     FILEBASE_API_TOKEN: "filebase-token-test",
+    FILEBASE_QUERY_TABLE_IPNS_LABEL: QUERY_TABLE_LABEL,
     ...overrides,
   };
 }
@@ -152,8 +167,13 @@ describe("buildQueryTableKey / planQueryTableUpload — single object only", () 
 // ---------------------------------------------------------------------------
 
 describe("resolveQueryTableIpnsLabel — separate-label contract", () => {
-  it("defaults to oracle-query-table-<county> when the override is unset", () => {
-    expect(resolveQueryTableIpnsLabel(fullEnv(), "lee")).toBe(QUERY_TABLE_LABEL);
+  it("requires an explicit nonempty per-county label", () => {
+    expect(() =>
+      resolveQueryTableIpnsLabel(
+        fullEnv({ FILEBASE_QUERY_TABLE_IPNS_LABEL: undefined }),
+        "lee",
+      ),
+    ).toThrow(/is required/u);
     expect(defaultQueryTableIpnsLabel("lee")).toBe(QUERY_TABLE_LABEL);
   });
 
@@ -274,5 +294,24 @@ describe("uploadQueryTable — single-object upload + IPNS recording", () => {
       expect(c.body?.["label"]).not.toBe(PROPERTY_LABEL);
       expect(c.body?.["label"]).not.toBe(GEO_LABEL);
     }
+  });
+
+  it("propagates IPNS update failure", async () => {
+    const client = createMockS3Client();
+    const failingFetch = async () => ({
+      ok: false,
+      status: 503,
+      statusText: "Unavailable",
+      json: async () => ({}),
+    });
+    await expect(
+      uploadQueryTable({
+        client: asClient(client),
+        fetchImpl: asFetch(failingFetch),
+        env: fullEnv(),
+        county: "lee",
+        body: PARQUET_BODY,
+      }),
+    ).rejects.toThrow(/IPNS list failed/u);
   });
 });

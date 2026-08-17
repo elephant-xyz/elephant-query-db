@@ -11,6 +11,7 @@ import { from as copyFrom } from "pg-copy-streams";
 import { Client, Pool, type PoolClient } from "pg";
 
 import {
+  APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
   BULK_STAGE_COLUMNS,
   addSunbizAddressReferencesToRows,
   assertAppraisalPrefixIsScoped,
@@ -32,6 +33,7 @@ import {
   mapSunbizAnnualReportsFromRegistration,
   mapSunbizClassRecord,
   mergeBulkStageTable,
+  parseAppraisalSourcePayloadSidecar,
   parseS3Uri,
   PLACES_TABLE_ORDER,
   preparedRowsContainSelectedParcel,
@@ -207,6 +209,7 @@ const APPRAISAL_TABLE_ORDER: readonly LogicalTableName[] = [
   "deeds",
   "fact_sheets",
   "geometries",
+  "geometry_rings",
   "sales_histories",
   "taxes",
   "property_valuations",
@@ -574,6 +577,15 @@ async function stageAppraisal(params: {
       await stageArtifact(params, artifact.uri, async () => {
         const buffer = await readS3ObjectBuffer(params.s3, artifact.uri);
         const zip = new AdmZip(buffer);
+        const sourcePayloadEntry = zip.getEntry(
+          APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
+        );
+        const artifactSourcePayload =
+          sourcePayloadEntry === null
+            ? undefined
+            : parseAppraisalSourcePayloadSidecar(
+                sourcePayloadEntry.getData().toString("utf8"),
+              );
         const rows: PreparedRow[] = [];
         let skippedRecords = 0;
         const entries = zip
@@ -585,6 +597,7 @@ async function stageAppraisal(params: {
           const text = entry.getData().toString("utf8");
           const record: unknown = JSON.parse(text);
           const bundle = mapAppraisalTransformedFile({
+            artifactSourcePayload,
             artifactUri: artifact.uri,
             countyName: params.options.appraisalCountyName,
             filePath: entry.entryName,
@@ -773,6 +786,15 @@ async function stageAndMergeAppraisalBatched(params: {
         await stageArtifact({ counters: batchCounters }, artifact.uri, async () => {
           const buffer = await readS3ObjectBuffer(s3, artifact.uri);
           const zip = new AdmZip(buffer);
+          const sourcePayloadEntry = zip.getEntry(
+            APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
+          );
+          const artifactSourcePayload =
+            sourcePayloadEntry === null
+              ? undefined
+              : parseAppraisalSourcePayloadSidecar(
+                  sourcePayloadEntry.getData().toString("utf8"),
+                );
           const rows: PreparedRow[] = [];
           let skippedRecords = 0;
           const entries = zip
@@ -784,6 +806,7 @@ async function stageAndMergeAppraisalBatched(params: {
             const text = entry.getData().toString("utf8");
             const record: unknown = JSON.parse(text);
             const bundle = mapAppraisalTransformedFile({
+              artifactSourcePayload,
               artifactUri: artifact.uri,
               countyName: params.options.appraisalCountyName,
               filePath: entry.entryName,

@@ -6,11 +6,13 @@ export type JsonObject = Record<string, unknown>;
 // arms admit any `<county>_appraiser` / `<county>_accela` value (e.g.
 // `orange_appraiser`) while still excluding unrelated strings. The
 // `<county>_permits` arm covers bulk city permit-portal pulls that are not
-// Accela harvests (e.g. `santa_clara_permits`). `bbb` and `sunbiz` remain
-// fixed. Existing `lee_appraiser` / `lee_accela` literals stay assignable via
+// Accela harvests (e.g. `santa_clara_permits`). Statewide registration sources
+// remain explicit literals so one jurisdiction's semantics cannot leak into
+// another. Existing `lee_appraiser` / `lee_accela` literals stay assignable via
 // the template arms.
 export type SourceSystem =
   | "bbb"
+  | "illinois_sos"
   | "sunbiz"
   | "overture_places"
   | `${string}_appraiser`
@@ -48,6 +50,8 @@ export type LogicalTableName =
   | "files"
   | "flood_storm_information"
   | "geometries"
+  | "geometry_rings"
+  | "illinois_sos_component_records"
   | "inspections"
   | "layouts"
   | "lots"
@@ -91,6 +95,7 @@ export type PreparedRowReferences = {
   readonly businessReputationProfileSourceRecordKey?: string;
   readonly companySourceRecordKey?: string;
   readonly deedSourceRecordKey?: string;
+  readonly geometrySourceRecordKey?: string;
   readonly parcelSourceRecordKey?: string;
   readonly personSourceRecordKey?: string;
   readonly propertyImprovementSourceRecordKey?: string;

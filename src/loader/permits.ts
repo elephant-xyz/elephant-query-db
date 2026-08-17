@@ -1080,6 +1080,56 @@ function sourceHttpRequestFromUrl(value: unknown): JsonObject | null {
   return url === null ? null : { method: "GET", url };
 }
 
+type NormalizedCityPermitIdentity = {
+  readonly permitNumber: string | null;
+  readonly sourceRecordKey: string;
+};
+
+/**
+ * Resolve the stable official identity for one normalized city permit.
+ *
+ * Most city sources print a permit number. Some official legacy reports instead
+ * print an application year, application number, permit code, and issue date.
+ * Those exact source fields form the identity without fabricating a modern
+ * permit number. Incomplete legacy identities remain rejected.
+ *
+ * @param record - Normalized city record with optional legacy fields under `raw`.
+ * @param sourceSystem - County-prefixed loader source system.
+ * @param citySourceSystem - Original municipal report source.
+ * @returns Stable identity, or null when neither supported identity is complete.
+ */
+function readNormalizedCityPermitIdentity(
+  record: JsonObject,
+  sourceSystem: SourceSystem,
+  citySourceSystem: string,
+): NormalizedCityPermitIdentity | null {
+  const permitNumber = readString(record.permit_number);
+  if (permitNumber !== null) {
+    return {
+      permitNumber,
+      sourceRecordKey: `${sourceSystem}:permit:${citySourceSystem}:${permitNumber}`,
+    };
+  }
+
+  if (!isJsonObject(record.raw)) return null;
+  const applicationYear = readString(record.raw.source_application_year);
+  const applicationNumber = readString(record.raw.source_application_number);
+  const permitCode = readString(record.raw.source_permit_code);
+  const issueDate = readDate(record.permit_issue_date);
+  if (
+    applicationYear === null ||
+    applicationNumber === null ||
+    permitCode === null ||
+    issueDate === null
+  ) {
+    return null;
+  }
+  return {
+    permitNumber: null,
+    sourceRecordKey: `${sourceSystem}:permit:${citySourceSystem}:application:${applicationYear}:${applicationNumber}:${permitCode}:issued:${issueDate}`,
+  };
+}
+
 /**
  * Map one normalized city permit-portal record (bulk CSV/API pull) into
  * logical query-db rows.
@@ -1126,22 +1176,27 @@ export function mapNormalizedCityPermit(params: {
     };
   }
 
-  const permitNumber = readString(params.record.permit_number);
-  if (permitNumber === null) {
+  const citySourceSystem = readString(params.record.source_system) ?? "unknown";
+  const identity = readNormalizedCityPermitIdentity(
+    params.record,
+    sourceSystem,
+    citySourceSystem,
+  );
+  if (identity === null) {
     return {
       rows: [],
       skippedRecords: [
         {
           artifactUri: params.artifactUri,
-          reason: "normalized city permit record is missing permit_number",
+          reason:
+            "normalized city permit record is missing permit_number or complete official application identity",
           sourcePayload: params.record,
         },
       ],
     };
   }
 
-  const citySourceSystem = readString(params.record.source_system) ?? "unknown";
-  const permitKey = `${sourceSystem}:permit:${citySourceSystem}:${permitNumber}`;
+  const permitKey = identity.sourceRecordKey;
   const recordStatus = readString(params.record.record_status);
   const recordType = readString(params.record.record_type);
   const parcelIdentifier = normalizeParcelIdentifier(params.record.parcel_identifier);
@@ -1176,7 +1231,7 @@ export function mapNormalizedCityPermit(params: {
       sourceArtifactUri: params.artifactUri,
     }),
     request_identifier: permitKey,
-    permit_number: permitNumber,
+    permit_number: identity.permitNumber,
     improvement_type: recordType,
     improvement_status: recordStatus,
     record_type: recordType,
