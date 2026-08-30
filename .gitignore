@@ -11,5 +11,9 @@ dist/
 .loader-runs/
 downloads/
 .property-consolidation-export/
+.property-consolidation-export-*/
+.query-table-export/
+.dataset-coverage/
+data/
 .upload-runs/
 .env*

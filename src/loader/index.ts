@@ -16,5 +16,6 @@ export * from "./permits.js";
 export * from "./places.js";
 export * from "./scoped-load.js";
 export * from "./sql.js";
+export * from "./paDos.js";
 export * from "./sunbiz.js";
 export * from "./types.js";

@@ -14,6 +14,7 @@ export type SourceSystem =
   | "bbb"
   | "illinois_sos"
   | "sunbiz"
+  | "pa_dos"
   | "overture_places"
   | `${string}_appraiser`
   | `${string}_accela`

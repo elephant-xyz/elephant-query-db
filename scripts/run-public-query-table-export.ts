@@ -381,6 +381,7 @@ export function buildPublicQueryTableRow(
     permit_count: 0,
     has_sunbiz_tenant: false,
     has_bbb_contractor: false,
+    has_pa_corp_tenant: false,
     hoa_flag: null,
   };
 }

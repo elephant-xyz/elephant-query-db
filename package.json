@@ -41,6 +41,8 @@
     "appraisal:transform-data": "tsx scripts/run-lee-appraisal-transform-data-only.ts",
     "load:bulk": "tsx scripts/run-bulk-data-load.ts",
     "load:data": "tsx scripts/run-data-load.ts",
+    "load:pa-dos-local": "tsx scripts/run-pa-dos-local-load.ts",
+    "load:permits-local": "tsx scripts/run-permits-local-load.ts",
     "load:illinois-sos": "tsx scripts/run-illinois-sos-pilot.ts",
     "load:illinois-sos-components": "tsx scripts/run-illinois-sos-components.ts",
     "load:link-scoped-permits": "tsx scripts/link-scoped-permits-to-appraisals.ts",

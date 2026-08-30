@@ -1107,7 +1107,12 @@ function readNormalizedCityPermitIdentity(
   if (permitNumber !== null) {
     return {
       permitNumber,
-      sourceRecordKey: `${sourceSystem}:permit:${citySourceSystem}:${permitNumber}`,
+      sourceRecordKey: buildNormalizedCityPermitSourceRecordKey(
+        sourceSystem,
+        citySourceSystem,
+        permitNumber,
+        record,
+      ),
     };
   }
 
@@ -1253,6 +1258,7 @@ export function mapNormalizedCityPermit(params: {
   });
   const permitReferences = buildNormalizedCityPermitReferences({
     parcelIdentifier,
+    appraisalRequestIdentifier: readString(params.record.request_identifier),
     permitSourceSystem: sourceSystem,
     workLocationKey,
   });
@@ -1270,6 +1276,39 @@ export function mapNormalizedCityPermit(params: {
 }
 
 /**
+ * Build a stable source_record_key for a normalized city-permit JSONL row.
+ *
+ * SmartGov and similar portals reuse permit numbers across parcels, so the
+ * portal detail id (when present) disambiguates collisions. Fall back to
+ * `{permitNumber}:{requestIdentifier}` before the legacy permit-number-only key.
+ *
+ * @param permitSourceSystem - County permit track (e.g. `chester_permits`).
+ * @param citySourceSystem - City portal slug from the normalized row.
+ * @param permitNumber - Permit/application number from the portal.
+ * @param record - Normalized permit JSON object.
+ * @returns Deterministic source_record_key for idempotent upserts.
+ */
+export function buildNormalizedCityPermitSourceRecordKey(
+  permitSourceSystem: SourceSystem,
+  citySourceSystem: string,
+  permitNumber: string,
+  record: JsonObject,
+): string {
+  const raw = record.raw;
+  if (isJsonObject(raw)) {
+    const detailId = readString(raw.detail_id);
+    if (detailId !== null) {
+      return `${permitSourceSystem}:permit:${citySourceSystem}:${detailId}`;
+    }
+  }
+  const requestIdentifier = readString(record.request_identifier);
+  if (requestIdentifier !== null) {
+    return `${permitSourceSystem}:permit:${citySourceSystem}:${permitNumber}:${requestIdentifier}`;
+  }
+  return `${permitSourceSystem}:permit:${citySourceSystem}:${permitNumber}`;
+}
+
+/**
  * Build cross-source references for a normalized city permit.
  *
  * County-scoped city permit systems use `<county>_permits`, while their
@@ -1280,21 +1319,24 @@ export function mapNormalizedCityPermit(params: {
  */
 function buildNormalizedCityPermitReferences(params: {
   readonly parcelIdentifier: string | null;
+  readonly appraisalRequestIdentifier: string | null;
   readonly permitSourceSystem: SourceSystem;
   readonly workLocationKey: string | null;
 }): PreparedRow["references"] | undefined {
   const appraiserSourceSystem = appraiserSourceSystemFromPermitSourceSystem(
     params.permitSourceSystem,
   );
+  const referenceParcelKey =
+    params.appraisalRequestIdentifier ?? params.parcelIdentifier;
   const references = {
     ...(params.workLocationKey === null
       ? {}
       : { addressSourceRecordKey: params.workLocationKey }),
-    ...(params.parcelIdentifier === null || appraiserSourceSystem === null
+    ...(referenceParcelKey === null || appraiserSourceSystem === null
       ? {}
       : {
-          parcelSourceRecordKey: `${appraiserSourceSystem}:${params.parcelIdentifier}:parcel:property_seed`,
-          propertySourceRecordKey: `${appraiserSourceSystem}:${params.parcelIdentifier}:property:property`,
+          parcelSourceRecordKey: `${appraiserSourceSystem}:${referenceParcelKey}:parcel:property_seed`,
+          propertySourceRecordKey: `${appraiserSourceSystem}:${referenceParcelKey}:property:property`,
         }),
   };
   return Object.keys(references).length === 0 ? undefined : references;

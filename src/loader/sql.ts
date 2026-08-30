@@ -767,7 +767,15 @@ const APPRAISER_SOURCE_SYSTEM_SUFFIX = "_appraiser";
 const PERMIT_SOURCE_SYSTEM_SUFFIX = "_accela";
 
 function readSourceSystem(value: unknown): SourceSystem | null {
-  if (value === "bbb" || value === "illinois_sos" || value === "sunbiz") return value;
+  if (
+    value === "bbb" ||
+    value === "illinois_sos" ||
+    value === "sunbiz" ||
+    value === "pa_dos" ||
+    value === "overture_places"
+  ) {
+    return value;
+  }
   if (typeof value !== "string") return null;
   // Admit county-parameterized appraiser/permit systems (`<county>_appraiser`,
   // `<county>_accela`) but require a non-empty county prefix so bare suffixes

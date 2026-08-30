@@ -660,11 +660,12 @@ export function buildBulkMergeSql(params: {
   });
 
   return [
-    `WITH source_rows AS (`,
+    `WITH stage_filtered AS (`,
+    `SELECT * FROM ${stageTableSql} WHERE "table_name" = $1`,
+    `), source_rows AS (`,
     `SELECT s."row_index", ${resolvedValuesExpression} AS "resolved_values_json"`,
-    `FROM ${stageTableSql} s`,
+    `FROM stage_filtered s`,
     referenceSql.joinSql,
-    `WHERE s."table_name" = $1`,
     `), typed_rows AS (`,
     `SELECT "row_index", (jsonb_populate_record(NULL::${targetTableSql}, "resolved_values_json")).*`,
     `FROM source_rows`,
