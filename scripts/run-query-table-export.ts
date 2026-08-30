@@ -97,6 +97,7 @@ export type QueryTableSourceRow = {
   readonly permit_count: string | null;
   readonly has_sunbiz_tenant: boolean | null;
   readonly has_bbb_contractor: boolean | null;
+  readonly has_pa_corp_tenant: boolean | null;
 };
 
 /** Flat, scalar-only output row — exactly the parquet schema, one per property. */
@@ -137,6 +138,7 @@ export type QueryTableRow = {
   readonly permit_count: number | null;
   readonly has_sunbiz_tenant: boolean | null;
   readonly has_bbb_contractor: boolean | null;
+  readonly has_pa_corp_tenant: boolean | null;
   readonly hoa_flag: boolean | null;
 };
 
@@ -285,6 +287,7 @@ export function buildQueryTableRow(row: QueryTableSourceRow, cid: string | null)
     permit_count: toInteger(row.permit_count) ?? 0,
     has_sunbiz_tenant: row.has_sunbiz_tenant ?? false,
     has_bbb_contractor: row.has_bbb_contractor ?? false,
+    has_pa_corp_tenant: row.has_pa_corp_tenant ?? false,
     // HOA gap: no HOA data is ingested into Neon yet. Reserved placeholder so the
     // parquet schema is stable once upstream HOA ingestion lands.
     hoa_flag: null,
@@ -337,6 +340,7 @@ export function buildQueryTableParquetSchema(): ParquetSchema {
     permit_count: { type: "INT64", optional: true },
     has_sunbiz_tenant: { type: "BOOLEAN", optional: true },
     has_bbb_contractor: { type: "BOOLEAN", optional: true },
+    has_pa_corp_tenant: { type: "BOOLEAN", optional: true },
     hoa_flag: { type: "BOOLEAN", optional: true },
   });
 }
@@ -467,99 +471,66 @@ function safeNumeric(expr: string): string {
 }
 
 // Digits-only normalization of a parcel identifier, matching normalizeParcelIdentifier
-// in run-property-consolidation-export.ts. property_improvements store the already
-// normalized key, so we normalize the appraisal parcel the same way to join.
+// in run-property-consolidation-export.ts. Used for BBB contractor enrichment only;
+// permit counts prefer the direct property_id FK (see permit_counts CTE).
 const NORMALIZED_PARCEL = `regexp_replace(p.parcel_identifier, '[^0-9]', '', 'g')`;
 
+// Normalized parcel for a county_properties row alias (permit orphan fallback only).
+const NORMALIZED_CP_PARCEL = `regexp_replace(cp.parcel_identifier, '[^0-9]', '', 'g')`;
+
+/** Florida oracle counties where Sunbiz corporate enrichment is in scope. */
+const FLORIDA_SUNBIZ_COUNTY_KEYS = new Set([
+  "lee",
+  "miami-dade",
+  "orange",
+  "palm-beach",
+  "hillsborough",
+]);
+
 /**
- * The one and only query. Pre-dedups every many-to-one relation into a CTE with
- * exactly one row per property, then folds to one row per folio via
- * DISTINCT ON (folio). The folio is the TRUE cardinality key — see the
- * parcel_identifier collapse lesson in run-geo-index-export.ts.
+ * Sunbiz is Florida-only. Scanning `business_registration_addresses` for a PA county
+ * (e.g. Chester) is wasted work and can stall the export on shared Neon.
+ *
+ * @param {string} county County slug (hyphen form).
+ * @returns {boolean} Whether to include Sunbiz/BBB cross-county enrichment CTEs.
  */
-async function fetchQueryTableRows(
-  pool: Pool,
+export function includeSunbizBbbEnrichmentInQueryTable(county: string): boolean {
+  return FLORIDA_SUNBIZ_COUNTY_KEYS.has(county.trim().toLowerCase());
+}
+
+/** Pennsylvania counties where PA DOS open-data enrichment is in scope. */
+const PENNSYLVANIA_PA_DOS_COUNTY_KEYS = new Set(["chester"]);
+
+/**
+ * PA DOS corporate enrichment applies to PA oracle counties with a loaded pa_dos slice.
+ *
+ * @param county County slug (hyphen form).
+ * @returns Whether to join pa_dos business-registration addresses in the export.
+ */
+export function includePaDosEnrichmentInQueryTable(county: string): boolean {
+  return PENNSYLVANIA_PA_DOS_COUNTY_KEYS.has(county.trim().toLowerCase());
+}
+
+/**
+ * Build the query-table SQL. When enrichment is off, omit Sunbiz/BBB/PA DOS CTEs and emit
+ * constant false flags instead of scanning statewide enrichment tables.
+ *
+ * @param sourceSystem Appraisal source_system filter.
+ * @param includeSunbizBbb Whether to join Sunbiz/BBB enrichment tables.
+ * @param includePaDos Whether to join PA DOS registered-office addresses.
+ * @param limit Optional row cap for tests.
+ * @returns Parameterized SQL ($1 = sourceSystem).
+ */
+export function buildQueryTableSql(
   sourceSystem: string,
+  includeSunbizBbb: boolean,
+  includePaDos: boolean,
   limit: number | null,
-): Promise<QueryTableSourceRow[]> {
+): string {
+  void sourceSystem;
   const limitClause = limit !== null ? `LIMIT ${limit}` : "";
-  const result = await pool.query<QueryTableSourceRow>(
-    `
-    WITH tax_latest AS (
-      SELECT DISTINCT ON (property_id)
-        property_id,
-        property_assessed_value_amount AS assessed_value,
-        property_market_value_amount AS market_value,
-        property_land_amount AS land_value
-      FROM taxes
-      ORDER BY property_id, tax_year DESC NULLS LAST
-    ),
-    avm AS (
-      SELECT property_id, MAX(current_avm_value) AS avm_value
-      FROM property_valuations
-      GROUP BY property_id
-    ),
-    structure_pick AS (
-      SELECT DISTINCT ON (property_id)
-        property_id, exterior_wall_material_primary, roof_covering_material
-      FROM structures
-      ORDER BY property_id
-    ),
-    lot_pick AS (
-      SELECT DISTINCT ON (property_id)
-        property_id, lot_size_acre, lot_area_sqft
-      FROM lots
-      ORDER BY property_id
-    ),
-    layout_area AS (
-      -- Building living area lives on the layout rows, one or more per property.
-      -- Only the space_type='Building' rows carry these columns (room rows carry
-      -- size_square_feet instead), so SUM ignores the NULL room rows and folds a
-      -- multi-building parcel to its total living area — one row per property.
-      SELECT property_id,
-        SUM(livable_area_sq_ft) AS livable_area_sq_ft,
-        SUM(area_under_air_sq_ft) AS area_under_air_sq_ft
-      FROM layouts
-      GROUP BY property_id
-    ),
-    geom_pick AS (
-      SELECT DISTINCT ON (property_id)
-        property_id, latitude, longitude
-      FROM geometries
-      WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-      ORDER BY property_id
-    ),
-    owners_agg AS (
-      SELECT
-        property_id,
-        string_agg(DISTINCT owned_by, ' | ') AS owners_text,
-        count(DISTINCT owned_by) AS owner_count,
-        bool_or(owner_occupied_indicator) AS owner_occupied
-      FROM ownerships
-      WHERE owned_by IS NOT NULL AND owned_by <> ''
-      GROUP BY property_id
-    ),
-    owner_primary AS (
-      SELECT DISTINCT ON (property_id)
-        property_id, owned_by AS owner_name
-      FROM ownerships
-      WHERE owned_by IS NOT NULL AND owned_by <> ''
-      ORDER BY property_id, ownership_percentage DESC NULLS LAST
-    ),
-    sale_latest AS (
-      SELECT DISTINCT ON (property_id)
-        property_id,
-        ownership_transfer_date AS last_sale_date,
-        purchase_price_amount AS last_sale_price
-      FROM sales_histories
-      ORDER BY property_id, ownership_transfer_date DESC NULLS LAST
-    ),
-    permit_counts AS (
-      SELECT parcel_identifier, count(*) AS permit_count
-      FROM property_improvements
-      WHERE parcel_identifier IS NOT NULL AND parcel_identifier <> ''
-      GROUP BY parcel_identifier
-    ),
+  const enrichmentCtes = includeSunbizBbb
+    ? `,
     sunbiz_keys AS (
       SELECT DISTINCT a_sun.normalized_address_key AS k
       FROM business_registration_addresses bra
@@ -580,7 +551,142 @@ async function fetchQueryTableRows(
       JOIN companies c ON c.company_id = pi.contractor_company_id
       JOIN bbb_norm b ON b.nname = regexp_replace(lower(c.name), '[^a-z0-9]', '', 'g')
       WHERE c.name IS NOT NULL AND c.name <> ''
+    )`
+    : includePaDos
+      ? `,
+    pa_dos_keys AS (
+      SELECT DISTINCT a_pd.normalized_address_key AS k
+      FROM business_registration_addresses bra
+      JOIN addresses a_pd ON a_pd.address_id = bra.address_id
+      WHERE bra.source_system = 'pa_dos'
+        AND a_pd.normalized_address_key IS NOT NULL
+    )`
+      : "";
+  const hasSunbizExpr = includeSunbizBbb
+    ? "(sk.k IS NOT NULL) AS has_sunbiz_tenant"
+    : "false AS has_sunbiz_tenant";
+  const hasBbbExpr = includeSunbizBbb
+    ? "(pb.parcel_identifier IS NOT NULL) AS has_bbb_contractor"
+    : "false AS has_bbb_contractor";
+  const hasPaDosExpr = includePaDos
+    ? "(pd.k IS NOT NULL) AS has_pa_corp_tenant"
+    : "false AS has_pa_corp_tenant";
+  const enrichmentJoins = includeSunbizBbb
+    ? `
+    LEFT JOIN sunbiz_keys sk ON sk.k = a.normalized_address_key
+    LEFT JOIN permit_bbb pb ON pb.parcel_identifier = ${NORMALIZED_PARCEL}`
+    : includePaDos
+      ? `
+    LEFT JOIN pa_dos_keys pd ON pd.k = a.normalized_address_key`
+      : "";
+
+  return `
+    WITH county_properties AS (
+      SELECT
+        property_id,
+        parcel_id,
+        address_id,
+        parcel_identifier,
+        request_identifier,
+        property_type,
+        property_usage_type,
+        property_structure_built_year,
+        livable_floor_area,
+        total_area,
+        subdivision,
+        source_system
+      FROM properties
+      WHERE source_system = $1
     ),
+    tax_latest AS (
+      SELECT DISTINCT ON (t.property_id)
+        t.property_id,
+        t.property_assessed_value_amount AS assessed_value,
+        t.property_market_value_amount AS market_value,
+        t.property_land_amount AS land_value
+      FROM taxes t
+      JOIN county_properties cp ON cp.property_id = t.property_id
+      ORDER BY t.property_id, t.tax_year DESC NULLS LAST
+    ),
+    avm AS (
+      SELECT pv.property_id, MAX(pv.current_avm_value) AS avm_value
+      FROM property_valuations pv
+      JOIN county_properties cp ON cp.property_id = pv.property_id
+      GROUP BY pv.property_id
+    ),
+    structure_pick AS (
+      SELECT DISTINCT ON (s.property_id)
+        s.property_id, s.exterior_wall_material_primary, s.roof_covering_material
+      FROM structures s
+      JOIN county_properties cp ON cp.property_id = s.property_id
+      ORDER BY s.property_id
+    ),
+    lot_pick AS (
+      SELECT DISTINCT ON (l.property_id)
+        l.property_id, l.lot_size_acre, l.lot_area_sqft
+      FROM lots l
+      JOIN county_properties cp ON cp.property_id = l.property_id
+      ORDER BY l.property_id
+    ),
+    layout_area AS (
+      SELECT l.property_id,
+        SUM(l.livable_area_sq_ft) AS livable_area_sq_ft,
+        SUM(l.area_under_air_sq_ft) AS area_under_air_sq_ft
+      FROM layouts l
+      JOIN county_properties cp ON cp.property_id = l.property_id
+      GROUP BY l.property_id
+    ),
+    geom_pick AS (
+      SELECT DISTINCT ON (g.property_id)
+        g.property_id, g.latitude, g.longitude
+      FROM geometries g
+      JOIN county_properties cp ON cp.property_id = g.property_id
+      WHERE g.latitude IS NOT NULL AND g.longitude IS NOT NULL
+      ORDER BY g.property_id
+    ),
+    owners_agg AS (
+      SELECT
+        o.property_id,
+        string_agg(DISTINCT o.owned_by, ' | ') AS owners_text,
+        count(DISTINCT o.owned_by) AS owner_count,
+        bool_or(o.owner_occupied_indicator) AS owner_occupied
+      FROM ownerships o
+      JOIN county_properties cp ON cp.property_id = o.property_id
+      WHERE o.owned_by IS NOT NULL AND o.owned_by <> ''
+      GROUP BY o.property_id
+    ),
+    owner_primary AS (
+      SELECT DISTINCT ON (o.property_id)
+        o.property_id, o.owned_by AS owner_name
+      FROM ownerships o
+      JOIN county_properties cp ON cp.property_id = o.property_id
+      WHERE o.owned_by IS NOT NULL AND o.owned_by <> ''
+      ORDER BY o.property_id, o.ownership_percentage DESC NULLS LAST
+    ),
+    sale_latest AS (
+      SELECT DISTINCT ON (sh.property_id)
+        sh.property_id,
+        sh.ownership_transfer_date AS last_sale_date,
+        sh.purchase_price_amount AS last_sale_price
+      FROM sales_histories sh
+      JOIN county_properties cp ON cp.property_id = sh.property_id
+      ORDER BY sh.property_id, sh.ownership_transfer_date DESC NULLS LAST
+    ),
+    permit_counts AS (
+      SELECT cp.property_id,
+        count(pi.property_improvement_id) AS permit_count
+      FROM county_properties cp
+      JOIN property_improvements pi
+        ON pi.source_system <> cp.source_system
+        AND (
+          (pi.property_id IS NOT NULL AND pi.property_id = cp.property_id)
+          OR (
+            pi.property_id IS NULL
+            AND pi.parcel_identifier = ${NORMALIZED_CP_PARCEL}
+          )
+        )
+      GROUP BY cp.property_id
+    )${enrichmentCtes},
     situs AS (
       SELECT DISTINCT ON (request_identifier)
         request_identifier, full_address
@@ -630,9 +736,10 @@ async function fetchQueryTableRows(
       p.subdivision AS subdivision,
       (pc.permit_count IS NOT NULL) AS has_permits,
       COALESCE(pc.permit_count, 0) AS permit_count,
-      (sk.k IS NOT NULL) AS has_sunbiz_tenant,
-      (pb.parcel_identifier IS NOT NULL) AS has_bbb_contractor
-    FROM properties p
+      ${hasSunbizExpr},
+      ${hasBbbExpr},
+      ${hasPaDosExpr}
+    FROM county_properties p
     LEFT JOIN parcels par ON par.parcel_id = p.parcel_id
     LEFT JOIN addresses a ON a.address_id = p.address_id
     LEFT JOIN geom_pick gp ON gp.property_id = p.property_id
@@ -644,14 +751,32 @@ async function fetchQueryTableRows(
     LEFT JOIN owner_primary op ON op.property_id = p.property_id
     LEFT JOIN owners_agg oa ON oa.property_id = p.property_id
     LEFT JOIN sale_latest sl ON sl.property_id = p.property_id
-    LEFT JOIN permit_counts pc ON pc.parcel_identifier = ${NORMALIZED_PARCEL}
-    LEFT JOIN sunbiz_keys sk ON sk.k = a.normalized_address_key
-    LEFT JOIN permit_bbb pb ON pb.parcel_identifier = ${NORMALIZED_PARCEL}
+    LEFT JOIN permit_counts pc ON pc.property_id = p.property_id${enrichmentJoins}
     LEFT JOIN situs su ON su.request_identifier = p.request_identifier
-    WHERE p.source_system = $1
     ORDER BY folio, p.property_id
     ${limitClause}
-  `,
+  `;
+}
+
+/**
+ * Fetch flat query-table rows for one appraisal county.
+ *
+ * @param {Pool} pool Postgres pool.
+ * @param {string} sourceSystem Appraisal source_system value.
+ * @param {string} county County slug controlling enrichment joins.
+ * @param {number | null} limit Optional row cap.
+ * @returns {Promise<QueryTableSourceRow[]>} Flat rows keyed by folio.
+ */
+async function fetchQueryTableRows(
+  pool: Pool,
+  sourceSystem: string,
+  county: string,
+  limit: number | null,
+): Promise<QueryTableSourceRow[]> {
+  const includeSunbizBbb = includeSunbizBbbEnrichmentInQueryTable(county);
+  const includePaDos = includePaDosEnrichmentInQueryTable(county);
+  const result = await pool.query<QueryTableSourceRow>(
+    buildQueryTableSql(sourceSystem, includeSunbizBbb, includePaDos, limit),
     [sourceSystem],
   );
   return result.rows;
@@ -679,6 +804,8 @@ async function main(): Promise<void> {
       event: "query_table_export_started",
       county: options.county,
       sourceSystem,
+      includeSunbizBbbEnrichment: includeSunbizBbbEnrichmentInQueryTable(options.county),
+      includePaDosEnrichment: includePaDosEnrichmentInQueryTable(options.county),
       limit: options.limit,
       outDir: options.outDir,
       startedAt,
@@ -705,7 +832,7 @@ async function main(): Promise<void> {
     await mkdir(countyDir, { recursive: true });
     const parquetPath = join(countyDir, "query-table.parquet");
 
-    const rows = await fetchQueryTableRows(pg, sourceSystem, options.limit);
+    const rows = await fetchQueryTableRows(pg, sourceSystem, options.county, options.limit);
 
     const schema = buildQueryTableParquetSchema();
     const writer = await ParquetWriter.openFile(schema, parquetPath);

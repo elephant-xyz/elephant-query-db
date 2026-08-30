@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   buildQueryTableRow,
   buildQueryTableParquetSchema,
+  buildQueryTableSql,
+  includePaDosEnrichmentInQueryTable,
+  includeSunbizBbbEnrichmentInQueryTable,
   type QueryTableSourceRow,
 } from "../scripts/run-query-table-export.js";
 
@@ -54,6 +57,7 @@ function sourceRow(overrides: Partial<QueryTableSourceRow>): QueryTableSourceRow
     permit_count: null,
     has_sunbiz_tenant: null,
     has_bbb_contractor: null,
+    has_pa_corp_tenant: null,
     ...overrides,
   };
 }
@@ -104,5 +108,33 @@ describe("query table living-area (Sq Ft) sourcing", () => {
     const schema = buildQueryTableParquetSchema();
 
     expect(schema.schema.livable_floor_area).toMatchObject({ type: "DOUBLE" });
+  });
+});
+
+describe("query table enrichment scope", () => {
+  it("includes Sunbiz/BBB joins only for Florida oracle counties", () => {
+    expect(includeSunbizBbbEnrichmentInQueryTable("lee")).toBe(true);
+    expect(includeSunbizBbbEnrichmentInQueryTable("chester")).toBe(false);
+    expect(includeSunbizBbbEnrichmentInQueryTable("santa-clara")).toBe(false);
+  });
+
+  it("includes PA DOS joins only for Chester", () => {
+    expect(includePaDosEnrichmentInQueryTable("chester")).toBe(true);
+    expect(includePaDosEnrichmentInQueryTable("lee")).toBe(false);
+  });
+
+  it("emits pa_dos_keys CTE for Chester without Sunbiz scans", () => {
+    const sql = buildQueryTableSql("chester_appraiser", false, true, null);
+    expect(sql).toContain("pa_dos_keys");
+    expect(sql).toContain("has_pa_corp_tenant");
+    expect(sql).not.toContain("sunbiz_keys");
+  });
+
+  it("counts permits by property_id FK and excludes same-source appraisal improvements", () => {
+    const sql = buildQueryTableSql("chester_appraiser", false, true, null);
+    expect(sql).toContain("pi.source_system <> cp.source_system");
+    expect(sql).toContain("pi.property_id = cp.property_id");
+    expect(sql).toContain("LEFT JOIN permit_counts pc ON pc.property_id = p.property_id");
+    expect(sql).not.toContain("LEFT JOIN permit_counts pc ON pc.parcel_identifier");
   });
 });

@@ -163,6 +163,7 @@ const APPRAISAL_JURISDICTION_METADATA = new Map<
   ["orange_appraiser", { countyName: "Orange", stateCode: "FL" }],
   ["palm_beach_appraiser", { countyName: "Palm Beach", stateCode: "FL" }],
   ["santa_clara_appraiser", { countyName: "Santa Clara", stateCode: "CA" }],
+  ["chester_appraiser", { countyName: "Chester", stateCode: "PA" }],
 ]);
 
 // Global cross-county serialization lock. Concurrent incremental county loads

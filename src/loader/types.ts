@@ -6,12 +6,13 @@ export type JsonObject = Record<string, unknown>;
 // arms admit any `<county>_appraiser` / `<county>_accela` value (e.g.
 // `orange_appraiser`) while still excluding unrelated strings. The
 // `<county>_permits` arm covers bulk city permit-portal pulls that are not
-// Accela harvests (e.g. `santa_clara_permits`). `bbb` and `sunbiz` remain
-// fixed. Existing `lee_appraiser` / `lee_accela` literals stay assignable via
-// the template arms.
+// Accela harvests (e.g. `santa_clara_permits`). `bbb`, `sunbiz`, and `pa_dos`
+// remain fixed. Existing `lee_appraiser` / `lee_accela` literals stay
+// assignable via the template arms.
 export type SourceSystem =
   | "bbb"
   | "sunbiz"
+  | "pa_dos"
   | `${string}_appraiser`
   | `${string}_accela`
   | `${string}_permits`;
