@@ -45,6 +45,7 @@ import {
   isSunbizAddressRecordSelected,
   isSunbizClassRecordSelected,
   normalizeParcelIdentifier,
+  parseAppraisalSourcePayloadSidecar,
   parseJsonArtifactRecords,
   preparedRowsContainSelectedParcel,
   parseS3Uri,
@@ -916,8 +917,65 @@ describe("source mappers", () => {
     expect(bundle.rows).toEqual([]);
     expect(bundle.skippedRecords).toHaveLength(1);
     expect(bundle.skippedRecords[0]?.reason).toBe(
-      "normalized city permit record is missing permit_number",
+      "normalized city permit record is missing permit_number or complete official application identity",
     );
+  });
+
+  it("maps a legacy city permit from exact official application identity fields", () => {
+    const record = {
+      source_system: "moline_official_monthly_building_permit_reports",
+      source_url: "https://www.moline.il.us/ArchiveCenter/ViewFile/Item/3728",
+      city: "Moline",
+      permit_number: null,
+      parcel_identifier: null,
+      work_location: "1630 5TH AVE",
+      permit_issue_date: "2017-01-03",
+      record_status: "issued",
+      record_type: "Building",
+      project_description: "Private legacy description.",
+      is_roof_permit: false,
+      raw: {
+        source_application_year: "17",
+        source_application_number: "31",
+        source_permit_code: "EC",
+        source_reports: [
+          {
+            archiveId: "3728",
+            reportMonth: "2017-01",
+            title: "January 2017 Building Permits",
+            url: "https://www.moline.il.us/ArchiveCenter/ViewFile/Item/3728",
+            pages: [1, 2],
+          },
+        ],
+      },
+    };
+    const bundle = mapNormalizedCityPermit({
+      artifactUri:
+        "s3://private/rock-island/permits/rock_island_moline_permits/load-ready.private.jsonl#L1",
+      record,
+      sourceSystem: "rock_island_moline_permits",
+    });
+
+    const address = findRow(bundle.rows, "addresses");
+    const permit = findRow(bundle.rows, "property_improvements");
+
+    expect(bundle.skippedRecords).toEqual([]);
+    expect(bundle.rows.map((row) => row.tableName)).toEqual([
+      "addresses",
+      "property_improvements",
+    ]);
+    expect(permit.values.source_record_key).toBe(
+      "rock_island_moline_permits:permit:moline_official_monthly_building_permit_reports:application:17:31:EC:issued:2017-01-03",
+    );
+    expect(permit.values.permit_number).toBeNull();
+    expect(permit.values.parcel_identifier).toBeNull();
+    expect(permit.references?.addressSourceRecordKey).toBe(
+      "rock_island_moline_permits:permit:moline_official_monthly_building_permit_reports:application:17:31:EC:issued:2017-01-03:work_location",
+    );
+    expect(permit.references?.parcelSourceRecordKey).toBeUndefined();
+    expect(permit.references?.propertySourceRecordKey).toBeUndefined();
+    expect(permit.values.source_payload).toEqual(record);
+    expect(address.values.source_payload).toEqual(record);
   });
 
   it("maps only the visible Accela status when historic pages include portal chrome", () => {
@@ -968,6 +1026,173 @@ describe("source mappers", () => {
       "lee_appraiser:36-43-24-00-00001.0000:address:site",
     );
     expect(property.values.property_structure_built_year).toBe(1);
+  });
+
+  it("retains a transform source sidecar in Rock Island source_payload", () => {
+    const sourcePayload = parseAppraisalSourcePayloadSidecar(
+      `${JSON.stringify({
+        request_identifier: "0012345678",
+        response: {
+          type: "FeatureCollection",
+          features: [
+            {
+              properties: { PIN: "0012345678", class: "0081" },
+              geometry: {
+                type: "MultiPolygon",
+                coordinates: [[[[-90.5, 41.5], [-90.4, 41.5], [-90.5, 41.5]]]],
+              },
+            },
+          ],
+        },
+      })}\n`,
+    );
+    const bundle = mapAppraisalTransformedFile({
+      artifactSourcePayload: sourcePayload,
+      artifactUri: "s3://bucket/rock-island/transformed_output.zip",
+      filePath: "data/property.json",
+      record: {
+        request_identifier: "0012345678",
+        parcel_identifier: "0012345678",
+        property_type: "Building",
+      },
+      sourceSystem: "rock_island_appraiser",
+    });
+    const property = findRow(bundle.rows, "properties");
+
+    expect(property.values.source_payload).toMatchObject({
+      parcel_identifier: "0012345678",
+      source_payload: {
+        response: {
+          features: [
+            {
+              properties: { class: "0081" },
+              geometry: { type: "MultiPolygon" },
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("normalizes every polygon ring without flattening MultiPolygon structure", () => {
+    const firstExterior = [
+      [-90.5, 41.5],
+      [-90.4, 41.5],
+      [-90.4, 41.6],
+      [-90.5, 41.5],
+    ];
+    const firstInterior = [
+      [-90.48, 41.52],
+      [-90.46, 41.52],
+      [-90.46, 41.54],
+      [-90.48, 41.52],
+    ];
+    const secondExterior = [
+      [-90.3, 41.4],
+      [-90.2, 41.4],
+      [-90.2, 41.5],
+      [-90.3, 41.4],
+    ];
+    const sourcePayload = {
+      request_identifier: "0012345678",
+      response: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            properties: { PIN: "0012345678" },
+            geometry: {
+              type: "MultiPolygon",
+              coordinates: [
+                [firstExterior, firstInterior],
+                [secondExterior],
+              ],
+            },
+          },
+        ],
+      },
+    };
+    const first = mapAppraisalTransformedFile({
+      artifactSourcePayload: sourcePayload,
+      artifactUri: "s3://bucket/rock-island/transformed_output.zip",
+      filePath: "data/geometry_1.json",
+      record: {
+        request_identifier: "0012345678",
+        polygon: firstExterior.map(([longitude, latitude]) => ({
+          latitude,
+          longitude,
+        })),
+      },
+      sourceSystem: "rock_island_appraiser",
+    });
+    const second = mapAppraisalTransformedFile({
+      artifactSourcePayload: sourcePayload,
+      artifactUri: "s3://bucket/rock-island/transformed_output.zip",
+      filePath: "data/geometry_2.json",
+      record: {
+        request_identifier: "0012345678",
+        polygon: secondExterior.map(([longitude, latitude]) => ({
+          latitude,
+          longitude,
+        })),
+      },
+      sourceSystem: "rock_island_appraiser",
+    });
+    const firstRings = first.rows.filter(
+      (row) => row.tableName === "geometry_rings",
+    );
+    const secondRings = second.rows.filter(
+      (row) => row.tableName === "geometry_rings",
+    );
+
+    expect(first.rows.map((row) => row.tableName)).toEqual([
+      "geometries",
+      "geometry_rings",
+      "geometry_rings",
+    ]);
+    expect(firstRings.map((row) => row.values)).toEqual([
+      expect.objectContaining({
+        coordinates: firstExterior,
+        polygon_index: 0,
+        ring_index: 0,
+        ring_role: "exterior",
+        source_geometry_type: "MultiPolygon",
+      }),
+      expect.objectContaining({
+        coordinates: firstInterior,
+        polygon_index: 0,
+        ring_index: 1,
+        ring_role: "interior",
+        source_geometry_type: "MultiPolygon",
+      }),
+    ]);
+    expect(secondRings).toEqual([
+      expect.objectContaining({
+        references: {
+          geometrySourceRecordKey:
+            "rock_island_appraiser:0012345678:geometry:geometry_2",
+        },
+        values: expect.objectContaining({
+          coordinates: secondExterior,
+          polygon_index: 1,
+          ring_index: 0,
+          ring_role: "exterior",
+          source_geometry_type: "MultiPolygon",
+        }),
+      }),
+    ]);
+  });
+
+  it("fails closed on malformed appraisal source sidecars", () => {
+    expect(() => parseAppraisalSourcePayloadSidecar("")).toThrow(
+      /exactly one record/,
+    );
+    expect(() =>
+      parseAppraisalSourcePayloadSidecar('{"one":true}\n{"two":true}\n'),
+    ).toThrow(/exactly one record/);
+    expect(() => parseAppraisalSourcePayloadSidecar("[]\n")).toThrow(
+      /JSON object/,
+    );
   });
 
   it("threads a non-Lee jurisdiction-key through parcel identity (Orange)", () => {

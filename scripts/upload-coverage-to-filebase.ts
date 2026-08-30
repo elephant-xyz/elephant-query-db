@@ -161,8 +161,10 @@ export function buildCoverageGatewayUrls(networkKey: string): CoverageGatewayUrl
  * coverage pointer can never clobber another dataset.
  */
 export function resolveCoverageIpnsLabel(env: CoveragePublishEnv, county: string): string {
-  const label =
-    trimToUndefined(env["FILEBASE_COVERAGE_IPNS_LABEL"]) ?? defaultCoverageIpnsLabel(county);
+  const label = trimToUndefined(env["FILEBASE_COVERAGE_IPNS_LABEL"]);
+  if (label === undefined) {
+    throw new Error("FILEBASE_COVERAGE_IPNS_LABEL is required");
+  }
 
   const guarded: ReadonlyArray<readonly [string, string]> = [
     [propertyIpnsLabel(county), "property dataset"],
@@ -197,6 +199,9 @@ function requireCredential(env: CoveragePublishEnv, name: string): string {
 export function assertFilebaseCredentials(env: CoveragePublishEnv): void {
   for (const name of REQUIRED_CREDENTIALS) {
     requireCredential(env, name);
+  }
+  if (requireCredential(env, "S3_ENDPOINT") !== "https://s3.filebase.com") {
+    throw new Error("S3_ENDPOINT must use the supported Filebase endpoint");
   }
 }
 
@@ -338,12 +343,21 @@ async function upsertCoverageIpnsPointer(
   const existing = names.find((name) => name.label === label);
 
   if (existing === undefined) {
-    const created = await createIpnsName(fetchImpl, apiToken, label, cid);
-    return created.network_key;
+    await createIpnsName(fetchImpl, apiToken, label, cid);
+  } else {
+    await updateIpnsName(fetchImpl, apiToken, label, cid);
   }
-
-  await updateIpnsName(fetchImpl, apiToken, label, cid);
-  return existing.network_key;
+  const verified = (await listIpnsNames(fetchImpl, apiToken)).find(
+    (name) => name.label === label,
+  );
+  if (
+    verified === undefined ||
+    verified.cid !== cid ||
+    verified.network_key.trim().length === 0
+  ) {
+    throw new Error("Dataset-coverage IPNS readback CID mismatch");
+  }
+  return verified.network_key;
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +388,13 @@ export async function uploadCoverage(opts: {
 
   const headerCid = await putCoverageObject(opts.client, { bucket, key, body: opts.body });
   const localCid = await computeIpfsCid(opts.body);
+  if (
+    headerCid !== undefined &&
+    localCid !== undefined &&
+    headerCid !== localCid
+  ) {
+    throw new Error("Filebase coverage upload CID disagrees with local content CID");
+  }
   const cid = localCid ?? trimToUndefined(headerCid);
 
   if (cid === undefined) {

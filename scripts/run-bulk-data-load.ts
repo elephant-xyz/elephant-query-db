@@ -1,8 +1,9 @@
 import { createReadStream, createWriteStream, readFileSync, unlink, writeFileSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { fileURLToPath } from "node:url";
 
 import AdmZip from "adm-zip";
 import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -10,6 +11,7 @@ import { from as copyFrom } from "pg-copy-streams";
 import { Client, Pool, type PoolClient } from "pg";
 
 import {
+  APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
   BULK_STAGE_COLUMNS,
   addSunbizAddressReferencesToRows,
   assertAppraisalPrefixIsScoped,
@@ -17,6 +19,7 @@ import {
   buildScopedLoadSelectionFromManifest,
   createS3ArtifactReader,
   expandBbbBusinessProfileRecords,
+  expandOverturePlaceRecords,
   isLeePermitRecordSelected,
   isSunbizAddressRecordSelected,
   isSunbizClassRecordSelected,
@@ -24,10 +27,15 @@ import {
   mapBbbBusinessProfile,
   mapLeePermitDetail,
   mapNormalizedCityPermit,
+  mapOverturePlace,
+  mapOverturePlaceExtraction,
+  parsePlacesDeactivationManifest,
   mapSunbizAnnualReportsFromRegistration,
   mapSunbizClassRecord,
   mergeBulkStageTable,
+  parseAppraisalSourcePayloadSidecar,
   parseS3Uri,
+  PLACES_TABLE_ORDER,
   preparedRowsContainSelectedParcel,
   readBulkTableColumns,
   readJsonArtifactRecords,
@@ -55,7 +63,7 @@ import {
   type CoverageSource,
 } from "./oracle-dataset-coverage-upsert.js";
 
-type TrackName = "appraisal" | "bbb" | "permits" | "sunbiz";
+type TrackName = "appraisal" | "bbb" | "permits" | "places" | "sunbiz";
 
 type BulkLoaderPhase = "all" | "stage" | "load";
 
@@ -75,6 +83,9 @@ type BulkLoaderOptions = {
   /** Artifacts per batch for disk-bounded appraisal loading. 0 = single-batch (legacy). */
   readonly batchSize: number;
   readonly bbbPrefix: string;
+  readonly placesPrefix: string;
+  readonly placesDeactivationManifest: string | null;
+  readonly placesRelease: string | null;
   readonly bucket: string;
   readonly concurrency: number;
   readonly envFile: string;
@@ -152,6 +163,7 @@ const DEFAULT_PERMIT_PREFIX =
 const DEFAULT_SUNBIZ_PREFIX =
   "permit-harvest/sunbiz-lee-corporate-quarterly-2026q2-expanded/lexicon-transform/business-registration-v1/classes/";
 const DEFAULT_BBB_PREFIX = "permit-harvest/bbb/category-data/browser-harvest-v1/profiles/";
+const DEFAULT_PLACES_PREFIX = "overture-places/lee/";
 const DEFAULT_STAGE_DIR = ".loader-runs/bulk-staging";
 const STAGE_TABLE_PREFIX = "elephant_bulk_stage";
 const APPRAISAL_JURISDICTION_METADATA = new Map<
@@ -198,6 +210,7 @@ const APPRAISAL_TABLE_ORDER: readonly LogicalTableName[] = [
   "deeds",
   "fact_sheets",
   "geometries",
+  "geometry_rings",
   "sales_histories",
   "taxes",
   "property_valuations",
@@ -260,6 +273,8 @@ const BBB_TABLE_ORDER: readonly LogicalTableName[] = [
   "business_reputation_external_links",
   "contractor_quality_scores",
 ];
+
+const PLACES_TRACK_TABLE_ORDER: readonly LogicalTableName[] = PLACES_TABLE_ORDER;
 
 /**
  * Run the local bulk loader from S3 artifacts into Neon/Postgres.
@@ -436,6 +451,13 @@ async function main(): Promise<void> {
     // Best-effort: coverage is downstream bookkeeping consumed by the snapshot/publish path,
     // so a failure here must never fail an otherwise-successful load.
     if (options.phase === "all" || options.phase === "load") {
+      if (options.tracks.includes("places")) {
+        await finalizePlacesAfterLoad({
+          databaseUrl,
+          deactivationManifestUri: options.placesDeactivationManifest,
+          release: options.placesRelease,
+        });
+      }
       await upsertCoverageAfterLoad({
         databaseUrl,
         jurisdictionKey: options.jurisdictionKey,
@@ -515,6 +537,9 @@ async function stageSelectedTracks(params: {
     if (params.options.tracks.includes("bbb")) {
       await stageBbb({ ...params, s3, writeRows });
     }
+    if (params.options.tracks.includes("places")) {
+      await stagePlaces({ ...params, s3, writeRows });
+    }
   } finally {
     writer.end();
     await onceFinish(writer);
@@ -553,6 +578,15 @@ async function stageAppraisal(params: {
       await stageArtifact(params, artifact.uri, async () => {
         const buffer = await readS3ObjectBuffer(params.s3, artifact.uri);
         const zip = new AdmZip(buffer);
+        const sourcePayloadEntry = zip.getEntry(
+          APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
+        );
+        const artifactSourcePayload =
+          sourcePayloadEntry === null
+            ? undefined
+            : parseAppraisalSourcePayloadSidecar(
+                sourcePayloadEntry.getData().toString("utf8"),
+              );
         const rows: PreparedRow[] = [];
         let skippedRecords = 0;
         const entries = zip
@@ -564,6 +598,7 @@ async function stageAppraisal(params: {
           const text = entry.getData().toString("utf8");
           const record: unknown = JSON.parse(text);
           const bundle = mapAppraisalTransformedFile({
+            artifactSourcePayload,
             artifactUri: artifact.uri,
             countyName: params.options.appraisalCountyName,
             filePath: entry.entryName,
@@ -752,6 +787,15 @@ async function stageAndMergeAppraisalBatched(params: {
         await stageArtifact({ counters: batchCounters }, artifact.uri, async () => {
           const buffer = await readS3ObjectBuffer(s3, artifact.uri);
           const zip = new AdmZip(buffer);
+          const sourcePayloadEntry = zip.getEntry(
+            APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
+          );
+          const artifactSourcePayload =
+            sourcePayloadEntry === null
+              ? undefined
+              : parseAppraisalSourcePayloadSidecar(
+                  sourcePayloadEntry.getData().toString("utf8"),
+                );
           const rows: PreparedRow[] = [];
           let skippedRecords = 0;
           const entries = zip
@@ -763,6 +807,7 @@ async function stageAndMergeAppraisalBatched(params: {
             const text = entry.getData().toString("utf8");
             const record: unknown = JSON.parse(text);
             const bundle = mapAppraisalTransformedFile({
+              artifactSourcePayload,
               artifactUri: artifact.uri,
               countyName: params.options.appraisalCountyName,
               filePath: entry.entryName,
@@ -1197,6 +1242,74 @@ async function stageBbb(params: {
 }
 
 /**
+ * Stage Overture places JSONL artifacts into the generic CSV file.
+ *
+ * Places inputs are extract JSONL (`places/places-part-NNNN.jsonl`) plus an
+ * optional `manifest/summary.json` run record. The mapper never writes
+ * `companies` or `company_id`.
+ *
+ * @param params - Shared S3 client, options, counters, and row writer callback.
+ * @returns Promise that resolves after places artifacts have been visited.
+ */
+async function stagePlaces(params: {
+  readonly counters: MutableBulkCounters;
+  readonly options: BulkLoaderOptions;
+  readonly s3: S3Client;
+  readonly writeRows: (rows: readonly PreparedRow[]) => Promise<void>;
+}): Promise<void> {
+  const reader = createS3ArtifactReader({ client: params.s3 });
+  const artifacts = await listS3Objects({
+    bucket: params.options.bucket,
+    limit: params.options.limit,
+    prefix: params.options.placesPrefix,
+    s3: params.s3,
+    suffix: [".json", ".jsonl"],
+  });
+  console.log(JSON.stringify({ event: "bulk_track_started", track: "places", artifactCount: artifacts.length }));
+
+  await processIterable(artifacts, params.options.concurrency, async (artifact) => {
+    await stageArtifact(params, artifact.uri, async () => {
+      const artifactRecords = await readJsonArtifactRecords(reader, artifact.uri, "auto");
+      const rows: PreparedRow[] = [];
+      let inputRecords = 0;
+      let skippedRecords = 0;
+      const isSummary = artifact.uri.endsWith("summary.json") || artifact.uri.includes("/manifest/");
+      for (const artifactRecord of artifactRecords) {
+        if (isSummary) {
+          const bundle = mapOverturePlaceExtraction({
+            artifactUri: artifact.uri,
+            record: artifactRecord.record,
+          });
+          rows.push(...bundle.rows);
+          skippedRecords += bundle.skippedRecords.length;
+          inputRecords += 1;
+          continue;
+        }
+        const placeRecords = expandOverturePlaceRecords(artifactRecord.record);
+        inputRecords += placeRecords.length;
+        for (const placeRecord of placeRecords) {
+          const bundle = mapOverturePlace({ artifactUri: artifact.uri, record: placeRecord });
+          rows.push(...bundle.rows);
+          skippedRecords += bundle.skippedRecords.length;
+        }
+      }
+      const sortedRows = sortRows(rows, PLACES_TRACK_TABLE_ORDER);
+      await params.writeRows(sortedRows);
+      params.counters.inputRecords += inputRecords;
+      params.counters.preparedRows += rows.length;
+      params.counters.skippedRecords += skippedRecords;
+      return {
+        filteredRecords: 0,
+        inputRecords,
+        preparedRows: rows.length,
+        skippedRecords,
+      };
+    });
+  });
+  console.log(JSON.stringify({ event: "bulk_track_finished", track: "places", artifactCount: artifacts.length }));
+}
+
+/**
  * Build the complete Sunbiz row-to-address reference map from transform relationship files.
  *
  * Full Sunbiz loads do not use the scoped-property filter, but they still need
@@ -1506,7 +1619,8 @@ async function upsertCoverageAfterLoad(params: {
   });
   try {
     for (const track of params.tracks) {
-      const source: CoverageSource = track;
+      const source = coverageSourceForTrack(track);
+      if (source === null) continue;
       try {
         const computation = await computeCoverage(pool, county, source);
         if (computation.ingestedCount <= 0) {
@@ -2230,6 +2344,7 @@ function tableOrderForTracks(tracks: readonly TrackName[]): readonly LogicalTabl
   if (tracks.includes("permits")) append(PERMIT_TABLE_ORDER);
   if (tracks.includes("sunbiz")) append(SUNBIZ_TABLE_ORDER);
   if (tracks.includes("bbb")) append(BBB_TABLE_ORDER);
+  if (tracks.includes("places")) append(PLACES_TRACK_TABLE_ORDER);
   return order;
 }
 
@@ -2306,6 +2421,10 @@ function parseOptions(args: readonly string[]): BulkLoaderOptions {
     appraisalStateCode: jurisdictionMetadata.stateCode,
     batchSize: parseBatchSize(values.get("batch-size"), values.get("incremental") === "true"),
     bbbPrefix: values.get("bbb-prefix") ?? DEFAULT_BBB_PREFIX,
+    placesPrefix: values.get("places-prefix") ?? DEFAULT_PLACES_PREFIX,
+    placesDeactivationManifest:
+      values.get("places-deactivation-manifest") ?? null,
+    placesRelease: values.get("places-release") ?? null,
     bucket: values.get("bucket") ?? DEFAULT_BUCKET,
     concurrency: parseConcurrency(values.get("concurrency")),
     envFile: values.get("env-file") ?? ".env.local",
@@ -2358,11 +2477,165 @@ function parseTracks(value: string): readonly TrackName[] {
   const tracks = value.split(",").map((track) => track.trim()).filter(Boolean);
   if (tracks.length === 0) throw new Error("At least one track is required");
   return tracks.map((track): TrackName => {
-    if (track !== "appraisal" && track !== "bbb" && track !== "permits" && track !== "sunbiz") {
+    if (track !== "appraisal" && track !== "bbb" && track !== "permits" && track !== "places" && track !== "sunbiz") {
       throw new Error(`Unsupported track: ${track}`);
     }
     return track;
   });
+}
+
+/**
+ * Map a loader track name onto the coverage-table source spelling.
+ *
+ * Places uses `overture_places` in Neon and the published snapshot (one spelling).
+ * The pre-existing sunbiz/`corporate` mismatch is not repeated here.
+ *
+ * @param track - Bulk-loader track.
+ * @returns Coverage source, or null when the track has no coverage row.
+ */
+function coverageSourceForTrack(track: TrackName): CoverageSource | null {
+  if (track === "places") return "overture_places";
+  if (track === "appraisal" || track === "permits" || track === "sunbiz" || track === "bbb") {
+    return track;
+  }
+  return null;
+}
+
+/**
+ * Fill PostGIS geometry from lon/lat and apply only explicit changelog
+ * deactivations. Unchanged rows keep their current state even when their
+ * `last_seen_release` is older than the run release. Absence is never closure.
+ *
+ * @param params - Direct database URL and optional S3 deactivation manifest.
+ * @returns Promise that resolves after the refresh SQL commits.
+ */
+async function finalizePlacesAfterLoad(params: {
+  readonly databaseUrl: string;
+  readonly deactivationManifestUri: string | null;
+  readonly release: string | null;
+}): Promise<void> {
+  if (params.release === null) {
+    throw new Error("--places-release is required when loading the places track");
+  }
+  const client = await createKeepaliveClient(params.databaseUrl);
+  try {
+    await client.query("BEGIN", []);
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext('overture_places_refresh'))`,
+      [],
+    );
+    const staleCategories = await client.query(
+      `DELETE FROM business_location_categories category
+       USING business_locations location
+       WHERE category.business_location_id = location.business_location_id
+         AND location.source_system = 'overture_places'
+         AND location.last_seen_release = $1
+         AND category.source_system = 'overture_places'
+         AND NOT (
+           category.source_record_key =
+             location.source_record_key || ':category:0:' ||
+             COALESCE(location.source_payload->>'taxonomy_primary', '')
+           OR EXISTS (
+             SELECT 1
+             FROM jsonb_array_elements_text(
+               CASE
+                 WHEN jsonb_typeof(location.source_payload->'taxonomy_alternate') = 'array'
+                 THEN location.source_payload->'taxonomy_alternate'
+                 ELSE '[]'::jsonb
+               END
+             ) WITH ORDINALITY alternate(label, ordinal)
+             WHERE alternate.label IS DISTINCT FROM
+                   location.source_payload->>'taxonomy_primary'
+               AND category.source_record_key =
+                   location.source_record_key || ':category:' ||
+                   alternate.ordinal::text || ':' || alternate.label
+           )
+         )`,
+      [params.release],
+    );
+    const staleSources = await client.query(
+      `DELETE FROM business_location_sources source
+       USING business_locations location
+       WHERE source.business_location_id = location.business_location_id
+         AND location.source_system = 'overture_places'
+         AND location.last_seen_release = $1
+         AND source.source_system = 'overture_places'
+         AND NOT EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(
+             CASE
+               WHEN jsonb_typeof(location.source_payload->'sources') = 'array'
+               THEN location.source_payload->'sources'
+               ELSE '[]'::jsonb
+             END
+           ) WITH ORDINALITY expected(value, ordinal)
+           WHERE source.source_record_key =
+                 location.source_record_key || ':source:' ||
+                 (expected.ordinal - 1)::text || ':' ||
+                 COALESCE(expected.value->>'dataset', '')
+         )`,
+      [params.release],
+    );
+    await client.query(
+      `UPDATE business_locations
+       SET geometry = ST_SetSRID(ST_MakePoint(longitude::double precision, latitude::double precision), 4326)
+       WHERE source_system = 'overture_places'
+         AND longitude IS NOT NULL
+         AND latitude IS NOT NULL
+         AND (
+           geometry IS NULL
+           OR NOT ST_Equals(
+             geometry,
+             ST_SetSRID(ST_MakePoint(longitude::double precision, latitude::double precision), 4326)
+           )
+         )`,
+      [],
+    );
+    let deactivatedCount = 0;
+    if (params.deactivationManifestUri !== null) {
+      const { bucket, key } = parseS3Uri(params.deactivationManifestUri);
+      const s3 = new S3Client({});
+      const response = await s3.send(
+        new GetObjectCommand({ Bucket: bucket, Key: key }),
+      );
+      if (response.Body === undefined) {
+        throw new Error(
+          `Places deactivation manifest has no body: ${params.deactivationManifestUri}`,
+        );
+      }
+      const parsed = parsePlacesDeactivationManifest(
+        JSON.parse(await response.Body.transformToString()),
+      );
+      const gersIds = parsed.records.map((record) => record.gersId);
+      if (gersIds.length > 0) {
+        const result = await client.query(
+          `UPDATE business_locations
+           SET is_current = false,
+               updated_at = now()
+           WHERE source_system = 'overture_places'
+             AND county_key = $1
+             AND gers_id = ANY($2::text[])
+             AND is_current = true`,
+          [parsed.county, gersIds],
+        );
+        deactivatedCount = result.rowCount ?? 0;
+      }
+    }
+    await client.query("COMMIT", []);
+    console.log(
+      JSON.stringify({
+        event: "overture_places_refresh_finalized",
+        deactivatedCount,
+        deletedStaleCategoryCount: staleCategories.rowCount ?? 0,
+        deletedStaleSourceCount: staleSources.rowCount ?? 0,
+      }),
+    );
+  } catch (caught) {
+    await client.query("ROLLBACK", []).catch(() => undefined);
+    throw caught;
+  } finally {
+    await client.end();
+  }
 }
 
 /**
@@ -2479,6 +2752,7 @@ function redactedOptions(options: BulkLoaderOptions): JsonObject {
     appraisalStateCode: options.appraisalStateCode,
     batchSize: options.batchSize,
     bbbPrefix: options.bbbPrefix,
+    placesPrefix: options.placesPrefix,
     bucket: options.bucket,
     concurrency: options.concurrency,
     envFile: options.envFile,
@@ -2606,7 +2880,22 @@ function onceFinish(writer: Writable): Promise<void> {
   });
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+/**
+ * True when this module is the CLI entrypoint.
+ *
+ * Compares resolved filesystem paths so percent-encoded spaces in
+ * `import.meta.url` and relative `process.argv[1]` values still match.
+ *
+ * @param metaUrl - `import.meta.url` of the module under test.
+ * @param argv1 - `process.argv[1]` as invoked (relative or absolute).
+ * @returns Whether the two paths refer to the same file.
+ */
+export function isCliEntrypoint(metaUrl: string, argv1: string | undefined): boolean {
+  if (argv1 === undefined || argv1.trim().length === 0) return false;
+  return fileURLToPath(metaUrl) === resolve(argv1);
+}
+
+if (isCliEntrypoint(import.meta.url, process.argv[1])) {
   main().catch((caught: unknown) => {
     const message = caught instanceof Error ? caught.message : String(caught);
     console.error(JSON.stringify({ event: "bulk_loader_failed", error: message }));

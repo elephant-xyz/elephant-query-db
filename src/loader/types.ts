@@ -6,19 +6,26 @@ export type JsonObject = Record<string, unknown>;
 // arms admit any `<county>_appraiser` / `<county>_accela` value (e.g.
 // `orange_appraiser`) while still excluding unrelated strings. The
 // `<county>_permits` arm covers bulk city permit-portal pulls that are not
-// Accela harvests (e.g. `santa_clara_permits`). `bbb`, `sunbiz`, and `pa_dos`
-// remain fixed. Existing `lee_appraiser` / `lee_accela` literals stay
-// assignable via the template arms.
+// Accela harvests (e.g. `santa_clara_permits`). Statewide registration sources
+// remain explicit literals so one jurisdiction's semantics cannot leak into
+// another. Existing `lee_appraiser` / `lee_accela` literals stay assignable via
+// the template arms.
 export type SourceSystem =
   | "bbb"
+  | "illinois_sos"
   | "sunbiz"
   | "pa_dos"
+  | "overture_places"
   | `${string}_appraiser`
   | `${string}_accela`
   | `${string}_permits`;
 
 export type LogicalTableName =
   | "addresses"
+  | "business_location_categories"
+  | "business_location_parcel_links"
+  | "business_location_sources"
+  | "business_locations"
   | "business_registration_addresses"
   | "business_registration_annual_reports"
   | "business_registration_events"
@@ -44,10 +51,13 @@ export type LogicalTableName =
   | "files"
   | "flood_storm_information"
   | "geometries"
+  | "geometry_rings"
+  | "illinois_sos_component_records"
   | "inspections"
   | "layouts"
   | "lots"
   | "ownerships"
+  | "overture_place_extractions"
   | "parcels"
   | "people"
   | "permit_contacts"
@@ -81,10 +91,12 @@ export type PreparedRow = {
 
 export type PreparedRowReferences = {
   readonly addressSourceRecordKey?: string;
+  readonly businessLocationSourceRecordKey?: string;
   readonly businessReputationComplaintSourceRecordKey?: string;
   readonly businessReputationProfileSourceRecordKey?: string;
   readonly companySourceRecordKey?: string;
   readonly deedSourceRecordKey?: string;
+  readonly geometrySourceRecordKey?: string;
   readonly parcelSourceRecordKey?: string;
   readonly personSourceRecordKey?: string;
   readonly propertyImprovementSourceRecordKey?: string;

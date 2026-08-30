@@ -21,6 +21,9 @@
 #   TRACKS                (optional)  comma-separated loader tracks (default appraisal); e.g. appraisal,sunbiz,bbb
 #   SUNBIZ_PREFIX         (optional)  S3 prefix for the sunbiz track (only used when TRACKS includes sunbiz)
 #   BBB_PREFIX            (optional)  S3 prefix for the bbb track (only used when TRACKS includes bbb)
+#   PLACES_PREFIX         (optional)  S3 prefix for Overture place JSONL/summary artifacts
+#   PLACES_RELEASE        (required for places) pinned Overture release
+#   PLACES_DEACTIVATION_MANIFEST (optional) S3 URI for explicit removed/moved-out GERS IDs
 #   APPRAISAL_BUCKET      (optional)  overrides the loader default bucket
 #   BATCH_SIZE            (optional)  default 20000
 #   SCOPE_MANIFEST        (optional)  S3-URI manifest path/URL to scope a TEST subset
@@ -75,6 +78,15 @@ build_load_args() {
   if [ -n "${BBB_PREFIX:-}" ]; then
     LOAD_ARGS="$LOAD_ARGS --bbb-prefix $BBB_PREFIX"
   fi
+  if [ -n "${PLACES_PREFIX:-}" ]; then
+    LOAD_ARGS="$LOAD_ARGS --places-prefix $PLACES_PREFIX"
+  fi
+  if [ -n "${PLACES_RELEASE:-}" ]; then
+    LOAD_ARGS="$LOAD_ARGS --places-release $PLACES_RELEASE"
+  fi
+  if [ -n "${PLACES_DEACTIVATION_MANIFEST:-}" ]; then
+    LOAD_ARGS="$LOAD_ARGS --places-deactivation-manifest $PLACES_DEACTIVATION_MANIFEST"
+  fi
   if [ -n "${SCOPE_MANIFEST:-}" ]; then
     LOAD_ARGS="$LOAD_ARGS --scope-manifest $SCOPE_MANIFEST"
   fi
@@ -85,6 +97,11 @@ build_load_args() {
 }
 
 if [ "$STEP" = "load" ]; then
+  case ",$TRACKS," in
+    *,places,*)
+      $TSX scripts/apply-overture-places-refresh-migration.ts
+      ;;
+  esac
   build_load_args
   # shellcheck disable=SC2086
   exec $TSX scripts/run-bulk-data-load.ts $LOAD_ARGS

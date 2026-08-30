@@ -63,6 +63,7 @@ const GENERATED_OR_DEFAULT_COLUMNS = new Set<string>([
   "created_at",
   "updated_at",
   "loaded_at",
+  "geometry",
 ]);
 
 const TABLES_WITH_UPDATED_AT = new Set<LogicalTableName>([
@@ -83,6 +84,10 @@ const TABLES_WITH_UPDATED_AT = new Set<LogicalTableName>([
   "business_reputation_rating_reasons",
   "business_reputation_reviews",
   "business_reputation_service_areas",
+  "business_location_categories",
+  "business_location_parcel_links",
+  "business_location_sources",
+  "business_locations",
   "companies",
   "contractor_quality_scores",
   "deeds",
@@ -90,9 +95,11 @@ const TABLES_WITH_UPDATED_AT = new Set<LogicalTableName>([
   "files",
   "flood_storm_information",
   "geometries",
+  "geometry_rings",
   "layouts",
   "lots",
   "ownerships",
+  "overture_place_extractions",
   "parcels",
   "people",
   "property_improvements",
@@ -111,6 +118,7 @@ const TABLES_WITH_ADDRESS_ID = new Set<LogicalTableName>([
   "business_reputation_service_areas",
   "business_registration_addresses",
   "business_registration_parties",
+  "business_locations",
   "permit_contacts",
   "properties",
   "property_improvements",
@@ -135,6 +143,8 @@ const TABLES_WITH_CONTRACTOR_COMPANY_ID = new Set<LogicalTableName>(["property_i
 const TABLES_WITH_OWNER_COMPANY_ID = new Set<LogicalTableName>(["ownerships"]);
 
 const TABLES_WITH_DEED_ID = new Set<LogicalTableName>(["files"]);
+
+const TABLES_WITH_GEOMETRY_ID = new Set<LogicalTableName>(["geometry_rings"]);
 
 const TABLES_WITH_PARCEL_ID = new Set<LogicalTableName>([
   "properties",
@@ -193,6 +203,12 @@ const TABLES_WITH_BUSINESS_REPUTATION_COMPLAINT_ID = new Set<LogicalTableName>([
   "business_reputation_complaint_events",
 ]);
 
+const TABLES_WITH_BUSINESS_LOCATION_ID = new Set<LogicalTableName>([
+  "business_location_categories",
+  "business_location_parcel_links",
+  "business_location_sources",
+]);
+
 const SOURCE_KEY_REFERENCE_RESOLUTIONS: readonly ReferenceResolution[] = [
   {
     referenceJsonKey: "addressSourceRecordKey",
@@ -233,6 +249,14 @@ const SOURCE_KEY_REFERENCE_RESOLUTIONS: readonly ReferenceResolution[] = [
     targetTableName: "deeds",
     targetTables: TABLES_WITH_DEED_ID,
     alias: "ref_deed",
+  },
+  {
+    referenceJsonKey: "geometrySourceRecordKey",
+    targetColumnName: "geometry_id",
+    targetIdColumnName: "geometry_id",
+    targetTableName: "geometries",
+    targetTables: TABLES_WITH_GEOMETRY_ID,
+    alias: "ref_geometry",
   },
   {
     referenceJsonKey: "parcelSourceRecordKey",
@@ -289,6 +313,14 @@ const SOURCE_KEY_REFERENCE_RESOLUTIONS: readonly ReferenceResolution[] = [
     targetTableName: "business_reputation_complaints",
     targetTables: TABLES_WITH_BUSINESS_REPUTATION_COMPLAINT_ID,
     alias: "ref_business_reputation_complaint",
+  },
+  {
+    referenceJsonKey: "businessLocationSourceRecordKey",
+    targetColumnName: "business_location_id",
+    targetIdColumnName: "business_location_id",
+    targetTableName: "business_locations",
+    targetTables: TABLES_WITH_BUSINESS_LOCATION_ID,
+    alias: "ref_business_location",
   },
 ];
 
@@ -597,9 +629,18 @@ export function buildBulkMergeSql(params: {
   const selectColumnsSql = insertColumnNames.map(quoteIdentifier).join(", ");
   const conflictColumnsSql = spec.conflictColumns.map(quoteIdentifier).join(", ");
   const distinctColumnsSql = spec.conflictColumns.map(quoteIdentifier).join(", ");
+  const coalesceOnUpdate = params.tableName === "business_locations"
+    ? new Set(["first_seen_release"])
+    : new Set<string>();
   const updateAssignments = insertColumnNames
     .filter((columnName) => !spec.conflictColumns.includes(columnName))
-    .map((columnName) => `${quoteIdentifier(columnName)} = EXCLUDED.${quoteIdentifier(columnName)}`);
+    .map((columnName) => {
+      const columnSql = quoteIdentifier(columnName);
+      if (coalesceOnUpdate.has(columnName)) {
+        return `${columnSql} = COALESCE(${targetTableSql}.${columnSql}, EXCLUDED.${columnSql})`;
+      }
+      return `${columnSql} = EXCLUDED.${columnSql}`;
+    });
   if (params.columns.some((column) => column.column_name === "loaded_at")) {
     updateAssignments.push(`"loaded_at" = now()`);
   }
