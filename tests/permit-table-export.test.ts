@@ -12,7 +12,9 @@ import {
  * exercises. Mirrors the `pg` result shape (numeric columns arrive as strings;
  * date columns are cast to ISO text in SQL).
  */
-function sourceRow(overrides: Partial<PermitTableSourceRow>): PermitTableSourceRow {
+function sourceRow(
+  overrides: Partial<PermitTableSourceRow>,
+): PermitTableSourceRow {
   return {
     property_improvement_id: "pi-1",
     property_id: null,
@@ -28,6 +30,7 @@ function sourceRow(overrides: Partial<PermitTableSourceRow>): PermitTableSourceR
     completion_date: null,
     expiration_date: null,
     opened_date: null,
+    source: null,
     source_system: null,
     county_name: null,
     project_description: null,
@@ -77,7 +80,10 @@ describe("buildPermitTableRow — one row per permit", () => {
 
   it("keeps ISO date text verbatim (already cast in SQL)", () => {
     const row = buildPermitTableRow(
-      sourceRow({ completion_date: "2007-05-14", permit_issue_date: "2006-11-02" }),
+      sourceRow({
+        completion_date: "2007-05-14",
+        permit_issue_date: "2006-11-02",
+      }),
     );
 
     expect(row.completion_date).toBe("2007-05-14");
@@ -93,6 +99,18 @@ describe("buildPermitTableRow — one row per permit", () => {
     expect(row.completion_date).toBeNull();
     expect(row.fee).toBeNull();
   });
+
+  it("preserves the portal source separately from the county source system", () => {
+    const row = buildPermitTableRow(
+      sourceRow({
+        source: "lakeland_arcgis_permit_layer",
+        source_system: "polk_permits",
+      }),
+    );
+
+    expect(row.source).toBe("lakeland_arcgis_permit_layer");
+    expect(row.source_system).toBe("polk_permits");
+  });
 });
 
 describe("buildPermitTableParquetSchema — column typing", () => {
@@ -102,12 +120,18 @@ describe("buildPermitTableParquetSchema — column typing", () => {
     expect(schema.schema.estimated_job_value).toMatchObject({ type: "DOUBLE" });
     expect(schema.schema.fee).toMatchObject({ type: "DOUBLE" });
     expect(schema.schema.completion_date).toMatchObject({ type: "UTF8" });
+    expect(schema.schema.source).toMatchObject({
+      type: "UTF8",
+      optional: true,
+    });
   });
 
   it("keeps property_improvement_id as the required (non-optional) primary key", () => {
     const schema = buildPermitTableParquetSchema();
 
-    expect(schema.schema.property_improvement_id).toMatchObject({ type: "UTF8" });
+    expect(schema.schema.property_improvement_id).toMatchObject({
+      type: "UTF8",
+    });
     expect(schema.schema.property_improvement_id?.optional).not.toBe(true);
   });
 });

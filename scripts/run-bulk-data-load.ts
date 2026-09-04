@@ -6,7 +6,7 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
 import AdmZip from "adm-zip";
-import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { GetObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client, type S3ClientConfig } from "@aws-sdk/client-s3";
 import { from as copyFrom } from "pg-copy-streams";
 import { Client, Pool, type PoolClient } from "pg";
 
@@ -66,6 +66,33 @@ import {
 type TrackName = "appraisal" | "bbb" | "permits" | "places" | "sunbiz";
 
 type BulkLoaderPhase = "all" | "stage" | "load";
+
+/**
+ * Build the artifact-reader S3 configuration.
+ *
+ * Production keeps the default AWS credential/endpoint chain. Local bulk-load
+ * rehearsals can set `LOCAL_S3_ENDPOINT` to an S3rver-compatible endpoint; the
+ * fixed credentials are intentionally local-only placeholders required by the
+ * AWS SDK signer.
+ *
+ * @param localS3Endpoint - Optional local S3-compatible endpoint.
+ * @returns AWS SDK client configuration for artifact reads.
+ */
+export function buildArtifactS3ClientConfig(
+  localS3Endpoint: string | undefined,
+): S3ClientConfig {
+  const endpoint = localS3Endpoint?.trim();
+  if (endpoint === undefined || endpoint.length === 0) return {};
+  return {
+    endpoint,
+    forcePathStyle: true,
+    region: "us-east-1",
+    credentials: {
+      accessKeyId: "S3RVER",
+      secretAccessKey: "S3RVER",
+    },
+  };
+}
 
 /**
  * Shape of the artifacts under `--permit-prefix`:
@@ -509,7 +536,7 @@ async function stageSelectedTracks(params: {
   readonly stagedArtifactUris: string[];
 }): Promise<void> {
   await mkdir(dirname(params.stageFile), { recursive: true });
-  const s3 = new S3Client({});
+  const s3 = new S3Client(buildArtifactS3ClientConfig(process.env.LOCAL_S3_ENDPOINT));
   const writer = createWriteStream(params.stageFile, { encoding: "utf8", flags: "w" });
   let nextRowIndex = 1;
 
