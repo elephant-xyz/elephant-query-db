@@ -54,6 +54,7 @@ export type PermitTableSourceRow = {
   readonly completion_date: string | null;
   readonly expiration_date: string | null;
   readonly opened_date: string | null;
+  readonly source: string | null;
   readonly source_system: string | null;
   readonly county_name: string | null;
   readonly project_description: string | null;
@@ -78,6 +79,7 @@ export type PermitTableRow = {
   readonly completion_date: string | null;
   readonly expiration_date: string | null;
   readonly opened_date: string | null;
+  readonly source: string | null;
   readonly source_system: string | null;
   readonly county_name: string | null;
   readonly project_description: string | null;
@@ -152,6 +154,7 @@ export function buildPermitTableRow(row: PermitTableSourceRow): PermitTableRow {
     completion_date: toText(row.completion_date),
     expiration_date: toText(row.expiration_date),
     opened_date: toText(row.opened_date),
+    source: toText(row.source),
     source_system: toText(row.source_system),
     county_name: toText(row.county_name),
     project_description: toText(row.project_description),
@@ -187,6 +190,7 @@ export function buildPermitTableParquetSchema(): ParquetSchema {
     completion_date: { type: "UTF8", optional: true },
     expiration_date: { type: "UTF8", optional: true },
     opened_date: { type: "UTF8", optional: true },
+    source: { type: "UTF8", optional: true },
     source_system: { type: "UTF8", optional: true },
     county_name: { type: "UTF8", optional: true },
     project_description: { type: "UTF8", optional: true },
@@ -213,7 +217,9 @@ function toParquetRecord(row: PermitTableRow): Record<string, unknown> {
 // CLI option parsing
 // ---------------------------------------------------------------------------
 
-export function parseOptions(argv: readonly string[]): PermitTableExportOptions {
+export function parseOptions(
+  argv: readonly string[],
+): PermitTableExportOptions {
   const values = new Map<string, string>();
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
@@ -313,6 +319,7 @@ async function fetchPermitTableRows(
       pi.completion_date::text AS completion_date,
       pi.expiration_date::text AS expiration_date,
       pi.opened_date::text AS opened_date,
+      pi.source AS source,
       pi.source_system AS source_system,
       par.county_name AS county_name,
       pi.project_description AS project_description,
@@ -368,7 +375,9 @@ async function main(): Promise<void> {
 
   pg.on("error", (caught) => {
     const message = caught instanceof Error ? caught.message : String(caught);
-    console.error(JSON.stringify({ event: "database_pool_error", error: message }));
+    console.error(
+      JSON.stringify({ event: "database_pool_error", error: message }),
+    );
   });
 
   try {
@@ -420,7 +429,9 @@ function isInvokedDirectly(): boolean {
 if (isInvokedDirectly()) {
   main().catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(JSON.stringify({ event: "permit_table_export_failed", error: message }));
+    console.error(
+      JSON.stringify({ event: "permit_table_export_failed", error: message }),
+    );
     process.exit(1);
   });
 }
