@@ -1,6 +1,5 @@
-import { createReadStream, readFileSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdir, readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -19,6 +18,22 @@ import type {
 
 import { computeIpfsCid } from "./run-property-consolidation-export.js";
 import type { IndexFile, ManifestEntry, ManifestSummary } from "./run-property-consolidation-export.js";
+import {
+  CheckpointJournal,
+  compactUploadCheckpoint,
+  createUploadProgress,
+  DEFAULT_UPLOAD_RUNS_DIR,
+  readUploadCheckpoint,
+  recordUploadFailure,
+  recordUploadSkipped,
+  recordUploadSuccess,
+  runBoundedWorkerPool,
+  snapshotUploadProgress,
+  uploadCheckpointPathsForBucket,
+  type CheckpointRecord,
+  type UploadProgressState,
+  type UploadRetryInfo,
+} from "./filebase-upload-state.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,12 +51,6 @@ type UploadOptions = {
   readonly filebaseApiToken: string | null;
   readonly filebaseIpnsLabel: string | null;
   readonly forceIndex: boolean;
-};
-
-type CheckpointRecord = {
-  readonly key: string;
-  readonly cid: string;
-  readonly uploadedAt: string;
 };
 
 /**
@@ -97,12 +106,6 @@ export function decideFixedKeyUpload(
   return { reupload: false };
 }
 
-type Checkpoint = {
-  readonly schemaVersion: "1";
-  readonly startedAt: string;
-  readonly entries: CheckpointRecord[];
-};
-
 type FilebaseIpnsItem = {
   readonly label: string;
   readonly network_key: string;
@@ -110,47 +113,6 @@ type FilebaseIpnsItem = {
   readonly sequence?: number;
   readonly enabled?: boolean;
 };
-
-// ---------------------------------------------------------------------------
-// Semaphore (no extra dependencies)
-// ---------------------------------------------------------------------------
-
-class Semaphore {
-  private slots: number;
-  private readonly queue: Array<() => void> = [];
-
-  constructor(concurrency: number) {
-    this.slots = concurrency;
-  }
-
-  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    await this.acquire();
-    try {
-      return await fn();
-    } finally {
-      this.release();
-    }
-  }
-
-  private acquire(): Promise<void> {
-    if (this.slots > 0) {
-      this.slots -= 1;
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve) => {
-      this.queue.push(resolve);
-    });
-  }
-
-  private release(): void {
-    const next = this.queue.shift();
-    if (next !== undefined) {
-      next();
-    } else {
-      this.slots += 1;
-    }
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Raw HTTP response type (AWS SDK v3 internals)
@@ -168,56 +130,6 @@ function isRawHttpResponse(value: unknown): value is RawHttpResponse {
     "headers" in value &&
     typeof (value as RawHttpResponse).headers === "object"
   );
-}
-
-// ---------------------------------------------------------------------------
-// Checkpoint helpers
-// ---------------------------------------------------------------------------
-
-const UPLOAD_RUNS_DIR = ".upload-runs";
-
-// Checkpoint MUST be scoped per bucket. The upload uses fixed object keys
-// (index.json, manifest.json, shards/shard-NNNN.json); a single shared checkpoint
-// keyed only by object key would make a second bucket (e.g. another county) skip
-// those fixed files as "already uploaded", leaving its IPNS pointing at a stale
-// index. Scoping by bucket prevents that cross-bucket contamination.
-function checkpointPathForBucket(bucket: string): string {
-  const safeBucket = bucket.replace(/[^a-zA-Z0-9._-]/g, "_");
-  return join(UPLOAD_RUNS_DIR, `filebase-upload-checkpoint-${safeBucket}.json`);
-}
-
-async function readCheckpoint(checkpointPath: string): Promise<Map<string, CheckpointRecord>> {
-  const text = await readFile(checkpointPath, "utf8").catch((err: unknown) => {
-    if (err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "ENOENT") {
-      return null;
-    }
-    throw err;
-  });
-
-  if (text === null) return new Map();
-
-  const parsed = JSON.parse(text) as Checkpoint;
-  const map = new Map<string, CheckpointRecord>();
-  for (const entry of parsed.entries) {
-    map.set(entry.key, entry);
-  }
-  return map;
-}
-
-function writeCheckpointSync(
-  checkpointPath: string,
-  startedAt: string,
-  uploaded: Map<string, CheckpointRecord>,
-): void {
-  const checkpoint: Checkpoint = {
-    schemaVersion: "1",
-    startedAt,
-    entries: [...uploaded.values()],
-  };
-  writeFile(checkpointPath, `${JSON.stringify(checkpoint, null, 2)}\n`, "utf8").catch((err: unknown) => {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(JSON.stringify({ event: "checkpoint_write_failed", error: message }));
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +152,21 @@ function buildS3Client(options: UploadOptions): S3Client {
 // CID capture via deserialize middleware (mirrors s3-compatible-storage.service.ts)
 // ---------------------------------------------------------------------------
 
+type PutObjectResult = {
+  readonly cid: string | undefined;
+  readonly retry: UploadRetryInfo;
+};
+
+/**
+ * Upload bytes and capture Filebase's CID plus AWS SDK retry metadata.
+ *
+ * The CID middleware is attached to the individual command so concurrent
+ * uploads cannot collide on the shared S3 client middleware stack.
+ *
+ * @param client - Shared Filebase-compatible S3 client.
+ * @param params - Bucket, key, bytes, and content type for one object.
+ * @returns Filebase CID and retry metadata from the completed SDK request.
+ */
 async function putObjectAndCaptureCid(
   client: S3Client,
   params: {
@@ -248,7 +175,7 @@ async function putObjectAndCaptureCid(
     readonly body: Buffer;
     readonly contentType: string;
   }
-): Promise<string | undefined> {
+): Promise<PutObjectResult> {
   let capturedHeaders: Record<string, string> | undefined;
 
   const captureMiddleware: DeserializeMiddleware<PutObjectCommandInput, PutObjectCommandOutput> =
@@ -282,9 +209,16 @@ async function putObjectAndCaptureCid(
     priority: "low",
   });
 
-  await client.send(command);
+  const output = await client.send(command);
 
-  return capturedHeaders?.["x-amz-meta-cid"];
+  return {
+    cid: capturedHeaders?.["x-amz-meta-cid"],
+    retry: {
+      attempts: output.$metadata.attempts ?? 1,
+      retryDelayMs: output.$metadata.totalRetryDelay ?? 0,
+      throttled: false,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -292,9 +226,84 @@ async function putObjectAndCaptureCid(
 // ---------------------------------------------------------------------------
 
 type UploadResult =
-  | { readonly ok: true; readonly key: string; readonly cid: string }
-  | { readonly ok: false; readonly key: string; readonly error: string };
+  | {
+      readonly ok: true;
+      readonly key: string;
+      readonly cid: string;
+      readonly retry: UploadRetryInfo;
+    }
+  | {
+      readonly ok: false;
+      readonly key: string;
+      readonly error: string;
+      readonly retry: UploadRetryInfo;
+      readonly fatal: boolean;
+    };
 
+/**
+ * Read retry and throttle details from an AWS SDK failure without weakening
+ * the unknown-error boundary.
+ *
+ * @param error - Unknown failure thrown by file I/O or the AWS SDK.
+ * @returns Normalized attempt, delay, and throttle information.
+ */
+function retryInfoFromError(error: unknown): UploadRetryInfo {
+  let attempts = 1;
+  let retryDelayMs = 0;
+  let statusCode: number | undefined;
+  let errorName = "";
+
+  if (typeof error === "object" && error !== null) {
+    if ("name" in error && typeof error.name === "string") {
+      errorName = error.name;
+    }
+    if (
+      "$metadata" in error &&
+      typeof error.$metadata === "object" &&
+      error.$metadata !== null
+    ) {
+      const metadata = error.$metadata;
+      if ("attempts" in metadata && typeof metadata.attempts === "number") {
+        attempts = metadata.attempts;
+      }
+      if (
+        "totalRetryDelay" in metadata &&
+        typeof metadata.totalRetryDelay === "number"
+      ) {
+        retryDelayMs = metadata.totalRetryDelay;
+      }
+      if (
+        "httpStatusCode" in metadata &&
+        typeof metadata.httpStatusCode === "number"
+      ) {
+        statusCode = metadata.httpStatusCode;
+      }
+    }
+  }
+
+  return {
+    attempts,
+    retryDelayMs,
+    throttled:
+      statusCode === 429 ||
+      statusCode === 503 ||
+      /throttl|slowdown|too.?many/iu.test(errorName),
+  };
+}
+
+/**
+ * Upload one JSON file and return a non-throwing per-object result.
+ *
+ * Failed reads and exhausted SDK retries become explicit failed results so the
+ * worker pool can finish active work and preserve every successful journal entry.
+ *
+ * @param client - Shared Filebase-compatible S3 client.
+ * @param options - Validated upload session options.
+ * @param key - Stable Filebase object key.
+ * @param absolutePath - Local JSON file path.
+ * @param expectedCid - Immutable local CID, or null when unavailable.
+ * @returns Success with CID/retries, or failure with error/retry visibility.
+ */
 async function uploadFile(
   client: S3Client,
   options: UploadOptions,
@@ -302,58 +311,71 @@ async function uploadFile(
   absolutePath: string,
   expectedCid: string | null
 ): Promise<UploadResult> {
-  const body = await readFile(absolutePath);
-  const filebaseCid = await putObjectAndCaptureCid(client, {
-    bucket: options.bucket,
-    key,
-    body,
-    contentType: "application/json",
-  });
+  try {
+    const body = await readFile(absolutePath);
+    const upload = await putObjectAndCaptureCid(client, {
+      bucket: options.bucket,
+      key,
+      body,
+      contentType: "application/json",
+    });
 
-  if (filebaseCid === undefined) {
-    return { ok: false, key, error: "Filebase did not return x-amz-meta-cid header" };
-  }
-
-  if (expectedCid !== null && filebaseCid !== expectedCid) {
-    console.error(
-      JSON.stringify({
-        event: "cid_mismatch",
+    if (upload.cid === undefined) {
+      return {
+        ok: false,
         key,
-        expectedCid,
-        filebaseCid,
-        message: "Pre-computed CID is authoritative — Filebase CID differs. Investigate before trusting the upload.",
-      })
-    );
-  }
+        error: "Filebase did not return x-amz-meta-cid header",
+        retry: upload.retry,
+        fatal: false,
+      };
+    }
 
-  return { ok: true, key, cid: filebaseCid };
+    if (expectedCid !== null && upload.cid !== expectedCid) {
+      console.error(
+        JSON.stringify({
+          event: "cid_mismatch",
+          key,
+          expectedCid,
+          filebaseCid: upload.cid,
+          message: "Pre-computed CID is authoritative — Filebase CID differs. Investigate before trusting the upload.",
+        })
+      );
+    }
+
+    return { ok: true, key, cid: upload.cid, retry: upload.retry };
+  } catch (error: unknown) {
+    return {
+      ok: false,
+      key,
+      error: error instanceof Error ? error.message : String(error),
+      retry: retryInfoFromError(error),
+      fatal: true,
+    };
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Progress tracking
-// ---------------------------------------------------------------------------
-
-type ProgressState = {
-  total: number;
-  uploaded: number;
-  failed: number;
-  skipped: number;
-  startedAt: number;
-};
-
-function logProgress(state: ProgressState): void {
-  const elapsedSec = (Date.now() - state.startedAt) / 1000;
-  const rate = elapsedSec > 0 ? (state.uploaded / elapsedSec).toFixed(1) : "0";
-  const done = state.uploaded + state.failed + state.skipped;
+/**
+ * Emit current-plan totals, 60-second throughput, and SDK retry visibility.
+ *
+ * @param state - Mutable progress state for the current uploader session.
+ * @returns Nothing.
+ */
+function logProgress(state: UploadProgressState): void {
+  const snapshot = snapshotUploadProgress(state);
   console.log(
     JSON.stringify({
       event: "progress",
-      uploaded: state.uploaded,
-      failed: state.failed,
-      skipped: state.skipped,
-      total: state.total,
-      done,
-      rate_per_sec: rate,
+      uploaded: snapshot.uploaded,
+      failed: snapshot.failed,
+      skipped: snapshot.skipped,
+      total: snapshot.total,
+      done: snapshot.done,
+      rolling_window_sec: snapshot.rollingWindowSec,
+      rolling_rate_per_sec: Number(snapshot.rollingRatePerSec.toFixed(1)),
+      retried_uploads: snapshot.retriedUploads,
+      retry_attempts: snapshot.retryAttempts,
+      retry_delay_ms: snapshot.retryDelayMs,
+      throttled_failures: snapshot.throttledFailures,
     })
   );
 }
@@ -643,12 +665,30 @@ async function main(): Promise<void> {
     return;
   }
 
-  await mkdir(UPLOAD_RUNS_DIR, { recursive: true });
-  const checkpointPath = checkpointPathForBucket(options.bucket);
-  const checkpoint = await readCheckpoint(checkpointPath);
+  await mkdir(DEFAULT_UPLOAD_RUNS_DIR, { recursive: true });
+  const checkpointPaths = uploadCheckpointPathsForBucket(options.bucket);
+  const recovery = await readUploadCheckpoint(checkpointPaths);
   const startedAt = new Date().toISOString();
 
-  const alreadyUploaded = new Map<string, CheckpointRecord>(checkpoint);
+  if (recovery.partialJournalTailIgnored) {
+    console.warn(
+      JSON.stringify({
+        event: "checkpoint_partial_tail_ignored",
+        journalPath: checkpointPaths.journalPath,
+        message: "Ignored one incomplete final journal line; its fixed-content object is safe to re-upload.",
+      }),
+    );
+  }
+  console.log(
+    JSON.stringify({
+      event: "checkpoint_recovered",
+      snapshotEntries: recovery.legacyEntryCount,
+      journalEntries: recovery.journalEntryCount,
+      uniqueEntries: recovery.uploaded.size,
+    }),
+  );
+
+  const alreadyUploaded = new Map<string, CheckpointRecord>(recovery.uploaded);
   for (const entry of entries) {
     const key = `properties/${entry.propertyId}.json`;
     if (entry.cid === null) {
@@ -658,44 +698,69 @@ async function main(): Promise<void> {
   }
   const client = buildS3Client(options);
 
-  const progress: ProgressState = {
-    total: totalUploadCount,
-    uploaded: 0,
-    failed: 0,
-    skipped: alreadyUploaded.size,
-    startedAt: Date.now(),
-  };
-
-  const semaphore = new Semaphore(options.concurrency);
+  const progress = createUploadProgress(totalUploadCount);
   const failures: string[] = [];
+  let journal = new CheckpointJournal(checkpointPaths.journalPath);
+  const progressTimer = setInterval(() => logProgress(progress), 30_000);
+  progressTimer.unref();
 
-  // Log progress every 500 uploaded
+  // Log on volume in addition to the 30-second rolling-throughput timer.
   let lastLogAt = 0;
 
-  const handleResult = (result: UploadResult): void => {
+  /**
+   * Persist one per-object result before exposing it as completed progress.
+   *
+   * @param result - Upload outcome including CID or error and SDK retry details.
+   * @returns Promise resolved after successful uploads are journaled.
+   */
+  const handleResult = async (result: UploadResult): Promise<void> => {
     if (!result.ok) {
       failures.push(result.key);
-      progress.failed += 1;
-      console.error(JSON.stringify({ event: "upload_failed", key: result.key, error: result.error }));
+      recordUploadFailure(progress, result.retry);
+      console.error(
+        JSON.stringify({
+          event: "upload_failed",
+          key: result.key,
+          error: result.error,
+          attempts: result.retry.attempts,
+          retryDelayMs: result.retry.retryDelayMs,
+          throttled: result.retry.throttled,
+        }),
+      );
+      if (result.fatal) {
+        throw new Error(`Upload operation failed for ${result.key}: ${result.error}`);
+      }
       return;
     }
 
-    alreadyUploaded.set(result.key, {
+    const record: CheckpointRecord = {
       key: result.key,
       cid: result.cid,
       uploadedAt: new Date().toISOString(),
-    });
-    progress.uploaded += 1;
+    };
+    await journal.append(record);
+    alreadyUploaded.set(result.key, record);
+    recordUploadSuccess(progress, result.retry);
+
+    if (result.retry.attempts > 1) {
+      console.warn(
+        JSON.stringify({
+          event: "upload_retried",
+          key: result.key,
+          attempts: result.retry.attempts,
+          retryDelayMs: result.retry.retryDelayMs,
+        }),
+      );
+    }
 
     if (progress.uploaded - lastLogAt >= 500) {
       lastLogAt = progress.uploaded;
       logProgress(progress);
-      writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
     }
   };
 
-  // 1. Upload property files in parallel
-  const uploadTasks = entries.map((entry) => {
+  // 1. Upload property files with only O(concurrency) active/pending workers.
+  await runBoundedWorkerPool(entries, options.concurrency, async (entry) => {
     const key = `properties/${entry.propertyId}.json`;
     // Use the relative key, not entry.filePath: the manifest stores filePath WITH the
     // export-dir prefix already, so join(exportDir, filePath) would double it
@@ -703,20 +768,27 @@ async function main(): Promise<void> {
     const absolutePath = join(options.exportDir, key);
 
     if (alreadyUploaded.has(key)) {
-      progress.skipped += 1;
-      return Promise.resolve();
+      recordUploadSkipped(progress);
+      return;
     }
 
-    return semaphore.runExclusive(async () => {
-      const result = await uploadFile(client, options, key, absolutePath, entry.cid);
-      handleResult(result);
-    });
+    const result = await uploadFile(client, options, key, absolutePath, entry.cid);
+    await handleResult(result);
   });
 
-  await Promise.all(uploadTasks);
-
-  // Flush checkpoint after all property files
-  writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
+  // One atomic O(n) compaction at the large phase boundary replaces the former
+  // full-map rewrite every 500 records. The old journal remains recoverable
+  // until the compatible snapshot rename has completed.
+  await journal.close();
+  await compactUploadCheckpoint(checkpointPaths, startedAt, alreadyUploaded);
+  journal = new CheckpointJournal(checkpointPaths.journalPath);
+  console.log(
+    JSON.stringify({
+      event: "checkpoint_compacted",
+      phase: "properties",
+      entries: alreadyUploaded.size,
+    }),
+  );
 
   // 2. Upload shard files (if sharded index exists), before index.json
   if (hasShardedIndex && indexFile !== null) {
@@ -737,40 +809,39 @@ async function main(): Promise<void> {
         })
       );
     } else {
-      const shardTasks = shardFileNames.map((fileName) => {
-        const s3Key = `shards/${fileName}`;
-        const absolutePath = join(options.exportDir, "shards", fileName);
-        // The index carries each shard's freshly-computed local CID; use it to
-        // decide whether the checkpointed copy is stale.
-        const expectedCid = shardCidMap.get(fileName) ?? null;
-        const existing = alreadyUploaded.get(s3Key);
-        const decision = decideFixedKeyUpload(existing, expectedCid, options.forceIndex);
+      await runBoundedWorkerPool(
+        shardFileNames,
+        options.concurrency,
+        async (fileName) => {
+          const s3Key = `shards/${fileName}`;
+          const absolutePath = join(options.exportDir, "shards", fileName);
+          // The index carries each shard's freshly-computed local CID; use it to
+          // decide whether the checkpointed copy is stale.
+          const expectedCid = shardCidMap.get(fileName) ?? null;
+          const existing = alreadyUploaded.get(s3Key);
+          const decision = decideFixedKeyUpload(existing, expectedCid, options.forceIndex);
 
-        if (!decision.reupload) {
-          progress.skipped += 1;
-          return Promise.resolve();
-        }
+          if (!decision.reupload) {
+            recordUploadSkipped(progress);
+            return;
+          }
 
-        if (decision.reason !== "new") {
-          console.log(
-            JSON.stringify({
-              event: "fixed_key_reupload",
-              key: s3Key,
-              reason: decision.reason,
-              previousCid: existing?.cid ?? null,
-              localCid: expectedCid,
-            })
-          );
-        }
+          if (decision.reason !== "new") {
+            console.log(
+              JSON.stringify({
+                event: "fixed_key_reupload",
+                key: s3Key,
+                reason: decision.reason,
+                previousCid: existing?.cid ?? null,
+                localCid: expectedCid,
+              })
+            );
+          }
 
-        return semaphore.runExclusive(async () => {
           const result = await uploadFile(client, options, s3Key, absolutePath, expectedCid);
-          handleResult(result);
-        });
-      });
-
-      await Promise.all(shardTasks);
-      writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
+          await handleResult(result);
+        },
+      );
     }
   }
 
@@ -796,6 +867,7 @@ async function main(): Promise<void> {
 
       if (!decision.reupload) {
         indexCid = existingIndex?.cid;
+        recordUploadSkipped(progress);
         console.log(JSON.stringify({ event: "index_already_uploaded", cid: indexCid }));
       } else {
         if (decision.reason !== "new") {
@@ -810,25 +882,16 @@ async function main(): Promise<void> {
           );
         }
 
-        const filebaseCid = await putObjectAndCaptureCid(client, {
-          bucket: options.bucket,
-          key: indexKey,
-          body: indexBody,
-          contentType: "application/json",
-        });
-
-        if (filebaseCid === undefined) {
-          failures.push(indexKey);
-          console.error(JSON.stringify({ event: "index_upload_failed", error: "No CID returned from Filebase" }));
-        } else {
-          indexCid = filebaseCid;
-          alreadyUploaded.set(indexKey, {
-            key: indexKey,
-            cid: filebaseCid,
-            uploadedAt: new Date().toISOString(),
-          });
-          writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
-          progress.uploaded += 1;
+        const result = await uploadFile(
+          client,
+          options,
+          indexKey,
+          indexPath,
+          localIndexCid,
+        );
+        await handleResult(result);
+        if (result.ok) {
+          indexCid = result.cid;
         }
       }
     }
@@ -855,6 +918,7 @@ async function main(): Promise<void> {
 
     if (!decision.reupload) {
       manifestCid = existingManifest?.cid;
+      recordUploadSkipped(progress);
       console.log(JSON.stringify({ event: "manifest_already_uploaded", cid: manifestCid }));
     } else {
       if (decision.reason !== "new") {
@@ -869,28 +933,32 @@ async function main(): Promise<void> {
         );
       }
 
-      const filebaseCid = await putObjectAndCaptureCid(client, {
-        bucket: options.bucket,
-        key: manifestKey,
-        body: manifestBody,
-        contentType: "application/json",
-      });
-
-      if (filebaseCid === undefined) {
-        failures.push(manifestKey);
-        console.error(JSON.stringify({ event: "manifest_upload_failed", error: "No CID returned from Filebase" }));
-      } else {
-        manifestCid = filebaseCid;
-        alreadyUploaded.set(manifestKey, {
-          key: manifestKey,
-          cid: filebaseCid,
-          uploadedAt: new Date().toISOString(),
-        });
-        writeCheckpointSync(checkpointPath, startedAt, alreadyUploaded);
-        progress.uploaded += 1;
+      const result = await uploadFile(
+        client,
+        options,
+        manifestKey,
+        manifestPath,
+        localManifestCid,
+      );
+      await handleResult(result);
+      if (result.ok) {
+        manifestCid = result.cid;
       }
     }
   }
+
+  // Final serialized flush + atomic compaction. At no point is a valid snapshot
+  // or journal truncated in place.
+  await journal.close();
+  await compactUploadCheckpoint(checkpointPaths, startedAt, alreadyUploaded);
+  clearInterval(progressTimer);
+  console.log(
+    JSON.stringify({
+      event: "checkpoint_compacted",
+      phase: "final",
+      entries: alreadyUploaded.size,
+    }),
+  );
 
   // 5. IPNS upsert (if API token is set and index was uploaded)
   let ipnsName: string | undefined;
@@ -908,14 +976,21 @@ async function main(): Promise<void> {
 
   // Final summary
   logProgress(progress);
+  const finalProgress = snapshotUploadProgress(progress);
 
   console.log(
     JSON.stringify({
       event: "upload_session_complete",
-      uploaded: progress.uploaded,
-      skipped: progress.skipped,
-      failed: progress.failed,
-      total: progress.total,
+      uploaded: finalProgress.uploaded,
+      skipped: finalProgress.skipped,
+      failed: finalProgress.failed,
+      total: finalProgress.total,
+      done: finalProgress.done,
+      rollingRatePerSec: Number(finalProgress.rollingRatePerSec.toFixed(1)),
+      retriedUploads: finalProgress.retriedUploads,
+      retryAttempts: finalProgress.retryAttempts,
+      retryDelayMs: finalProgress.retryDelayMs,
+      throttledFailures: finalProgress.throttledFailures,
       indexCid: indexCid ?? null,
       manifestCid: manifestCid ?? null,
       ipnsName: ipnsName ?? null,
