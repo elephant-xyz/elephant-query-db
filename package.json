@@ -66,6 +66,7 @@
     "backfill:rock-island-children": "tsx scripts/backfill-rock-island-children.ts",
     "backfill:rock-island-geometry-rings": "tsx scripts/backfill-rock-island-geometry-rings.ts",
     "backfill:rock-island-address-class": "tsx scripts/backfill-rock-island-address-class.ts",
+    "cleanup:tax-roll-avm": "tsx scripts/cleanup-tax-roll-avm-projections.ts",
     "export:public-coverage": "tsx scripts/write-public-coverage-snapshot.ts",
     "export:permit-table": "tsx scripts/run-permit-table-export.ts",
     "validate:permit-table": "tsx scripts/validate-permit-table.ts",

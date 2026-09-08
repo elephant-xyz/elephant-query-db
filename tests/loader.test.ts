@@ -1280,7 +1280,7 @@ describe("source mappers", () => {
     );
   });
 
-  it("maps Lee appraisal owner, tax, lot, sales, and permit-history files into logical child rows", () => {
+  it("maps Lee appraisal owner, tax, lot, sales, and permit-history files without treating tax values as an AVM", () => {
     const ownerBundle = mapAppraisalTransformedFile({
       artifactUri: "s3://bucket/appraisal/transformed_output.zip",
       filePath: "data/company_1.json",
@@ -1334,7 +1334,6 @@ describe("source mappers", () => {
     const company = findRow(ownerBundle.rows, "companies");
     const ownership = findRow(ownerBundle.rows, "ownerships");
     const tax = findRow(taxBundle.rows, "taxes");
-    const valuation = findRow(taxBundle.rows, "property_valuations");
     const lot = findRow(lotBundle.rows, "lots");
     const sale = findRow(saleBundle.rows, "sales_histories");
     const improvement = findRow(improvementBundle.rows, "property_improvements");
@@ -1346,9 +1345,7 @@ describe("source mappers", () => {
     expect(tax.references?.propertySourceRecordKey).toBe("lee_appraiser:10211376:property:property");
     expect(tax.values.tax_year).toBe(2025);
     expect(tax.values.property_market_value_amount).toBe(250000);
-    expect(valuation.references?.propertySourceRecordKey).toBe("lee_appraiser:10211376:property:property");
-    expect(valuation.values.current_avm_value).toBe(250000);
-    expect(valuation.values.valuation_date).toBe("2025-01-01");
+    expect(taxBundle.rows.some((row) => row.tableName === "property_valuations")).toBe(false);
     expect(lot.references?.propertySourceRecordKey).toBe("lee_appraiser:10211376:property:property");
     expect(lot.values.lot_area_sqft).toBe(10890);
     expect(sale.references?.propertySourceRecordKey).toBe("lee_appraiser:10211376:property:property");
