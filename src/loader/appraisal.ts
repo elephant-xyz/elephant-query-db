@@ -553,7 +553,19 @@ function mapKnownAppraisalRecord(
   // query-db table; they should fall through to skip rather than each producing a `taxes` row.
   // `tax_exemption` carries `tax_year` and collides on the (property_id, tax_year) unique key;
   // `tax_jurisdiction` has no year and inserts null-year rows.
-  if (/^tax_\d+\.json$/.test(fileName)) return mapTaxRows(record, fileName, requestIdentifier, artifactUri, sourceSystem);
+  if (/^tax_\d+\.json$/.test(fileName)) {
+    return [
+      mapPropertyChild(
+        "taxes",
+        record,
+        fileName,
+        requestIdentifier,
+        artifactUri,
+        TAX_COLUMNS,
+        sourceSystem,
+      ),
+    ];
+  }
   if (/^property_valuation_/.test(fileName)) {
     return [mapPropertyChild("property_valuations", record, fileName, requestIdentifier, artifactUri, PROPERTY_VALUATION_COLUMNS, sourceSystem)];
   }
@@ -853,79 +865,6 @@ function mapOwnership(params: {
       ownership_identifier: params.ownerKeyPart,
       owned_by: params.ownedBy,
       source_payload: params.record,
-    }),
-  };
-}
-
-/**
- * Map a Lee appraiser tax file and a valuation projection from the same value row.
- *
- * The tax roll's just/market value is also useful as the county-assessed
- * valuation point for parcel detail screens, so one `tax_YYYY.json` source row
- * produces both `taxes` and `property_valuations` when value data exists.
- *
- * @param record - Parsed `tax_YYYY.json` payload.
- * @param fileName - Source data file name.
- * @param requestIdentifier - Lee appraiser folio/request identifier.
- * @param artifactUri - S3 URI of the transformed output ZIP.
- * @returns Prepared tax row plus a derived property valuation row when possible.
- */
-function mapTaxRows(
-  record: JsonObject,
-  fileName: string,
-  requestIdentifier: string,
-  artifactUri: string | null,
-  sourceSystem: SourceSystem,
-): readonly PreparedRow[] {
-  const taxRow = mapPropertyChild("taxes", record, fileName, requestIdentifier, artifactUri, TAX_COLUMNS, sourceSystem);
-  const valuationRow = mapCountyValuationFromTax(record, fileName, requestIdentifier, artifactUri, sourceSystem);
-  return valuationRow === null ? [taxRow] : [taxRow, valuationRow];
-}
-
-/**
- * Project county-assessed value fields from a tax source row into a property valuation row.
- *
- * @param record - Parsed `tax_YYYY.json` source payload containing market or assessed value fields.
- * @param fileName - Tax source data file name used to build a stable source key.
- * @param requestIdentifier - Lee appraiser folio/request identifier.
- * @param artifactUri - S3 URI of the transformed output ZIP.
- * @returns Prepared valuation row when the source includes a usable value; otherwise `null`.
- */
-function mapCountyValuationFromTax(
-  record: JsonObject,
-  fileName: string,
-  requestIdentifier: string,
-  artifactUri: string | null,
-  sourceSystem: SourceSystem,
-): PreparedRow | null {
-  const marketValue = normalizeAppraisalColumnValue("property_market_value_amount", record.property_market_value_amount);
-  const assessedValue = normalizeAppraisalColumnValue("property_assessed_value_amount", record.property_assessed_value_amount);
-  const currentAvmValue = marketValue ?? assessedValue;
-  if (currentAvmValue === null || currentAvmValue === undefined) return null;
-  const taxYear = readInteger(record.tax_year);
-  const valuationPayload = compactObject({
-    request_identifier: requestIdentifier,
-    source_file_name: fileName,
-    tax_year: taxYear,
-    current_avm_value: currentAvmValue,
-    valuation_date: taxYear === null ? null : `${String(taxYear)}-01-01`,
-    valuation_method_type: "LEE_APPRAISER_TAX_ROLL_JUST_VALUE",
-    source_tax_payload: record,
-  });
-  return {
-    tableName: "property_valuations",
-    references: { propertySourceRecordKey: sourceKey(sourceSystem, requestIdentifier, "property", "property") },
-    values: compactObject({
-      ...metadata(
-        sourceSystem,
-        sourceKey(sourceSystem, requestIdentifier, "property_valuation", fileName.replace(/\.json$/, "")),
-        valuationPayload,
-        artifactUri,
-      ),
-      valuation_date: valuationPayload.valuation_date,
-      valuation_method_type: valuationPayload.valuation_method_type,
-      current_avm_value: currentAvmValue,
-      source_payload: valuationPayload,
     }),
   };
 }

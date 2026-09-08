@@ -140,6 +140,13 @@ describe("query table enrichment scope", () => {
     expect(sql).not.toContain("LEFT JOIN permit_counts pc ON pc.parcel_identifier");
   });
 
+  it("selects the latest dated AVM instead of the highest numeric value", () => {
+    const sql = buildQueryTableSql("duval_appraiser", false, false, null);
+    expect(sql).toContain("SELECT DISTINCT ON (pv.property_id)");
+    expect(sql).toContain("pv.valuation_date DESC NULLS LAST");
+    expect(sql).not.toContain("MAX(pv.current_avm_value)");
+  });
+
   it("uses consolidation flags so query rows match their property CIDs", () => {
     const row = applyManifestEnrichment(
       sourceRow({

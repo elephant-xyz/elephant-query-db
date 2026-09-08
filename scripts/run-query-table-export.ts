@@ -657,10 +657,16 @@ export function buildQueryTableSql(
       ORDER BY t.property_id, t.tax_year DESC NULLS LAST
     ),
     avm AS (
-      SELECT pv.property_id, MAX(pv.current_avm_value) AS avm_value
+      SELECT DISTINCT ON (pv.property_id)
+        pv.property_id,
+        pv.current_avm_value AS avm_value
       FROM property_valuations pv
       JOIN county_properties cp ON cp.property_id = pv.property_id
-      GROUP BY pv.property_id
+      WHERE pv.current_avm_value IS NOT NULL
+      ORDER BY
+        pv.property_id,
+        pv.valuation_date DESC NULLS LAST,
+        pv.property_valuation_id DESC
     ),
     structure_pick AS (
       SELECT DISTINCT ON (s.property_id)

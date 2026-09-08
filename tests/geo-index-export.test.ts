@@ -176,3 +176,13 @@ describe("appraisalSourceForCounty", () => {
     expect(appraisalSourceForCounty("lee_appraiser")).toBe("lee_appraiser");
   });
 });
+
+describe("buildGeoIndexSql", () => {
+  it("selects the latest dated AVM instead of the highest numeric value", async () => {
+    const { buildGeoIndexSql } = await import(EXPORT_MODULE);
+    const sql = buildGeoIndexSql(null);
+    expect(sql).toContain("SELECT DISTINCT ON (property_id)");
+    expect(sql).toContain("valuation_date DESC NULLS LAST");
+    expect(sql).not.toContain("MAX(current_avm_value)");
+  });
+});
