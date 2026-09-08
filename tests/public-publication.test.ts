@@ -3,12 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   assertRockIslandArcGisOutFields,
   assertPublicNonPii,
-  buildApprovedValuationsByFolioSql,
   parsePublicPropertyOptions,
   sourceSystemForCounty,
 } from "../scripts/run-public-property-export.js";
 import {
-  buildPublicQueryTableSourceSql,
   buildPublicQueryTableRow,
   readVerifiedGeometryCoordinate,
   type PublicQueryTableSourceRow,
@@ -42,10 +40,7 @@ import {
   assertPropertyCheckpointCid,
   assertRemoteIndexAgreement,
 } from "../scripts/upload-consolidation-to-filebase.js";
-import {
-  buildApprovedValuationsByPropertySql,
-  computeIpfsCid,
-} from "../scripts/run-property-consolidation-export.js";
+import { computeIpfsCid } from "../scripts/run-property-consolidation-export.js";
 
 describe("public property export safety", () => {
   it("rejects denied PII recursively inside source payload", () => {
@@ -582,33 +577,19 @@ describe("bounded geometry repair", () => {
 });
 
 describe("child cardinality SQL", () => {
-  it("counts approved valuations through one property-scoped join", () => {
+  it("counts valuations through one source-scoped property-id join", () => {
     const sql = buildValuationCountByFolioSql();
     expect(sql.match(/JOIN properties/gu)).toHaveLength(1);
     expect(sql).toContain(
       "property.property_id = valuation.property_id",
     );
-    expect(sql).not.toContain(
+    expect(sql).toContain(
       "property.source_system = valuation.source_system",
     );
-    expect(sql).toContain("valuation.publication_permitted IS TRUE");
-    expect(sql.match(/source_system = \$1/gu)).toHaveLength(1);
+    expect(sql.match(/source_system = \$1/gu)).toHaveLength(2);
     expect(sql).not.toMatch(
       /JOIN (taxes|sales_histories|geometries|lots)/u,
     );
-  });
-
-  it("publishes only approved AVMs while allowing a vendor source system", () => {
-    for (const sql of [
-      buildPublicQueryTableSourceSql(),
-      buildApprovedValuationsByFolioSql(),
-      buildApprovedValuationsByPropertySql(),
-    ]) {
-      expect(sql).toContain("publication_permitted IS TRUE");
-      expect(sql).not.toContain(
-        "property.source_system = valuation.source_system",
-      );
-    }
   });
 
   it("retains parcel-only geometry through a nullable property link", () => {

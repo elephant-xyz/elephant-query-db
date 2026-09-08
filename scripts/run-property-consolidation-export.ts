@@ -1664,16 +1664,10 @@ async function fetchGeometries(pool: Pool, propertyIds: readonly string[]): Prom
   return result.rows;
 }
 
-export function buildApprovedValuationsByPropertySql(): string {
-  return `SELECT property_id, valuation_date, current_avm_value, high_value, low_value, confidence_score
-     FROM property_valuations
-     WHERE property_id = ANY($1::uuid[])
-       AND publication_permitted IS TRUE`;
-}
-
 async function fetchValuations(pool: Pool, propertyIds: readonly string[]): Promise<ValuationRow[]> {
   const result = await pool.query<ValuationRow>(
-    buildApprovedValuationsByPropertySql(),
+    `SELECT property_id, valuation_date, current_avm_value, high_value, low_value, confidence_score
+     FROM property_valuations WHERE property_id = ANY($1::uuid[])`,
     [propertyIds],
   );
   return result.rows;

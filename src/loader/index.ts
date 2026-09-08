@@ -2,7 +2,6 @@ export * from "./appraisal.js";
 export * from "./appraisal-geometry.js";
 export * from "./appraisal-source.js";
 export * from "./artifacts.js";
-export * from "./avm.js";
 export * from "./bbb.js";
 export * from "./bulk.js";
 export * from "./curated-sample.js";

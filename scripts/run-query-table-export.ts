@@ -663,7 +663,6 @@ export function buildQueryTableSql(
       FROM property_valuations pv
       JOIN county_properties cp ON cp.property_id = pv.property_id
       WHERE pv.current_avm_value IS NOT NULL
-        AND pv.publication_permitted IS TRUE
       ORDER BY
         pv.property_id,
         pv.valuation_date DESC NULLS LAST,

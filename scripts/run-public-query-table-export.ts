@@ -168,13 +168,19 @@ async function loadCidMap(manifestPath: string): Promise<Map<string, string>> {
 }
 
 /**
- * Build the public scalar query with PII and unapproved AVMs structurally
- * absent from the SQL.
+ * Fetch one public scalar row per parcel folio, with all PII/enrichment tracks
+ * structurally absent from the SQL.
  *
- * @returns Parameterized SQL for exactly one row per source parcel.
+ * @param pool - Connected PostgreSQL pool.
+ * @param sourceSystem - County appraiser source-system key.
+ * @returns Exactly one row per source parcel.
  */
-export function buildPublicQueryTableSourceSql(): string {
-  return `
+async function fetchRows(
+  pool: Pool,
+  sourceSystem: string,
+): Promise<PublicQueryTableSourceRow[]> {
+  const result = await pool.query<PublicQueryTableSourceRow>(
+    `
       WITH first_property AS (
         SELECT DISTINCT ON (request_identifier) *
         FROM properties
@@ -237,8 +243,9 @@ export function buildPublicQueryTableSourceSql(): string {
         FROM property_valuations valuation
         JOIN properties property
           ON property.property_id = valuation.property_id
-        WHERE property.source_system = $1
-          AND valuation.publication_permitted IS TRUE
+         AND property.source_system = valuation.source_system
+        WHERE valuation.source_system = $1
+          AND property.source_system = $1
         ORDER BY
           property.request_identifier,
           valuation.valuation_date DESC NULLS LAST,
@@ -310,15 +317,7 @@ export function buildPublicQueryTableSourceSql(): string {
         AND par.request_identifier IS NOT NULL
         AND par.request_identifier <> ''
       ORDER BY par.request_identifier, par.parcel_id
-    `;
-}
-
-async function fetchRows(
-  pool: Pool,
-  sourceSystem: string,
-): Promise<PublicQueryTableSourceRow[]> {
-  const result = await pool.query<PublicQueryTableSourceRow>(
-    buildPublicQueryTableSourceSql(),
+    `,
     [sourceSystem],
   );
   return result.rows;

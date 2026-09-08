@@ -10,7 +10,6 @@ import {
   numeric,
   pgTable,
   text,
-  timestamp,
   unique,
   uniqueIndex,
   uuid,
@@ -266,7 +265,6 @@ export const propertyValuations = pgTable(
     propertyId: uuid("property_id").references(() => properties.propertyId, {
       onDelete: "cascade",
     }),
-    requestIdentifier: text("request_identifier"),
     valuationDate: date("valuation_date"),
     valuationMethodType: text("valuation_method_type"),
     confidenceScore: integer("confidence_score"),
@@ -282,17 +280,6 @@ export const propertyValuations = pgTable(
       precision: 18,
       scale: 6,
     }),
-    provider: text("provider"),
-    vendorPropertyId: text("vendor_property_id"),
-    countyFips: text("county_fips"),
-    sourceProfileId: text("source_profile_id"),
-    publicationPermitted: boolean("publication_permitted").default(false),
-    publicationApprovedAt: timestamp("publication_approved_at", {
-      withTimezone: true,
-    }),
-    licenseReviewReference: text("license_review_reference"),
-    sourceManifestSha256: text("source_manifest_sha256"),
-    sourceRecordsSha256: text("source_records_sha256"),
     sourcePayload: jsonObjectColumn("source_payload"),
     ...sourceMetadataColumns(),
     createdAt: createdAtColumn(),
@@ -304,45 +291,9 @@ export const propertyValuations = pgTable(
       table.propertyId,
       table.valuationDate,
     ),
-    index("property_valuations_approved_property_date_idx").on(
-      table.propertyId,
-      table.publicationPermitted,
-      table.valuationDate,
-    ),
     check(
       "property_valuations_confidence_score_check",
       sql`${table.confidenceScore} IS NULL OR (${table.confidenceScore} >= 0 AND ${table.confidenceScore} <= 100)`,
-    ),
-    check(
-      "property_valuations_bounds_check",
-      sql`${table.currentAvmValue} IS NULL OR (
-        ${table.currentAvmValue} > 0
-        AND (${table.lowValue} IS NULL OR ${table.lowValue} <= ${table.currentAvmValue})
-        AND (${table.highValue} IS NULL OR ${table.highValue} >= ${table.currentAvmValue})
-      )`,
-    ),
-    check(
-      "property_valuations_publication_approval_check",
-      sql`${table.publicationPermitted} IS NOT TRUE OR (
-        ${table.propertyId} IS NOT NULL
-        AND ${table.requestIdentifier} IS NOT NULL
-        AND ${table.currentAvmValue} IS NOT NULL
-        AND ${table.valuationDate} IS NOT NULL
-        AND ${table.valuationMethodType} IS NOT NULL
-        AND ${table.confidenceScore} IS NOT NULL
-        AND ${table.lowValue} IS NOT NULL
-        AND ${table.highValue} IS NOT NULL
-        AND ${table.provider} IS NOT NULL
-        AND ${table.vendorPropertyId} IS NOT NULL
-        AND ${table.countyFips} ~ '^[0-9]{5}$'
-        AND ${table.sourceProfileId} IS NOT NULL
-        AND ${table.publicationApprovedAt} IS NOT NULL
-        AND ${table.licenseReviewReference} IS NOT NULL
-        AND ${table.sourceRecordHash} ~ '^[a-f0-9]{64}$'
-        AND ${table.sourceArtifactUri} IS NOT NULL
-        AND ${table.sourceManifestSha256} ~ '^[a-f0-9]{64}$'
-        AND ${table.sourceRecordsSha256} ~ '^[a-f0-9]{64}$'
-      )`,
     ),
   ],
 );

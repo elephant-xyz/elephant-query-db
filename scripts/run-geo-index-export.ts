@@ -283,7 +283,6 @@ export function buildGeoIndexSql(limit: number | null): string {
         current_avm_value
       FROM property_valuations
       WHERE current_avm_value IS NOT NULL
-        AND publication_permitted IS TRUE
       ORDER BY
         property_id,
         valuation_date DESC NULLS LAST,

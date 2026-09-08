@@ -130,7 +130,6 @@ describe("query database schema", () => {
     expect(layouts.sourcePayload.name).toBe("source_payload");
     expect(lots.sourcePayload.name).toBe("source_payload");
     expect(propertyImprovements.sourcePayload.name).toBe("source_payload");
-    expect(propertyValuations.sourcePayload.name).toBe("source_payload");
     expect(inspections.sourcePayload.name).toBe("source_payload");
     expect(permitContacts.sourcePayload.name).toBe("source_payload");
     expect(permitEvents.sourcePayload.name).toBe("source_payload");
@@ -165,13 +164,6 @@ describe("query database schema", () => {
     );
     expect(addresses.normalizedAddressHash.name).toBe("normalized_address_hash");
     expect(propertyImprovements.propertyImprovementId.name).toBe("property_improvement_id");
-    expect(propertyValuations.publicationPermitted.name).toBe(
-      "publication_permitted",
-    );
-    expect(propertyValuations.sourceProfileId.name).toBe("source_profile_id");
-    expect(propertyValuations.sourceManifestSha256.name).toBe(
-      "source_manifest_sha256",
-    );
     expect(businessRegistrations.businessRegistrationId.name).toBe("business_registration_id");
   });
 

@@ -154,9 +154,9 @@ const DB_TO_EXPORT = {
 /**
  * Build the valuation count query without joining unrelated child tables.
  *
- * The source-system predicate scopes the parent property; the valuation is
- * instead gated by explicit publication approval so a licensed vendor source
- * can link across source systems.
+ * The source-system predicate is applied on both sides of the property-id join,
+ * preventing cross-source parent matches while preserving one count per
+ * valuation row.
  *
  * @returns Parameterized per-folio valuation count SQL.
  */
@@ -165,9 +165,10 @@ export function buildValuationCountByFolioSql(): string {
             FROM property_valuations valuation
             JOIN properties property
               ON property.property_id = valuation.property_id
-           WHERE property.source_system = $1
-             AND property.request_identifier = $2
-             AND valuation.publication_permitted IS TRUE`;
+             AND property.source_system = valuation.source_system
+           WHERE valuation.source_system = $1
+             AND property.source_system = $1
+             AND property.request_identifier = $2`;
 }
 
 /**

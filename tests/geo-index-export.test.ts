@@ -183,7 +183,6 @@ describe("buildGeoIndexSql", () => {
     const sql = buildGeoIndexSql(null);
     expect(sql).toContain("SELECT DISTINCT ON (property_id)");
     expect(sql).toContain("valuation_date DESC NULLS LAST");
-    expect(sql).toContain("publication_permitted IS TRUE");
     expect(sql).not.toContain("MAX(current_avm_value)");
   });
 });
