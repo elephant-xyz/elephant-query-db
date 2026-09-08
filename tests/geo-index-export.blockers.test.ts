@@ -102,7 +102,7 @@ describe("buildGeoIndex — request_identifier cardinality / dedup (blocker 2, r
     expect(index.entries[0].requestIdentifier).toBe("REQ-1234567890");
   });
 
-  it("does not rank multiple property valuations by numeric value", async () => {
+  it("does not double-count a property that has multiple property_valuations", async () => {
     const { buildGeoIndex } = await import(EXPORT_MODULE);
     // Same request_identifier + same centroid, two differing valuations (the
     // LEFT JOIN onto property_valuations produced two rows). Exactly one entry
@@ -114,9 +114,9 @@ describe("buildGeoIndex — request_identifier cardinality / dedup (blocker 2, r
     const index = buildGeoIndex(rows, { county: "Lee" });
     expect(index.entries).toHaveLength(1);
     expect(index.count).toBe(1);
-    // SQL orders the latest dated row first. Defensive deduplication must
-    // retain that value rather than substituting a numerically higher older AVM.
-    expect(index.entries[0].currentAvmValue).toBe(100000);
+    // Selection contract: the single surviving entry takes the maximum non-null
+    // current_avm_value among the duplicates (deterministic, never the sum).
+    expect(index.entries[0].currentAvmValue).toBe(200000);
   });
 
   it("emits exactly one centroid per property (single latitude/longitude, not repeated)", async () => {

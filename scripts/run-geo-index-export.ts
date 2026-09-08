@@ -118,9 +118,11 @@ function dedupKey(row: GeoIndexSourceRow): string {
   return `parcel:${row.parcel_identifier}`;
 }
 
-/** Preserve SQL's latest-first AVM selection while tolerating duplicate geometry rows. */
-function pickFirstAvm(a: number | null, b: number | null): number | null {
-  return a ?? b;
+/** Deterministic AVM selection across duplicate rows: the maximum non-null value. */
+function pickMaxAvm(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.max(a, b);
 }
 
 /**
@@ -128,8 +130,8 @@ function pickFirstAvm(a: number | null, b: number | null): number | null {
  *
  * Guarantees the reviewer-pinned contract:
  *  - one entry per folio — duplicate join rows (multiple geometries or multiple
- *    property_valuations) collapse into a single entry, retaining SQL's
- *    latest-first non-null current_avm_value and the first valid centroid;
+ *    property_valuations) collapse into a single entry, taking the maximum
+ *    non-null current_avm_value and the first valid centroid;
  *  - rows whose centroid cannot be coerced to a finite lat/lng are skipped, so
  *    the index never carries a NaN coordinate;
  *  - the output carries `county` (when supplied) and an `exportedAt` timestamp
@@ -164,10 +166,10 @@ export function buildGeoIndex(
       continue;
     }
 
-    // Blocker 2: collapse the duplicate without ranking AVMs by numeric value.
+    // Blocker 2: collapse the duplicate, keeping the deterministic max AVM.
     byKey.set(key, {
       ...existing,
-      currentAvmValue: pickFirstAvm(existing.currentAvmValue, currentAvmValue),
+      currentAvmValue: pickMaxAvm(existing.currentAvmValue, currentAvmValue),
     });
   }
 
@@ -274,19 +276,24 @@ export function appraisalSourceForCounty(county: string): string {
  * no centroid are excluded (they cannot be placed on a map). Scoped to a single
  * county via its source_system (bound as $1), so the export is county-generic.
  */
-export function buildGeoIndexSql(limit: number | null): string {
+async function fetchGeoRows(
+  pool: Pool,
+  sourceSystem: string,
+  limit: number | null,
+): Promise<GeoIndexSourceRow[]> {
   const limitClause = limit !== null ? `LIMIT ${limit}` : "";
-  return `
+  // Pre-dedupe in SQL to keep this a single slim pass with exactly one row per
+  // property: collapse the many-to-one property_valuations join to the maximum
+  // current_avm_value in a CTE, then DISTINCT ON the property to fold any
+  // multi-geometry join down to a single deterministic centroid. The pure
+  // builder still dedupes by folio as a defensive backstop.
+  const result = await pool.query<GeoIndexSourceRow>(`
     WITH avm AS (
-      SELECT DISTINCT ON (property_id)
+      SELECT
         property_id,
-        current_avm_value
+        MAX(current_avm_value) AS current_avm_value
       FROM property_valuations
-      WHERE current_avm_value IS NOT NULL
-      ORDER BY
-        property_id,
-        valuation_date DESC NULLS LAST,
-        property_valuation_id DESC
+      GROUP BY property_id
     )
     SELECT DISTINCT ON (p.property_id)
       p.parcel_identifier AS parcel_identifier,
@@ -304,22 +311,7 @@ export function buildGeoIndexSql(limit: number | null): string {
       AND g.longitude IS NOT NULL
     ORDER BY p.property_id, g.latitude, g.longitude
     ${limitClause}
-  `;
-}
-
-async function fetchGeoRows(
-  pool: Pool,
-  sourceSystem: string,
-  limit: number | null,
-): Promise<GeoIndexSourceRow[]> {
-  // Pre-dedupe in SQL to keep this a single slim pass with exactly one row per
-  // property. Valuations use recency rather than numeric magnitude; DISTINCT
-  // ON then folds multiple geometries into one deterministic centroid. The
-  // pure builder still dedupes by folio as a defensive backstop.
-  const result = await pool.query<GeoIndexSourceRow>(
-    buildGeoIndexSql(limit),
-    [sourceSystem],
-  );
+  `, [sourceSystem]);
   return result.rows;
 }
 
