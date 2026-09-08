@@ -430,21 +430,12 @@ async function fetchChildren(
 }
 
 /**
- * Fetch valuation rows through their parent property because the valuation
- * table does not carry request_identifier directly.
+ * Build the query for approved valuation rows through their county property.
  *
- * @param pool - Connected PostgreSQL pool.
- * @param sourceSystem - County appraiser source-system key.
- * @param folios - True request identifiers in the current batch.
- * @returns Valuation rows keyed by their parent property's folio.
+ * @returns Parameterized SQL keyed by the parent property's folio.
  */
-async function fetchValuations(
-  pool: Pool,
-  sourceSystem: string,
-  folios: readonly string[],
-): Promise<ChildRow[]> {
-  const result = await pool.query<ChildRow>(
-    `SELECT p.request_identifier,
+export function buildApprovedValuationsByFolioSql(): string {
+  return `SELECT p.request_identifier,
             v.valuation_date,
             v.current_avm_value,
             v.high_value,
@@ -453,11 +444,19 @@ async function fetchValuations(
        FROM property_valuations v
        JOIN properties p
          ON p.property_id = v.property_id
-        AND p.source_system = v.source_system
-      WHERE v.source_system = $1
-        AND p.source_system = $1
+      WHERE p.source_system = $1
         AND p.request_identifier = ANY($2::text[])
-      ORDER BY p.request_identifier, v.source_record_key`,
+        AND v.publication_permitted IS TRUE
+      ORDER BY p.request_identifier, v.source_record_key`;
+}
+
+async function fetchValuations(
+  pool: Pool,
+  sourceSystem: string,
+  folios: readonly string[],
+): Promise<ChildRow[]> {
+  const result = await pool.query<ChildRow>(
+    buildApprovedValuationsByFolioSql(),
     [sourceSystem, folios],
   );
   return result.rows;

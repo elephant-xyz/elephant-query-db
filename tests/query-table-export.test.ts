@@ -144,6 +144,7 @@ describe("query table enrichment scope", () => {
     const sql = buildQueryTableSql("duval_appraiser", false, false, null);
     expect(sql).toContain("SELECT DISTINCT ON (pv.property_id)");
     expect(sql).toContain("pv.valuation_date DESC NULLS LAST");
+    expect(sql).toContain("pv.publication_permitted IS TRUE");
     expect(sql).not.toContain("MAX(pv.current_avm_value)");
   });
 

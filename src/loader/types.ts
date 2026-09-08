@@ -1,10 +1,12 @@
 export type JsonObject = Record<string, unknown>;
 
-// Appraiser and permit source systems are county-parameterized: the bulk loader
+// Appraiser, AVM, and permit source systems are county/provider-parameterized:
+// the bulk loader
 // derives them from the `--jurisdiction-key` / `--permit-source-system` CLI
 // options (defaulting to `lee_appraiser` / `lee_accela`). The template-literal
 // arms admit any `<county>_appraiser` / `<county>_accela` value (e.g.
 // `orange_appraiser`) while still excluding unrelated strings. The
+// `<provider>_avm` identifies separately licensed valuation feeds. The
 // `<county>_permits` arm covers bulk city permit-portal pulls that are not
 // Accela harvests (e.g. `santa_clara_permits`). Statewide registration sources
 // remain explicit literals so one jurisdiction's semantics cannot leak into
@@ -16,6 +18,7 @@ export type SourceSystem =
   | "sunbiz"
   | "pa_dos"
   | "overture_places"
+  | `${string}_avm`
   | `${string}_appraiser`
   | `${string}_accela`
   | `${string}_permits`;
