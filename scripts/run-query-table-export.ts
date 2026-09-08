@@ -431,15 +431,56 @@ function loadEnvFile(envFile: string): void {
 // ---------------------------------------------------------------------------
 
 type ManifestShape = {
-  readonly entries?: ReadonlyArray<{ readonly propertyId?: string; readonly cid?: string | null }>;
+  readonly entries?: ReadonlyArray<{
+    readonly propertyId?: string;
+    readonly cid?: string | null;
+    readonly hasSunbizTenant?: boolean;
+    readonly hasBbbContractor?: boolean;
+  }>;
 };
 
 /**
- * Load the consolidation manifest and index CIDs by propertyId. Returns an empty
- * map (with a warning) when the manifest is absent — property_cid is then NULL.
+ * Consolidation-derived property publication metadata.
  */
-function loadCidMap(manifestPath: string | null): Map<string, string> {
-  const map = new Map<string, string>();
+export type ManifestPropertyMetadata = {
+  readonly cid: string | null;
+  readonly hasSunbizTenant: boolean | null;
+  readonly hasBbbContractor: boolean | null;
+};
+
+/**
+ * Prefer consolidation-derived enrichment flags because they are generated
+ * from the same records embedded in the published property CID.
+ *
+ * @param row Database query-table row.
+ * @param metadata Consolidation metadata for the same property, when present.
+ * @returns A row whose enrichment flags agree with its consolidated JSON.
+ */
+export function applyManifestEnrichment(
+  row: QueryTableSourceRow,
+  metadata: ManifestPropertyMetadata | undefined,
+): QueryTableSourceRow {
+  if (metadata === undefined) return row;
+  return {
+    ...row,
+    has_sunbiz_tenant:
+      metadata.hasSunbizTenant ?? row.has_sunbiz_tenant,
+    has_bbb_contractor:
+      metadata.hasBbbContractor ?? row.has_bbb_contractor,
+  };
+}
+
+/**
+ * Load consolidation CIDs and enrichment flags by propertyId. Returns an empty
+ * map (with a warning) when the manifest is absent.
+ *
+ * @param manifestPath Path to the consolidation manifest, or null.
+ * @returns Publication metadata keyed by property UUID.
+ */
+function loadManifestMap(
+  manifestPath: string | null,
+): Map<string, ManifestPropertyMetadata> {
+  const map = new Map<string, ManifestPropertyMetadata>();
   if (manifestPath === null) {
     console.warn(
       JSON.stringify({
@@ -452,11 +493,17 @@ function loadCidMap(manifestPath: string | null): Map<string, string> {
 
   const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as ManifestShape;
   for (const entry of parsed.entries ?? []) {
-    if (entry.propertyId !== undefined && entry.cid !== undefined && entry.cid !== null) {
-      map.set(entry.propertyId, entry.cid);
+    if (entry.propertyId !== undefined) {
+      map.set(entry.propertyId, {
+        cid: entry.cid ?? null,
+        hasSunbizTenant: entry.hasSunbizTenant ?? null,
+        hasBbbContractor: entry.hasBbbContractor ?? null,
+      });
     }
   }
-  console.log(JSON.stringify({ event: "manifest_loaded", manifestPath, cidCount: map.size }));
+  console.log(
+    JSON.stringify({ event: "manifest_loaded", manifestPath, cidCount: map.size }),
+  );
   return map;
 }
 
@@ -481,6 +528,7 @@ const NORMALIZED_CP_PARCEL = `regexp_replace(cp.parcel_identifier, '[^0-9]', '',
 /** Florida oracle counties where Sunbiz corporate enrichment is in scope. */
 const FLORIDA_SUNBIZ_COUNTY_KEYS = new Set([
   "lee",
+  "broward",
   "miami-dade",
   "orange",
   "palm-beach",
@@ -812,7 +860,7 @@ async function main(): Promise<void> {
     }),
   );
 
-  const cidMap = loadCidMap(options.manifestPath);
+  const manifestMap = loadManifestMap(options.manifestPath);
 
   const pg = new Pool({
     application_name: "elephant-query-table-export",
@@ -841,9 +889,13 @@ async function main(): Promise<void> {
     let withCid = 0;
     try {
       for (const raw of rows) {
-        const cid = cidMap.get(raw.property_id) ?? null;
+        const metadata = manifestMap.get(raw.property_id);
+        const cid = metadata?.cid ?? null;
         if (cid !== null) withCid += 1;
-        await writer.appendRow(toParquetRecord(buildQueryTableRow(raw, cid)));
+        const sourceRow = applyManifestEnrichment(raw, metadata);
+        await writer.appendRow(
+          toParquetRecord(buildQueryTableRow(sourceRow, cid)),
+        );
         written += 1;
       }
     } finally {

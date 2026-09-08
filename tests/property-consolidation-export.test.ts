@@ -9,9 +9,13 @@ import {
   computeIpfsCid,
   DEFAULT_BATCH_SIZE,
   EMPTY_MANIFEST_STATS,
+  extractContractorLicenseNumbers,
+  isDirectExecution,
   normalizeContractorName,
   parseOptions,
   parseUnnormalizedAddress,
+  resolveBbbProfilesForPermits,
+  resolvePropertyPermits,
   unquoteEnvValue,
 } from "../scripts/run-property-consolidation-export.js";
 
@@ -98,6 +102,26 @@ describe("parseOptions", () => {
     expect(options.limit).toBe(100);
     expect(options.batchSize).toBe(25);
     expect(options.county).toBe("broward");
+  });
+});
+
+describe("isDirectExecution", () => {
+  it("matches entrypoint paths containing spaces", () => {
+    const entrypoint = "/Volumes/example disk/elephant/query-db/export.ts";
+    expect(
+      isDirectExecution(
+        "file:///Volumes/example%20disk/elephant/query-db/export.ts",
+        entrypoint,
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects missing or different entrypoints", () => {
+    const moduleUrl = "file:///Volumes/example/elephant/query-db/export.ts";
+    expect(isDirectExecution(moduleUrl, undefined)).toBe(false);
+    expect(
+      isDirectExecution(moduleUrl, "/Volumes/example/elephant/query-db/other.ts"),
+    ).toBe(false);
   });
 });
 
@@ -659,6 +683,7 @@ describe("assemblePropertyRecord", () => {
   it("maps permits with nested children", () => {
     const permitRow = {
       property_improvement_id: "permit-uuid-1",
+      property_id: "prop-uuid-1",
       parcel_identifier: "1234567890",
       permit_number: "BP-2024-001",
       improvement_type: "BUILDING",
@@ -669,6 +694,7 @@ describe("assemblePropertyRecord", () => {
       project_description: "New roof",
       contractor_company_id: "company-uuid-1",
       contractor_name: "Acme Roofing",
+      licensed_professional: null,
     };
 
     const result = assemblePropertyRecord({
@@ -721,6 +747,102 @@ describe("assemblePropertyRecord", () => {
   });
 });
 
+describe("resolvePropertyPermits", () => {
+  const basePermit = {
+    property_improvement_id: "permit-linked",
+    property_id: "property-1",
+    parcel_identifier: "1234567890",
+    permit_number: "BP-1",
+    improvement_type: "BUILDING",
+    completion_date: null,
+    record_status: null,
+    estimated_job_value: null,
+    estimated_sq_ft: null,
+    project_description: null,
+    contractor_company_id: null,
+    contractor_name: null,
+    licensed_professional: null,
+  };
+
+  it("uses direct property links and only unlinked parcel fallbacks", () => {
+    const linked = new Map([
+      ["property-1", [basePermit]],
+      [
+        "property-2",
+        [
+          {
+            ...basePermit,
+            property_improvement_id: "permit-other-property",
+            property_id: "property-2",
+          },
+        ],
+      ],
+    ]);
+    const unlinked = new Map([
+      [
+        "1234567890",
+        [
+          {
+            ...basePermit,
+            property_improvement_id: "permit-unlinked",
+            property_id: null,
+          },
+        ],
+      ],
+    ]);
+
+    expect(
+      resolvePropertyPermits(linked, unlinked, "property-1", "1234567890").map(
+        (permit) => permit.property_improvement_id,
+      ),
+    ).toEqual(["permit-linked", "permit-unlinked"]);
+  });
+});
+
+describe("BBB contractor evidence", () => {
+  const profile = {
+    business_reputation_profile_id: "bbb-profile-1",
+    name: "ACME ROOFING",
+    legal_name: null,
+    normalized_name: "acme roofing",
+    profile_url: "https://www.bbb.org/example",
+    bbb_rating: "A+",
+    is_accredited: true,
+    review_count: 4,
+    complaint_count: 1,
+  };
+  const permit = {
+    property_improvement_id: "permit-1",
+    property_id: "property-1",
+    parcel_identifier: "1234567890",
+    permit_number: "BP-1",
+    improvement_type: "ROOF",
+    completion_date: null,
+    record_status: null,
+    estimated_job_value: null,
+    estimated_sq_ft: null,
+    project_description: null,
+    contractor_company_id: null,
+    contractor_name: null,
+    licensed_professional: "ACME ROOFING - CCC1234567",
+  };
+
+  it("extracts Hillsborough-compatible Florida contractor licenses", () => {
+    expect(
+      extractContractorLicenseNumbers("Roofing license CCC1234567 / EC987654"),
+    ).toEqual(["CCC1234567", "EC987654"]);
+  });
+
+  it("resolves and deduplicates BBB profiles by contractor license", () => {
+    const profiles = resolveBbbProfilesForPermits(
+      [permit, { ...permit, property_improvement_id: "permit-2" }],
+      new Map(),
+      new Map([["CCC1234567", [profile]]]),
+    );
+    expect(profiles).toEqual([profile]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // buildManifestEntry
 // ---------------------------------------------------------------------------
@@ -734,6 +856,8 @@ describe("buildManifestEntry", () => {
       fileSizeBytes: 4096,
       sha256: "abc123def456",
       cid: "QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco",
+      hasSunbizTenant: true,
+      hasBbbContractor: true,
     });
 
     expect(entry.propertyId).toBe("prop-uuid-abc");
@@ -742,6 +866,8 @@ describe("buildManifestEntry", () => {
     expect(entry.fileSizeBytes).toBe(4096);
     expect(entry.sha256).toBe("abc123def456");
     expect(entry.cid).toBe("QmXoypizjW3WknFiJnKLwHCnL72vedxjQkDDP1mXWo6uco");
+    expect(entry.hasSunbizTenant).toBe(true);
+    expect(entry.hasBbbContractor).toBe(true);
   });
 
   it("accepts null cid", () => {
@@ -755,6 +881,8 @@ describe("buildManifestEntry", () => {
     });
 
     expect(entry.cid).toBeNull();
+    expect(entry.hasSunbizTenant).toBe(false);
+    expect(entry.hasBbbContractor).toBe(false);
   });
 });
 
