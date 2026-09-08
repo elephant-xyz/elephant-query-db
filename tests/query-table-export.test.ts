@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applyManifestEnrichment,
   buildQueryTableRow,
   buildQueryTableParquetSchema,
   buildQueryTableSql,
@@ -114,6 +115,7 @@ describe("query table living-area (Sq Ft) sourcing", () => {
 describe("query table enrichment scope", () => {
   it("includes Sunbiz/BBB joins only for Florida oracle counties", () => {
     expect(includeSunbizBbbEnrichmentInQueryTable("lee")).toBe(true);
+    expect(includeSunbizBbbEnrichmentInQueryTable("broward")).toBe(true);
     expect(includeSunbizBbbEnrichmentInQueryTable("chester")).toBe(false);
     expect(includeSunbizBbbEnrichmentInQueryTable("santa-clara")).toBe(false);
   });
@@ -136,5 +138,22 @@ describe("query table enrichment scope", () => {
     expect(sql).toContain("pi.property_id = cp.property_id");
     expect(sql).toContain("LEFT JOIN permit_counts pc ON pc.property_id = p.property_id");
     expect(sql).not.toContain("LEFT JOIN permit_counts pc ON pc.parcel_identifier");
+  });
+
+  it("uses consolidation flags so query rows match their property CIDs", () => {
+    const row = applyManifestEnrichment(
+      sourceRow({
+        has_sunbiz_tenant: false,
+        has_bbb_contractor: false,
+      }),
+      {
+        cid: "QmExample",
+        hasSunbizTenant: true,
+        hasBbbContractor: true,
+      },
+    );
+
+    expect(row.has_sunbiz_tenant).toBe(true);
+    expect(row.has_bbb_contractor).toBe(true);
   });
 });

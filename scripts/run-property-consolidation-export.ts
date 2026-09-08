@@ -3,6 +3,7 @@ import { createReadStream, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
+import { pathToFileURL } from "node:url";
 
 import { Pool } from "pg";
 
@@ -18,6 +19,26 @@ export type PropertyConsolidationOptions = {
   readonly envFile: string;
   readonly shardSize: number;
 };
+
+/**
+ * Determine whether this module is the process entrypoint, including paths
+ * containing spaces or other characters that require file-URL encoding.
+ *
+ * @param moduleUrl - The current module's canonical `import.meta.url`.
+ * @param entrypoint - The executable script path from `process.argv[1]`.
+ * @returns `true` only when the module URL identifies the executable script.
+ */
+export function isDirectExecution(
+  moduleUrl: string,
+  entrypoint: string | undefined,
+): boolean {
+  if (entrypoint === undefined) return false;
+  try {
+    return moduleUrl === pathToFileURL(entrypoint).href;
+  } catch {
+    return false;
+  }
+}
 
 export const DEFAULT_BATCH_SIZE = 250;
 
@@ -302,6 +323,8 @@ export type ManifestEntry = {
   readonly fileSizeBytes: number;
   readonly sha256: string;
   readonly cid: string | null;
+  readonly hasSunbizTenant: boolean;
+  readonly hasBbbContractor: boolean;
 };
 
 export type ManifestSummary = {
@@ -512,8 +535,9 @@ type ValuationRow = {
   confidence_score: number | null;
 };
 
-type PermitRow = {
+export type PermitRow = {
   property_improvement_id: string;
+  property_id: string | null;
   parcel_identifier: string | null;
   permit_number: string | null;
   improvement_type: string | null;
@@ -524,6 +548,7 @@ type PermitRow = {
   project_description: string | null;
   contractor_company_id: string | null;
   contractor_name: string | null;
+  licensed_professional: string | null;
 };
 
 type PermitContactRow = {
@@ -611,7 +636,7 @@ type SunbizAnnualReportRow = {
   report_date: string | null;
 };
 
-type BbbProfileRow = {
+export type BbbProfileRow = {
   business_reputation_profile_id: string;
   name: string | null;
   legal_name: string | null;
@@ -621,6 +646,12 @@ type BbbProfileRow = {
   is_accredited: boolean | null;
   review_count: number | null;
   complaint_count: number | null;
+};
+
+type BbbLicenseRow = {
+  business_reputation_profile_id: string;
+  license_number: string | null;
+  raw_text: string | null;
 };
 
 type BbbQualityScoreRow = {
@@ -851,6 +882,27 @@ export function normalizeContractorName(value: string | null | undefined): strin
     .trim();
 }
 
+const CONTRACTOR_LICENSE_PATTERN =
+  /\b(?:C[A-Z]{2}\d{5,8}|CCC\d+|CBC\d+|CGC\d+|CMC\d+|CAC\d+|CVC\d+|EC\d+)\b/giu;
+
+/**
+ * Extract normalized Florida contractor licenses using the same evidence
+ * pattern as the Hillsborough multi-trade BBB publication.
+ *
+ * @param value - Permit or BBB license text that may contain one or more licenses.
+ * @returns Unique uppercase alphanumeric license identifiers in source order.
+ */
+export function extractContractorLicenseNumbers(
+  value: string | null | undefined,
+): readonly string[] {
+  const licenses = new Set<string>();
+  for (const match of String(value ?? "").matchAll(CONTRACTOR_LICENSE_PATTERN)) {
+    const license = (match[0] ?? "").toUpperCase().replace(/[^A-Z0-9]/gu, "");
+    if (license.length > 0) licenses.add(license);
+  }
+  return [...licenses];
+}
+
 // ---------------------------------------------------------------------------
 // Grouping helpers
 // ---------------------------------------------------------------------------
@@ -867,6 +919,66 @@ function groupBy<TRow>(rows: readonly TRow[], keyFn: (row: TRow) => string): Map
     }
   }
   return map;
+}
+
+/**
+ * Resolve permits for one property using the durable foreign key first and
+ * parcel text only for permit rows that have not been linked to a property.
+ *
+ * @param linkedByPropertyId - Permit rows grouped by non-null `property_id`.
+ * @param unlinkedByParcelIdentifier - Null-`property_id` permits grouped by normalized parcel identifier.
+ * @param propertyId - Stable property UUID for the consolidated record.
+ * @param normalizedParcelIdentifier - Digits-only parcel identifier used for the unlinked fallback.
+ * @returns Linked permits followed by any still-unlinked permits matching the parcel.
+ */
+export function resolvePropertyPermits(
+  linkedByPropertyId: ReadonlyMap<string, readonly PermitRow[]>,
+  unlinkedByParcelIdentifier: ReadonlyMap<string, readonly PermitRow[]>,
+  propertyId: string,
+  normalizedParcelIdentifier: string,
+): readonly PermitRow[] {
+  return [
+    ...(linkedByPropertyId.get(propertyId) ?? []),
+    ...(unlinkedByParcelIdentifier.get(normalizedParcelIdentifier) ?? []),
+  ];
+}
+
+/**
+ * Resolve all unique BBB profiles evidenced by permit contractor names or
+ * Florida contractor-license identifiers.
+ *
+ * @param permits - Permits already resolved to one property.
+ * @param profilesByName - BBB profiles keyed by normalized organization name.
+ * @param profilesByLicense - BBB profiles keyed by normalized contractor license.
+ * @returns Deduplicated BBB profiles in first-evidence order.
+ */
+export function resolveBbbProfilesForPermits(
+  permits: readonly PermitRow[],
+  profilesByName: ReadonlyMap<string, readonly BbbProfileRow[]>,
+  profilesByLicense: ReadonlyMap<string, readonly BbbProfileRow[]>,
+): readonly BbbProfileRow[] {
+  const matched = new Map<string, BbbProfileRow>();
+  const addProfiles = (profiles: readonly BbbProfileRow[] | undefined): void => {
+    for (const profile of profiles ?? []) {
+      matched.set(profile.business_reputation_profile_id, profile);
+    }
+  };
+
+  for (const permit of permits) {
+    for (const value of [
+      permit.contractor_name,
+      permit.licensed_professional,
+    ]) {
+      const normalizedName = normalizeContractorName(value);
+      if (normalizedName.length > 0) {
+        addProfiles(profilesByName.get(normalizedName));
+      }
+      for (const license of extractContractorLicenseNumbers(value)) {
+        addProfiles(profilesByLicense.get(license));
+      }
+    }
+  }
+  return [...matched.values()];
 }
 
 // ---------------------------------------------------------------------------
@@ -1210,6 +1322,8 @@ export function buildManifestEntry(params: {
   readonly fileSizeBytes: number;
   readonly sha256: string;
   readonly cid: string | null;
+  readonly hasSunbizTenant?: boolean;
+  readonly hasBbbContractor?: boolean;
 }): ManifestEntry {
   return {
     propertyId: params.propertyId,
@@ -1218,6 +1332,8 @@ export function buildManifestEntry(params: {
     fileSizeBytes: params.fileSizeBytes,
     sha256: params.sha256,
     cid: params.cid,
+    hasSunbizTenant: params.hasSunbizTenant ?? false,
+    hasBbbContractor: params.hasBbbContractor ?? false,
   };
 }
 
@@ -1557,16 +1673,26 @@ async function fetchValuations(pool: Pool, propertyIds: readonly string[]): Prom
   return result.rows;
 }
 
-async function fetchPermits(pool: Pool, normalizedParcelIds: readonly string[]): Promise<PermitRow[]> {
-  if (normalizedParcelIds.length === 0) return [];
+async function fetchPermits(
+  pool: Pool,
+  propertyIds: readonly string[],
+  normalizedParcelIds: readonly string[],
+): Promise<PermitRow[]> {
+  if (propertyIds.length === 0 && normalizedParcelIds.length === 0) return [];
   const result = await pool.query<PermitRow>(
-    `SELECT pi.property_improvement_id, pi.parcel_identifier, pi.permit_number, pi.improvement_type,
+    `SELECT pi.property_improvement_id, pi.property_id, pi.parcel_identifier,
+            pi.permit_number, pi.improvement_type,
             pi.completion_date, pi.record_status, pi.estimated_job_value, pi.estimated_sq_ft,
-            pi.project_description, pi.contractor_company_id, c.name AS contractor_name
+            pi.project_description, pi.contractor_company_id, c.name AS contractor_name,
+            pi.licensed_professional
      FROM property_improvements pi
      LEFT JOIN companies c ON c.company_id = pi.contractor_company_id
-     WHERE pi.parcel_identifier = ANY($1)`,
-    [normalizedParcelIds],
+     WHERE pi.property_id = ANY($1::uuid[])
+        OR (
+          pi.property_id IS NULL
+          AND pi.parcel_identifier = ANY($2::text[])
+        )`,
+    [propertyIds, normalizedParcelIds],
   );
   return result.rows;
 }
@@ -1681,40 +1807,20 @@ async function fetchSunbizAnnualReports(pool: Pool, registrationIds: readonly st
   return result.rows;
 }
 
-async function fetchBbbProfiles(pool: Pool, contractorNames: readonly string[]): Promise<BbbProfileRow[]> {
-  if (contractorNames.length === 0) return [];
-  // Mirror catalog's contractor-bbb-db.mjs: derive first useful search token per
-  // contractor name, then ILIKE-search business_reputation_profiles by name/legal_name/
-  // normalized_name.  Exact matching (normalizeContractorName) happens in JS after fetch.
-  const tokens = [
-    ...new Set(
-      contractorNames
-        .map((name) => {
-          const normalized = normalizeContractorName(name);
-          return (
-            normalized
-              .split(" ")
-              .find((part) => part.length >= 4 && !["inc", "llc", "corp"].includes(part)) ??
-            normalized.split(" ")[0] ??
-            ""
-          );
-        })
-        .filter((t) => t.length > 0),
-    ),
-  ];
-  if (tokens.length === 0) return [];
-  const patterns = tokens.map((t) => `%${t}%`);
+async function fetchAllBbbProfiles(pool: Pool): Promise<BbbProfileRow[]> {
   const result = await pool.query<BbbProfileRow>(
     `SELECT business_reputation_profile_id, name, legal_name, normalized_name, profile_url,
             bbb_rating, is_accredited, review_count, complaint_count
      FROM business_reputation_profiles
-     WHERE provider ILIKE '%bbb%'
-       AND (
-         name ILIKE ANY($1)
-         OR legal_name ILIKE ANY($1)
-         OR normalized_name ILIKE ANY($1)
-       )`,
-    [patterns],
+     WHERE provider ILIKE '%bbb%'`,
+  );
+  return result.rows;
+}
+
+async function fetchAllBbbLicenses(pool: Pool): Promise<BbbLicenseRow[]> {
+  const result = await pool.query<BbbLicenseRow>(
+    `SELECT business_reputation_profile_id, license_number, raw_text
+     FROM business_reputation_licenses`,
   );
   return result.rows;
 }
@@ -1810,6 +1916,92 @@ async function main(): Promise<void> {
       return;
     }
 
+    const [bbbProfiles, bbbLicenses] = await Promise.all([
+      fetchAllBbbProfiles(pg),
+      fetchAllBbbLicenses(pg),
+    ]);
+    const bbbProfileIds = bbbProfiles.map(
+      (profile) => profile.business_reputation_profile_id,
+    );
+    const [
+      allBbbQualityScores,
+      allBbbReviews,
+      allBbbComplaints,
+    ] = await Promise.all([
+      bbbProfileIds.length === 0
+        ? Promise.resolve([])
+        : fetchBbbQualityScores(pg, bbbProfileIds),
+      bbbProfileIds.length === 0
+        ? Promise.resolve([])
+        : fetchBbbReviews(pg, bbbProfileIds),
+      bbbProfileIds.length === 0
+        ? Promise.resolve([])
+        : fetchBbbComplaints(pg, bbbProfileIds),
+    ]);
+
+    const bbbProfilesByNormalizedName = new Map<string, BbbProfileRow[]>();
+    const bbbProfilesByLicense = new Map<string, BbbProfileRow[]>();
+    const addBbbIndexEntry = (
+      index: Map<string, BbbProfileRow[]>,
+      key: string,
+      profile: BbbProfileRow,
+    ): void => {
+      const current = index.get(key) ?? [];
+      if (
+        !current.some(
+          (candidate) =>
+            candidate.business_reputation_profile_id ===
+            profile.business_reputation_profile_id,
+        )
+      ) {
+        current.push(profile);
+        index.set(key, current);
+      }
+    };
+    const bbbProfilesById = new Map(
+      bbbProfiles.map((profile) => [
+        profile.business_reputation_profile_id,
+        profile,
+      ]),
+    );
+    for (const profile of bbbProfiles) {
+      for (const value of [
+        profile.name,
+        profile.legal_name,
+        profile.normalized_name,
+      ]) {
+        const key = normalizeContractorName(value);
+        if (key.length > 0) {
+          addBbbIndexEntry(bbbProfilesByNormalizedName, key, profile);
+        }
+      }
+    }
+    for (const licenseRow of bbbLicenses) {
+      const profile = bbbProfilesById.get(
+        licenseRow.business_reputation_profile_id,
+      );
+      if (profile === undefined) continue;
+      for (const value of [licenseRow.license_number, licenseRow.raw_text]) {
+        for (const license of extractContractorLicenseNumbers(value)) {
+          addBbbIndexEntry(bbbProfilesByLicense, license, profile);
+        }
+      }
+    }
+    const bbbQualityScoreMap = new Map(
+      allBbbQualityScores.map((score) => [
+        score.business_reputation_profile_id,
+        score,
+      ]),
+    );
+    const bbbReviewMap = groupBy(
+      allBbbReviews,
+      (review) => review.business_reputation_profile_id,
+    );
+    const bbbComplaintMap = groupBy(
+      allBbbComplaints,
+      (complaint) => complaint.business_reputation_profile_id,
+    );
+
     // 2. Process properties in batches. Related rows are fetched and discarded
     //    per batch so peak memory = one batch's data, not the full dataset.
     const collectedAt = new Date().toISOString();
@@ -1862,18 +2054,11 @@ async function main(): Promise<void> {
         fetchFiles(pg, propertyIds),
         fetchGeometries(pg, propertyIds),
         fetchValuations(pg, propertyIds),
-        fetchPermits(pg, normalizedParcelIdentifiers),
+        fetchPermits(pg, propertyIds, normalizedParcelIdentifiers),
       ]);
 
-      // Round 2: fetch permit children + Sunbiz/BBB data for this batch
+      // Round 2: fetch permit children + Sunbiz data for this batch.
       const permitIds = permits.map((p) => p.property_improvement_id);
-      const contractorNames = [
-        ...new Set(
-          permits
-            .map((p) => p.contractor_name)
-            .filter((n): n is string => n !== null && n.trim().length > 0),
-        ),
-      ];
 
       const addressMap = new Map(addresses.map((a) => [a.address_id, a]));
       const normalizedAddressKeys = [
@@ -1892,7 +2077,6 @@ async function main(): Promise<void> {
         permitLinks,
         inspections,
         sunbizRegistrations,
-        bbbProfiles,
       ] = await Promise.all([
         fetchPermitContacts(pg, permitIds),
         fetchPermitCustomFields(pg, permitIds),
@@ -1901,26 +2085,18 @@ async function main(): Promise<void> {
         fetchPermitLinks(pg, permitIds),
         fetchInspections(pg, permitIds),
         fetchSunbizRegistrations(pg, normalizedAddressKeys),
-        fetchBbbProfiles(pg, contractorNames),
       ]);
 
       const sunbizRegistrationIds = sunbizRegistrations.map((r) => r.business_registration_id);
-      const bbbProfileIds = bbbProfiles.map((p) => p.business_reputation_profile_id);
 
       const [
         sunbizAddresses,
         sunbizParties,
         sunbizAnnualReports,
-        bbbQualityScores,
-        bbbReviews,
-        bbbComplaints,
       ] = await Promise.all([
         fetchSunbizAddresses(pg, sunbizRegistrationIds),
         fetchSunbizParties(pg, sunbizRegistrationIds),
         fetchSunbizAnnualReports(pg, sunbizRegistrationIds),
-        fetchBbbQualityScores(pg, bbbProfileIds),
-        fetchBbbReviews(pg, bbbProfileIds),
-        fetchBbbComplaints(pg, bbbProfileIds),
       ]);
 
       // Build in-memory lookup maps scoped to this batch
@@ -1938,8 +2114,13 @@ async function main(): Promise<void> {
       const geometryMap = groupBy(geometries, (r) => r.property_id);
       const valuationMap = groupBy(valuations, (r) => r.property_id);
 
-      const permitsByNormalizedParcel = groupBy(permits, (r) =>
-        r.parcel_identifier !== null ? r.parcel_identifier : "",
+      const linkedPermitsByPropertyId = groupBy(
+        permits.filter((row) => row.property_id !== null),
+        (row) => row.property_id ?? "",
+      );
+      const unlinkedPermitsByNormalizedParcel = groupBy(
+        permits.filter((row) => row.property_id === null),
+        (row) => row.parcel_identifier ?? "",
       );
       const permitContactMap = groupBy(permitContacts, (r) => r.property_improvement_id);
       const permitCustomFieldMap = groupBy(permitCustomFields, (r) => r.property_improvement_id);
@@ -1953,22 +2134,6 @@ async function main(): Promise<void> {
       const sunbizPartyMap = groupBy(sunbizParties, (r) => r.business_registration_id);
       const sunbizAnnualReportMap = groupBy(sunbizAnnualReports, (r) => r.business_registration_id);
 
-      // BBB profiles keyed by every normalized name variant they carry
-      // (name, legal_name, normalized_name).  A single profile can match under
-      // multiple keys so we build the map explicitly rather than using groupBy.
-      const bbbProfilesByNormalizedName = new Map<string, BbbProfileRow>();
-      for (const profile of bbbProfiles) {
-        for (const raw of [profile.name, profile.legal_name, profile.normalized_name]) {
-          const key = normalizeContractorName(raw);
-          if (key.length > 0 && !bbbProfilesByNormalizedName.has(key)) {
-            bbbProfilesByNormalizedName.set(key, profile);
-          }
-        }
-      }
-      const bbbQualityScoreMap = new Map(bbbQualityScores.map((s) => [s.business_reputation_profile_id, s]));
-      const bbbReviewMap = groupBy(bbbReviews, (r) => r.business_reputation_profile_id);
-      const bbbComplaintMap = groupBy(bbbComplaints, (r) => r.business_reputation_profile_id);
-
       // Assemble and write each property in this batch
       let batchWritten = 0;
 
@@ -1976,7 +2141,12 @@ async function main(): Promise<void> {
         const parcel = property.parcel_id !== null ? (parcelMap.get(property.parcel_id) ?? null) : null;
         const address = property.address_id !== null ? (addressMap.get(property.address_id) ?? null) : null;
         const propertyNormalizedParcel = normalizeParcelIdentifier(property.parcel_identifier);
-        const propertyPermits = permitsByNormalizedParcel.get(propertyNormalizedParcel) ?? [];
+        const propertyPermits = resolvePropertyPermits(
+          linkedPermitsByPropertyId,
+          unlinkedPermitsByNormalizedParcel,
+          property.property_id,
+          propertyNormalizedParcel,
+        );
 
         const permitsWithChildren: PermitWithChildren[] = propertyPermits.map((permit) => ({
           permit,
@@ -1997,21 +2167,11 @@ async function main(): Promise<void> {
           annualReports: sunbizAnnualReportMap.get(reg.business_registration_id) ?? [],
         }));
 
-        // Match each permit's contractor name to BBB profiles by normalized name key.
-        // Deduplicate profiles so the same BBB entry isn't attached twice if two
-        // permits on the property share the same contractor.
-        const bbbProfileIdsSeen = new Set<string>();
-        const bbbProfilesForProperty: BbbProfileRow[] = [];
-        for (const permit of propertyPermits) {
-          if (permit.contractor_name === null) continue;
-          const key = normalizeContractorName(permit.contractor_name);
-          if (key.length === 0) continue;
-          const profile = bbbProfilesByNormalizedName.get(key);
-          if (profile !== undefined && !bbbProfileIdsSeen.has(profile.business_reputation_profile_id)) {
-            bbbProfileIdsSeen.add(profile.business_reputation_profile_id);
-            bbbProfilesForProperty.push(profile);
-          }
-        }
+        const bbbProfilesForProperty = resolveBbbProfilesForPermits(
+          propertyPermits,
+          bbbProfilesByNormalizedName,
+          bbbProfilesByLicense,
+        );
         const bbbProfilesWithChildren: BbbProfileWithChildren[] = bbbProfilesForProperty.map((profile) => ({
           profile,
           qualityScore: bbbQualityScoreMap.get(profile.business_reputation_profile_id) ?? null,
@@ -2070,6 +2230,8 @@ async function main(): Promise<void> {
           fileSizeBytes: buffer.length,
           sha256,
           cid,
+          hasSunbizTenant: sunbizTenantsWithChildren.length > 0,
+          hasBbbContractor: bbbCount > 0,
         });
         manifestEntries.push(entry);
         if (bbbCount > 0) {
@@ -2127,8 +2289,7 @@ async function main(): Promise<void> {
 }
 
 // Only run when invoked directly as a script — not when imported (e.g. by tests).
-// Mirrors the entrypoint guard used by the sibling scripts in this directory.
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (isDirectExecution(import.meta.url, process.argv[1])) {
   main().catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     console.error(JSON.stringify({ event: "property_consolidation_export_failed", error: message }));
