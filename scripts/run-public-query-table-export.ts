@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { ParquetWriter } from "@dsnp/parquetjs";
 import { Pool } from "pg";
 
+import { mintSitusAddressIdentity } from "../src/loader/address-signature.js";
 import {
   buildQueryTableParquetSchema,
   type QueryTableRow,
@@ -342,6 +343,13 @@ export function buildPublicQueryTableRow(
   const verifiedCoordinate = readVerifiedGeometryCoordinate(
     row.geometry_source_payload,
   );
+  const addressStreet = row.address_street ?? parsedSiteAddress.street;
+  const addressZip = row.address_zip ?? parsedSiteAddress.postalCode;
+  const identity = mintSitusAddressIdentity({
+    state: row.state_code,
+    postalCode: addressZip,
+    street: addressStreet,
+  });
   return {
     property_id: row.property_id,
     property_cid: cid,
@@ -350,9 +358,11 @@ export function buildPublicQueryTableRow(
     source_system: row.source_system,
     county_name: row.county_name,
     state_code: row.state_code,
-    address_street: row.address_street ?? parsedSiteAddress.street,
+    address_street: addressStreet,
     address_city: row.address_city ?? parsedSiteAddress.city,
-    address_zip: row.address_zip ?? parsedSiteAddress.postalCode,
+    address_zip: addressZip,
+    elephant_uuid: identity?.elephantUuid ?? null,
+    elephant_token: identity?.elephantToken ?? null,
     latitude: verifiedCoordinate.latitude ?? numberOrNull(row.latitude),
     longitude: verifiedCoordinate.longitude ?? numberOrNull(row.longitude),
     lot_size_acre:

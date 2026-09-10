@@ -28,6 +28,7 @@ function sourceRow(overrides: Partial<QueryTableSourceRow>): QueryTableSourceRow
     street_suffix_type: null,
     city_name: null,
     postal_code: null,
+    unit_identifier: null,
     unnormalized_address: null,
     situs_full_address: null,
     latitude: null,
@@ -109,6 +110,47 @@ describe("query table living-area (Sq Ft) sourcing", () => {
     const schema = buildQueryTableParquetSchema();
 
     expect(schema.schema.livable_floor_area).toMatchObject({ type: "DOUBLE" });
+    expect(schema.schema.elephant_uuid).toMatchObject({ type: "UTF8" });
+    expect(schema.schema.elephant_token).toMatchObject({ type: "UTF8" });
+  });
+
+  it("mints address:v1 elephant ids from situs street, Oracle state, and ZIP5", () => {
+    const row = buildQueryTableRow(
+      sourceRow({
+        situs_full_address: "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+        state_code: "FL",
+      }),
+      null,
+    );
+
+    expect(row.address_street).toBe("11659 JONATHAN RD");
+    expect(row.address_zip).toBe("32225");
+    expect(row.elephant_uuid).toBe("c3a982a7-1102-50b8-b2cd-6cb3fca2060f");
+    expect(row.elephant_token).toBe(
+      "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+    );
+  });
+
+  it("does not mix owner-mailing unit or ZIP into the situs identity", () => {
+    const row = buildQueryTableRow(
+      sourceRow({
+        situs_full_address: "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+        state_code: "FL",
+        street_number: "1",
+        street_name: "MAILING",
+        street_suffix_type: "ST",
+        postal_code: "10001",
+        unit_identifier: "APT 2",
+      }),
+      null,
+    );
+
+    expect(row.address_street).toBe("11659 JONATHAN RD");
+    expect(row.address_zip).toBe("32225");
+    expect(row.elephant_uuid).toBe("c3a982a7-1102-50b8-b2cd-6cb3fca2060f");
+    expect(row.elephant_token).toBe(
+      "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+    );
   });
 });
 
@@ -129,6 +171,7 @@ describe("query table enrichment scope", () => {
     const sql = buildQueryTableSql("chester_appraiser", false, true, null);
     expect(sql).toContain("pa_dos_keys");
     expect(sql).toContain("has_pa_corp_tenant");
+    expect(sql).not.toContain("unit_identifier");
     expect(sql).not.toContain("sunbiz_keys");
   });
 

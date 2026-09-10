@@ -1,3 +1,4 @@
+export * from "./address-signature.js";
 export * from "./appraisal.js";
 export * from "./appraisal-geometry.js";
 export * from "./appraisal-source.js";

@@ -561,6 +561,8 @@ describe("assemblePropertyRecord", () => {
     expect(result.address.street).toBeNull();
     expect(result.address.city).toBeNull();
     expect(result.address.latitude).toBeNull();
+    expect(result.address.elephantUuid).toBeNull();
+    expect(result.address.elephantToken).toBeNull();
   });
 
   it("derives street/city/postalCode from unnormalized_address when structured columns are null (appraisal source)", () => {
@@ -605,6 +607,100 @@ describe("assemblePropertyRecord", () => {
     expect(result.address.city).toBe("FORT MYERS");
     expect(result.address.state).toBe("FL");
     expect(result.address.postalCode).toBe("33905");
+    expect(result.address.elephantUuid).not.toBeNull();
+    expect(result.address.elephantToken).not.toBeNull();
+  });
+
+  it("mints address:v1 elephant ids without changing source address fields", () => {
+    const address = {
+      address_id: "addr-opendoor-1",
+      street_number: "11659",
+      street_name: "JONATHAN",
+      street_suffix_type: "RD",
+      city_name: "JACKSONVILLE",
+      state_code: "FL",
+      postal_code: "32225-1234",
+      latitude: null,
+      longitude: null,
+      unnormalized_address: "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+      normalized_address_key: "11659-jonathan-rd-jacksonville-fl-32225",
+    };
+
+    const result = assemblePropertyRecord({
+      property: mockProperty,
+      parcel: mockParcel,
+      address,
+      taxes: [],
+      salesHistories: [],
+      structures: [],
+      layouts: [],
+      lots: [],
+      floodStorm: [],
+      utilities: [],
+      ownerships: [],
+      deeds: [],
+      files: [],
+      geometries: [],
+      valuations: [],
+      permits: [],
+      sunbizTenants: [],
+      bbbProfiles: [],
+      county: "duval",
+      collectedAt: "2026-09-10T16:00:00.000Z",
+    });
+
+    expect(address.postal_code).toBe("32225-1234");
+    expect(address.state_code).toBe("FL");
+    expect(result.address.street).toBe("11659 JONATHAN RD");
+    expect(result.address.elephantUuid).toBe(
+      "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+    );
+    expect(result.address.elephantToken).toBe(
+      "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+    );
+  });
+
+  it("hashes unit_identifier only with the same mailing street/ZIP, not a situs mix", () => {
+    const withUnit = assemblePropertyRecord({
+      property: mockProperty,
+      parcel: mockParcel,
+      address: {
+        address_id: "addr-opendoor-1",
+        street_number: "11659",
+        street_name: "JONATHAN",
+        street_suffix_type: "RD",
+        unit_identifier: "APT 2",
+        city_name: "JACKSONVILLE",
+        state_code: "FL",
+        postal_code: "32225",
+        latitude: null,
+        longitude: null,
+        unnormalized_address: "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+        normalized_address_key: "11659-jonathan-rd-jacksonville-fl-32225",
+      },
+      taxes: [],
+      salesHistories: [],
+      structures: [],
+      layouts: [],
+      lots: [],
+      floodStorm: [],
+      utilities: [],
+      ownerships: [],
+      deeds: [],
+      files: [],
+      geometries: [],
+      valuations: [],
+      permits: [],
+      sunbizTenants: [],
+      bbbProfiles: [],
+      county: "duval",
+      collectedAt: "2026-09-10T16:00:00.000Z",
+    });
+
+    expect(withUnit.address.street).toBe("11659 JONATHAN RD");
+    expect(withUnit.address.elephantUuid).not.toBe(
+      "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+    );
   });
 
   it("leaves state null (not a wrong parsed value) when state_code is null", () => {

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Pool } from "pg";
 import { ParquetSchema, ParquetWriter } from "@dsnp/parquetjs";
 
+import { mintSitusAddressIdentity } from "../src/loader/address-signature.js";
 import {
   appraisalSourceForCounty,
   parseUnnormalizedAddress,
@@ -62,6 +63,12 @@ export type QueryTableSourceRow = {
   readonly street_suffix_type: string | null;
   readonly city_name: string | null;
   readonly postal_code: string | null;
+  /**
+   * Owner-mailing unit from `addresses.unit_identifier`. Not a situs field.
+   * `buildQueryTableRow` must not pass this into identity; tests set it to
+   * prove mailing units cannot change the situs uuid/token.
+   */
+  readonly unit_identifier: string | null;
   readonly unnormalized_address: string | null;
   readonly situs_full_address: string | null;
   readonly latitude: string | null;
@@ -112,6 +119,8 @@ export type QueryTableRow = {
   readonly address_street: string | null;
   readonly address_city: string | null;
   readonly address_zip: string | null;
+  readonly elephant_uuid: string | null;
+  readonly elephant_token: string | null;
   readonly latitude: number | null;
   readonly longitude: number | null;
   readonly lot_size_acre: number | null;
@@ -242,6 +251,11 @@ function resolveSitusAddress(row: QueryTableSourceRow): ResolvedAddress {
  */
 export function buildQueryTableRow(row: QueryTableSourceRow, cid: string | null): QueryTableRow {
   const address = resolveSitusAddress(row);
+  const identity = mintSitusAddressIdentity({
+    state: toText(row.state_code),
+    postalCode: address.zip,
+    street: address.street,
+  });
 
   const lotAreaSqft = toNumber(row.lot_area_sqft);
   const lotSizeAcre =
@@ -258,6 +272,8 @@ export function buildQueryTableRow(row: QueryTableSourceRow, cid: string | null)
     address_street: address.street,
     address_city: address.city,
     address_zip: address.zip,
+    elephant_uuid: identity?.elephantUuid ?? null,
+    elephant_token: identity?.elephantToken ?? null,
     latitude: toNumber(row.latitude),
     longitude: toNumber(row.longitude),
     lot_size_acre: lotSizeAcre,
@@ -314,6 +330,8 @@ export function buildQueryTableParquetSchema(): ParquetSchema {
     address_street: { type: "UTF8", optional: true },
     address_city: { type: "UTF8", optional: true },
     address_zip: { type: "UTF8", optional: true },
+    elephant_uuid: { type: "UTF8", optional: true },
+    elephant_token: { type: "UTF8", optional: true },
     latitude: { type: "DOUBLE", optional: true },
     longitude: { type: "DOUBLE", optional: true },
     lot_size_acre: { type: "DOUBLE", optional: true },

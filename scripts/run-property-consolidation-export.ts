@@ -7,6 +7,8 @@ import { pathToFileURL } from "node:url";
 
 import { Pool } from "pg";
 
+import { mintAddressIdentity } from "../src/loader/address-signature.js";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -49,6 +51,8 @@ type AddressShape = {
   readonly postalCode: string | null;
   readonly latitude: string | null;
   readonly longitude: string | null;
+  readonly elephantUuid: string | null;
+  readonly elephantToken: string | null;
 };
 
 type PropertyShape = {
@@ -419,6 +423,7 @@ type AddressRow = {
   street_number: string | null;
   street_name: string | null;
   street_suffix_type: string | null;
+  unit_identifier?: string | null;
   city_name: string | null;
   state_code: string | null;
   postal_code: string | null;
@@ -1049,13 +1054,30 @@ export function assemblePropertyRecord(params: AssembleParams): ConsolidatedProp
   // Structured columns, when present, always win over the parsed fallback.
   const parsed = parseUnnormalizedAddress(address?.unnormalized_address ?? null);
 
+  const street = structuredStreet ?? parsed.street;
+  const postalCode = address?.postal_code ?? parsed.postalCode;
+  const state = address?.state_code ?? null;
+  // Street, postal, and unit all come from this same `addresses` row (owner
+  // mailing when structured columns are populated). Do not mix in a situs
+  // parse for some fields and mailing `unit_identifier` for others — that is
+  // what the query-table publisher must also avoid, via mintSitusAddressIdentity.
+  const identity = mintAddressIdentity({
+    country: "us",
+    state,
+    postalCode,
+    street,
+    unit: address?.unit_identifier ?? null,
+  });
+
   const addressShape: AddressShape = {
-    street: structuredStreet ?? parsed.street,
+    street,
     city: address?.city_name ?? parsed.city,
-    state: address?.state_code ?? null,
-    postalCode: address?.postal_code ?? parsed.postalCode,
+    state,
+    postalCode,
     latitude: address?.latitude ?? null,
     longitude: address?.longitude ?? null,
+    elephantUuid: identity?.elephantUuid ?? null,
+    elephantToken: identity?.elephantToken ?? null,
   };
 
   const propertyShape: PropertyShape = {
@@ -1554,7 +1576,7 @@ async function fetchAddresses(pool: Pool, addressIds: readonly string[]): Promis
   if (addressIds.length === 0) return [];
   const result = await pool.query<AddressRow>(
     `SELECT address_id, street_number, street_name, street_suffix_type,
-            city_name, state_code, postal_code, latitude, longitude,
+            unit_identifier, city_name, state_code, postal_code, latitude, longitude,
             unnormalized_address, normalized_address_key
      FROM addresses WHERE address_id = ANY($1::uuid[])`,
     [addressIds],
