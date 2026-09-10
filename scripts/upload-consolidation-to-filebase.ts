@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -16,6 +17,7 @@ import type {
   HandlerExecutionContext,
 } from "@smithy/types";
 
+import { assertAddressIdentity } from "../src/loader/address-signature.js";
 import { computeIpfsCid } from "./run-property-consolidation-export.js";
 import type { IndexFile, ManifestEntry, ManifestSummary } from "./run-property-consolidation-export.js";
 import {
@@ -70,6 +72,60 @@ export function assertPropertyCheckpointCid(
     throw new Error(
       `Stale property checkpoint CID mismatch for ${key}: refusing changed content`,
     );
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Validate one consolidated property JSON address before any public write. */
+export function assertConsolidatedPropertyAddressIdentity(
+  body: Buffer,
+  key: string,
+): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString("utf8")) as unknown;
+  } catch {
+    throw new Error(`Invalid property JSON for ${key}`);
+  }
+  if (!isRecord(parsed)) {
+    throw new Error(`Property JSON must be an object for ${key}`);
+  }
+  const address = parsed["address"];
+  if (address === null) return;
+  if (!isRecord(address)) {
+    throw new Error(`Property address must be an object or null for ${key}`);
+  }
+  try {
+    assertAddressIdentity(
+      {
+        country: "us",
+        state:
+          typeof address["state"] === "string" ? address["state"] : null,
+        postalCode:
+          typeof address["postalCode"] === "string"
+            ? address["postalCode"]
+            : null,
+        street:
+          typeof address["street"] === "string" ? address["street"] : null,
+        unit: typeof address["unit"] === "string" ? address["unit"] : null,
+      },
+      {
+        elephantUuid:
+          typeof address["elephantUuid"] === "string"
+            ? address["elephantUuid"]
+            : null,
+        elephantToken:
+          typeof address["elephantToken"] === "string"
+            ? address["elephantToken"]
+            : null,
+      },
+    );
+  } catch (caught) {
+    const message = caught instanceof Error ? caught.message : String(caught);
+    throw new Error(`Address identity validation failed for ${key}: ${message}`);
   }
 }
 
@@ -696,6 +752,28 @@ async function main(): Promise<void> {
     }
     assertPropertyCheckpointCid(alreadyUploaded.get(key), entry.cid, key);
   }
+  await runBoundedWorkerPool(
+    entries,
+    Math.min(options.concurrency, 32),
+    async (entry) => {
+      const key = `properties/${entry.propertyId}.json`;
+      const body = await readFile(join(options.exportDir, key));
+      assertConsolidatedPropertyAddressIdentity(body, key);
+      const sha256 = createHash("sha256").update(body).digest("hex");
+      const cid = await computeIpfsCid(body);
+      if (sha256 !== entry.sha256 || cid !== entry.cid) {
+        throw new Error(
+          `Property content does not match the immutable manifest for ${key}`,
+        );
+      }
+    },
+  );
+  console.log(
+    JSON.stringify({
+      event: "property_identity_preflight_passed",
+      count: entries.length,
+    }),
+  );
   const client = buildS3Client(options);
 
   const progress = createUploadProgress(totalUploadCount);

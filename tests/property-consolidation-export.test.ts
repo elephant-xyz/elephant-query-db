@@ -698,6 +698,7 @@ describe("assemblePropertyRecord", () => {
     });
 
     expect(withUnit.address.street).toBe("11659 JONATHAN RD");
+    expect(withUnit.address.unit).toBe("APT 2");
     expect(withUnit.address.elephantUuid).not.toBe(
       "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
     );

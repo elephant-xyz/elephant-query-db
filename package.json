@@ -54,6 +54,7 @@
     "export:query-table": "tsx scripts/run-query-table-export.ts",
     "export:public-query-table": "tsx scripts/run-public-query-table-export.ts",
     "export:public-corporate-registration": "tsx scripts/run-public-corporate-registration-export.ts",
+    "backfill:query-table-identities": "tsx scripts/backfill-query-table-address-identities.ts",
     "validate:query-table": "tsx scripts/validate-query-table.ts",
     "validate:publication-dry-run": "tsx scripts/validate-publication-dry-run.ts",
     "build:publication-envelope": "tsx scripts/publication-artifact-envelope.ts --write",

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -11,12 +12,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertFilebaseCredentials,
+  assertQueryTableValidationEvidence,
   buildQueryTableGatewayUrls,
   buildQueryTableKey,
   defaultQueryTableIpnsLabel,
   geoIndexIpnsLabel,
   planQueryTableUpload,
   propertyIpnsLabel,
+  parseQueryTableValidationEvidence,
   resolveQueryTableIpnsLabel,
   uploadQueryTable,
 } from "../scripts/upload-query-table-to-filebase.js";
@@ -27,6 +30,13 @@ const GEO_LABEL = "oracle-geo-index-lee";
 const NETWORK_KEY = "k51qzitablleenamexxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
 const PARQUET_BODY = Buffer.from("PAR1-fake-parquet-bytes-for-cid-derivation", "utf8");
+const VALIDATION_EVIDENCE = {
+  county: "lee",
+  passed: true,
+  databaseReconciled: true,
+  immutableBaselineReconciled: false,
+  parquetSha256: createHash("sha256").update(PARQUET_BODY).digest("hex"),
+} as const;
 
 // The mocks are structural stand-ins for the AWS S3 client / global fetch; cast
 // them to the exact parameter types so the (statically typed) call sites accept
@@ -227,6 +237,48 @@ describe("assertFilebaseCredentials — explicit error before upload", () => {
   });
 });
 
+describe("query-table validation evidence", () => {
+  it("accepts both the standalone and full-publication report shapes", () => {
+    expect(
+      parseQueryTableValidationEvidence(VALIDATION_EVIDENCE),
+    ).toEqual(VALIDATION_EVIDENCE);
+    expect(
+      parseQueryTableValidationEvidence({
+        county: "lee",
+        queryTableIdentity: {
+          passed: true,
+          databaseReconciled: true,
+          immutableBaselineReconciled: false,
+          parquetSha256: VALIDATION_EVIDENCE.parquetSha256,
+        },
+      }),
+    ).toEqual(VALIDATION_EVIDENCE);
+  });
+
+  it("refuses unreconciled evidence or Parquet bytes changed after validation", () => {
+    expect(() =>
+      assertQueryTableValidationEvidence(PARQUET_BODY, "lee", {
+        ...VALIDATION_EVIDENCE,
+        databaseReconciled: false,
+      }),
+    ).toThrow(/database or immutable-baseline reconciliation/u);
+    expect(() =>
+      assertQueryTableValidationEvidence(PARQUET_BODY, "lee", {
+        ...VALIDATION_EVIDENCE,
+        databaseReconciled: false,
+        immutableBaselineReconciled: true,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertQueryTableValidationEvidence(
+        Buffer.concat([PARQUET_BODY, Buffer.from("changed")]),
+        "lee",
+        VALIDATION_EVIDENCE,
+      ),
+    ).toThrow(/changed after validation/u);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // End-to-end publish (mocked network)
 // ---------------------------------------------------------------------------
@@ -243,6 +295,7 @@ describe("uploadQueryTable — single-object upload + IPNS recording", () => {
         env: fullEnv({ S3_SECRET_ACCESS_KEY: undefined }),
         county: "lee",
         body: PARQUET_BODY,
+        validationEvidence: VALIDATION_EVIDENCE,
       }),
     ).rejects.toThrow();
 
@@ -260,6 +313,7 @@ describe("uploadQueryTable — single-object upload + IPNS recording", () => {
       env: fullEnv(),
       county: "lee",
       body: PARQUET_BODY,
+      validationEvidence: VALIDATION_EVIDENCE,
     });
 
     expect(client.sent).toHaveLength(1);
@@ -286,6 +340,7 @@ describe("uploadQueryTable — single-object upload + IPNS recording", () => {
         env: fullEnv({ FILEBASE_QUERY_TABLE_IPNS_LABEL: PROPERTY_LABEL }),
         county: "lee",
         body: PARQUET_BODY,
+        validationEvidence: VALIDATION_EVIDENCE,
       }),
     ).rejects.toThrow();
 
@@ -311,6 +366,7 @@ describe("uploadQueryTable — single-object upload + IPNS recording", () => {
         env: fullEnv(),
         county: "lee",
         body: PARQUET_BODY,
+        validationEvidence: VALIDATION_EVIDENCE,
       }),
     ).rejects.toThrow(/IPNS list failed/u);
   });

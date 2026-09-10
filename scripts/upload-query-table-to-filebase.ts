@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -64,6 +65,14 @@ export type QueryTablePublishResult = {
   readonly gatewayUrls: QueryTableGatewayUrls;
 };
 
+export type QueryTableValidationEvidence = {
+  readonly county: string;
+  readonly passed: boolean;
+  readonly databaseReconciled: boolean;
+  readonly immutableBaselineReconciled: boolean;
+  readonly parquetSha256: string;
+};
+
 /** Minimal S3 surface we use — satisfied by the AWS SDK v3 `S3Client`. */
 type QueryTableUploadClient = Pick<S3Client, "send" | "middlewareStack">;
 
@@ -114,6 +123,7 @@ const REQUIRED_CREDENTIALS = [
 ] as const;
 
 const FILEBASE_IPNS_API = "https://api.filebase.io/v1/names";
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
 // ---------------------------------------------------------------------------
 // Pure helpers (the tested contract)
@@ -127,6 +137,73 @@ function trimToUndefined(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   const trimmed = value.trim();
   return trimmed.length === 0 ? undefined : trimmed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read validation evidence from either validate-query-table or the full
+ * publication dry-run report.
+ */
+export function parseQueryTableValidationEvidence(
+  value: unknown,
+): QueryTableValidationEvidence {
+  if (!isRecord(value)) {
+    throw new Error("Query-table validation report must be a JSON object");
+  }
+  const nested = value["queryTableIdentity"];
+  const evidence = isRecord(nested) ? nested : value;
+  const county = value["county"];
+  const parquetSha256 = evidence["parquetSha256"];
+  if (
+    typeof county !== "string" ||
+    typeof parquetSha256 !== "string" ||
+    typeof evidence["passed"] !== "boolean" ||
+    typeof evidence["databaseReconciled"] !== "boolean"
+  ) {
+    throw new Error("Query-table validation report has an invalid shape");
+  }
+  return {
+    county,
+    passed: evidence["passed"],
+    databaseReconciled: evidence["databaseReconciled"],
+    immutableBaselineReconciled:
+      evidence["immutableBaselineReconciled"] === true,
+    parquetSha256,
+  };
+}
+
+/** Bind an approved upload to one fully reconciled, validated Parquet body. */
+export function assertQueryTableValidationEvidence(
+  body: Buffer,
+  county: string,
+  evidence: QueryTableValidationEvidence,
+  requireDatabaseReconciliation = true,
+): void {
+  if (normalizeCounty(evidence.county) !== normalizeCounty(county)) {
+    throw new Error("Query-table validation county does not match publish county");
+  }
+  if (!evidence.passed) {
+    throw new Error("Query-table validation report did not pass");
+  }
+  if (
+    requireDatabaseReconciliation &&
+    !evidence.databaseReconciled &&
+    !evidence.immutableBaselineReconciled
+  ) {
+    throw new Error(
+      "Live query-table publication requires database or immutable-baseline reconciliation",
+    );
+  }
+  if (!SHA256_PATTERN.test(evidence.parquetSha256)) {
+    throw new Error("Query-table validation report has an invalid Parquet SHA-256");
+  }
+  const actual = createHash("sha256").update(body).digest("hex");
+  if (actual !== evidence.parquetSha256) {
+    throw new Error("Query-table Parquet changed after validation");
+  }
 }
 
 /** The property dataset's IPNS label for a county — must never be re-pointed here. */
@@ -408,10 +485,11 @@ async function upsertQueryTableIpnsPointer(
 /**
  * Publish the single query-table parquet object and re-point its OWN IPNS label
  * at the derived CID. Validation order is load-bearing:
- *   1. credentials (throws before any upload/IPNS call when missing),
- *   2. label resolution + property/geo-label guard (throws before any write),
- *   3. upload the single object and derive its CID,
- *   4. re-point the query-table IPNS label.
+ *   1. database-reconciled validation evidence bound to these exact bytes,
+ *   2. credentials (throws before any upload/IPNS call when missing),
+ *   3. label resolution + property/geo-label guard (throws before any write),
+ *   4. upload the single object and derive its CID,
+ *   5. re-point the query-table IPNS label.
  */
 export async function uploadQueryTable(opts: {
   client: QueryTableUploadClient;
@@ -419,7 +497,13 @@ export async function uploadQueryTable(opts: {
   env: QueryTablePublishEnv;
   county: string;
   body: Buffer;
+  validationEvidence: QueryTableValidationEvidence;
 }): Promise<QueryTablePublishResult> {
+  assertQueryTableValidationEvidence(
+    opts.body,
+    opts.county,
+    opts.validationEvidence,
+  );
   assertFilebaseCredentials(opts.env);
   const ipnsLabel = resolveQueryTableIpnsLabel(opts.env, opts.county);
 
@@ -494,6 +578,7 @@ type QueryTablePublishCliOptions = {
   readonly parquetPath: string;
   readonly envFile: string;
   readonly dryRun: boolean;
+  readonly validationReportPath: string;
 };
 
 function parseCliOptions(argv: readonly string[]): QueryTablePublishCliOptions {
@@ -513,22 +598,37 @@ function parseCliOptions(argv: readonly string[]): QueryTablePublishCliOptions {
 
   const county = normalizeCounty(values.get("county") ?? "lee");
   const parquet = values.get("parquet");
+  const parquetPath =
+    parquet !== undefined && parquet !== "true"
+      ? parquet
+      : join(".query-table-export", county, "query-table.parquet");
   return {
     county,
-    parquetPath: parquet !== undefined && parquet !== "true"
-      ? parquet
-      : join(".query-table-export", county, "query-table.parquet"),
+    parquetPath,
     envFile: values.get("env-file") ?? ".env.local",
     dryRun: values.get("dry-run") === "true",
+    validationReportPath:
+      values.get("validation-report") ??
+      join(dirname(parquetPath), "validation-report.json"),
   };
 }
 
-async function runDryRun(options: QueryTablePublishCliOptions, env: QueryTablePublishEnv): Promise<void> {
+async function runDryRun(
+  options: QueryTablePublishCliOptions,
+  env: QueryTablePublishEnv,
+  validationEvidence: QueryTableValidationEvidence,
+): Promise<void> {
   const bucket = requireCredential(env, "S3_BUCKET");
   const ipnsLabel = resolveQueryTableIpnsLabel(env, options.county);
   const key = buildQueryTableKey(options.county);
 
   const body = await readFile(options.parquetPath);
+  assertQueryTableValidationEvidence(
+    body,
+    options.county,
+    validationEvidence,
+    false,
+  );
   const cid = await computeIpfsCid(body);
 
   console.log(
@@ -552,7 +652,11 @@ async function runDryRun(options: QueryTablePublishCliOptions, env: QueryTablePu
   console.log(`No uploads performed.\n`);
 }
 
-async function runPublish(options: QueryTablePublishCliOptions, env: QueryTablePublishEnv): Promise<void> {
+async function runPublish(
+  options: QueryTablePublishCliOptions,
+  env: QueryTablePublishEnv,
+  validationEvidence: QueryTableValidationEvidence,
+): Promise<void> {
   const { S3Client: S3ClientCtor } = await import("@aws-sdk/client-s3");
 
   const body = await readFile(options.parquetPath);
@@ -569,7 +673,14 @@ async function runPublish(options: QueryTablePublishCliOptions, env: QueryTableP
 
   const fetchImpl: QueryTableFetch = async (url, init) => fetch(url, init);
 
-  const result = await uploadQueryTable({ client, fetchImpl, env, county: options.county, body });
+  const result = await uploadQueryTable({
+    client,
+    fetchImpl,
+    env,
+    county: options.county,
+    body,
+    validationEvidence,
+  });
 
   const envMapValue = JSON.stringify({ [options.county]: result.gatewayUrls.filebase });
 
@@ -599,6 +710,9 @@ async function main(): Promise<void> {
   const options = parseCliOptions(process.argv.slice(2));
   loadEnvFile(options.envFile);
   const env: QueryTablePublishEnv = process.env;
+  const validationEvidence = parseQueryTableValidationEvidence(
+    JSON.parse(await readFile(options.validationReportPath, "utf8")) as unknown,
+  );
 
   // Fail fast on bad credentials / unsafe label before any upload — uploadQueryTable
   // re-validates as the authoritative gate.
@@ -606,11 +720,11 @@ async function main(): Promise<void> {
   resolveQueryTableIpnsLabel(env, options.county);
 
   if (options.dryRun) {
-    await runDryRun(options, env);
+    await runDryRun(options, env, validationEvidence);
     return;
   }
 
-  await runPublish(options, env);
+  await runPublish(options, env, validationEvidence);
 }
 
 function isInvokedDirectly(): boolean {

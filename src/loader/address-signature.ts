@@ -26,6 +26,11 @@ export type AddressIdentity = {
   readonly elephantUuid: string;
 };
 
+export type PublishedAddressIdentity = {
+  readonly elephantToken: string | null | undefined;
+  readonly elephantUuid: string | null | undefined;
+};
+
 function normalizeField(value: unknown): string {
   if (value === null || value === undefined) return "";
   return String(value)
@@ -126,4 +131,26 @@ export function mintAddressIdentity(
       .digest("hex"),
     elephantUuid: uuidV5(signature, ELEPHANT_ADDRESS_UUID_NAMESPACE),
   };
+}
+
+/** Fail closed unless a published identity is the exact pair for its address. */
+export function assertAddressIdentity(
+  input: AddressSignatureInput,
+  published: PublishedAddressIdentity,
+): void {
+  const expected = mintAddressIdentity(input);
+  const elephantUuid = published.elephantUuid ?? null;
+  const elephantToken = published.elephantToken ?? null;
+  if (expected === null) {
+    if (elephantUuid !== null || elephantToken !== null) {
+      throw new Error("Ineligible address has a published identity");
+    }
+    return;
+  }
+  if (
+    elephantUuid !== expected.elephantUuid ||
+    elephantToken !== expected.elephantToken
+  ) {
+    throw new Error("Published address identity does not match address:v1");
+  }
 }

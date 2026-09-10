@@ -126,14 +126,14 @@ The publish machine reads/clears `s3://<statusBucket>/incremental-status/<county
 
 ## One-time: approve publishing for a county
 
-Publishing is gated by an SSM parameter per county. Until it is set to `true`, `PUBLISH_APPROVED`
+Publishing is gated by an SSM parameter per county. Until it is set to exactly `1`, `PUBLISH_APPROVED`
 resolves to empty and the publish task runs as a **dry-run** (the state machine still exercises the
 full path; the parameter simply flips dry-run off):
 
 ```bash
 aws ssm put-parameter \
   --name /oracle/palm-beach/publish-approved \
-  --value true \
+  --value 1 \
   --type String \
   --overwrite
 ```

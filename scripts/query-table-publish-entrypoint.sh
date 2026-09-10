@@ -7,11 +7,9 @@
 #   2. validate validate-query-table.ts       -> exits nonzero on any folio mismatch/dupe
 #   3. publish  upload-query-table-to-filebase.ts -> re-points the oracle-query-table-<county> IPNS
 #
-# SAFE BY DEFAULT: validate runs in `parquet-only` mode (mid-ingest safe — skips the
-# Neon-completeness gate so it doesn't false-fail while the loader is still adding
-# folios), and publish runs as a DRY-RUN unless PUBLISH_APPROVED is non-empty. The
-# dry-run default is the PII human-gate: a real IPNS publish only happens when a
-# human explicitly approves it.
+# SAFE BY DEFAULT: validate runs in `parquet-only` mode for an unapproved
+# dry-run. A live publish requires PUBLISH_APPROVED=1 and full database
+# reconciliation; every other non-empty approval value is rejected.
 #
 # Env:
 #   COUNTY            (required)  hyphen slug, e.g. palm-beach. MUST be hyphen form — an
@@ -24,10 +22,10 @@
 #                                 --manifest to export to populate property_cid. When
 #                                 unset, export runs with property_cid NULL (fine for
 #                                 analytical use).
-#   VALIDATE_MODE     (optional)  parquet-only (default, mid-ingest safe) | full
-#                                 (completeness gate for a FINAL publish).
+#   VALIDATE_MODE     (optional)  parquet-only (default for dry-run) | full
+#                                 (required and default for a FINAL publish).
 #   PUBLISH_APPROVED  (optional)  empty (default) => DRY-RUN publish (no upload);
-#                                 non-empty => REAL publish. The PII human-gate.
+#                                 exactly 1 => REAL publish. Any other value fails.
 #   STEP              (optional)  all (default) | export | validate | publish
 #                                 — run a single stage.
 set -eu
@@ -40,15 +38,25 @@ STEP="${STEP:-all}"
 ENV_FILE="${ENV_FILE:-.env.local}"
 PUBLISH_ENV_FILE="${PUBLISH_ENV_FILE:-$ENV_FILE}"
 OUT_DIR="${OUT_DIR:-.query-table-export}"
-VALIDATE_MODE="${VALIDATE_MODE:-parquet-only}"
 PUBLISH_APPROVED="${PUBLISH_APPROVED:-}"
 
 PARQUET="$OUT_DIR/$COUNTY/query-table.parquet"
+VALIDATION_REPORT="$OUT_DIR/$COUNTY/validation-report.json"
 
-if [ -n "$PUBLISH_APPROVED" ]; then
+if [ "$PUBLISH_APPROVED" = "1" ]; then
   PUBLISH_APPROVED_LOG="true"
-else
+  VALIDATE_MODE="${VALIDATE_MODE:-full}"
+elif [ -z "$PUBLISH_APPROVED" ]; then
   PUBLISH_APPROVED_LOG="false"
+  VALIDATE_MODE="${VALIDATE_MODE:-parquet-only}"
+else
+  echo "PUBLISH_APPROVED must be empty or exactly 1" >&2
+  exit 1
+fi
+
+if [ "$PUBLISH_APPROVED_LOG" = "true" ] && [ "$VALIDATE_MODE" != "full" ]; then
+  echo "Approved publication requires VALIDATE_MODE=full" >&2
+  exit 1
 fi
 
 echo "{\"event\":\"query_table_publish_entrypoint_started\",\"county\":\"$COUNTY\",\"step\":\"$STEP\",\"validateMode\":\"$VALIDATE_MODE\",\"publishApproved\":$PUBLISH_APPROVED_LOG}"
@@ -76,7 +84,7 @@ run_export() {
 }
 
 run_validate() {
-  VALIDATE_ARGS="--county $COUNTY --parquet $PARQUET"
+  VALIDATE_ARGS="--county $COUNTY --parquet $PARQUET --report $VALIDATION_REPORT"
   if [ "$USE_ENV_FILE" = true ]; then
     VALIDATE_ARGS="$VALIDATE_ARGS --env-file $ENV_FILE"
   fi
@@ -88,11 +96,11 @@ run_validate() {
 }
 
 run_publish() {
-  PUBLISH_ARGS="--county $COUNTY"
+  PUBLISH_ARGS="--county $COUNTY --parquet $PARQUET --validation-report $VALIDATION_REPORT"
   if [ "$USE_ENV_FILE" = true ]; then
     PUBLISH_ARGS="$PUBLISH_ARGS --env-file $PUBLISH_ENV_FILE"
   fi
-  if [ -z "$PUBLISH_APPROVED" ]; then
+  if [ "$PUBLISH_APPROVED_LOG" = "false" ]; then
     PUBLISH_ARGS="$PUBLISH_ARGS --dry-run"
   fi
   # shellcheck disable=SC2086
