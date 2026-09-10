@@ -34,6 +34,7 @@ const VALIDATION_EVIDENCE = {
   county: "lee",
   passed: true,
   databaseReconciled: true,
+  immutableBaselineReconciled: false,
   parquetSha256: createHash("sha256").update(PARQUET_BODY).digest("hex"),
 } as const;
 
@@ -247,6 +248,7 @@ describe("query-table validation evidence", () => {
         queryTableIdentity: {
           passed: true,
           databaseReconciled: true,
+          immutableBaselineReconciled: false,
           parquetSha256: VALIDATION_EVIDENCE.parquetSha256,
         },
       }),
@@ -259,7 +261,14 @@ describe("query-table validation evidence", () => {
         ...VALIDATION_EVIDENCE,
         databaseReconciled: false,
       }),
-    ).toThrow(/database-reconciled/u);
+    ).toThrow(/database or immutable-baseline reconciliation/u);
+    expect(() =>
+      assertQueryTableValidationEvidence(PARQUET_BODY, "lee", {
+        ...VALIDATION_EVIDENCE,
+        databaseReconciled: false,
+        immutableBaselineReconciled: true,
+      }),
+    ).not.toThrow();
     expect(() =>
       assertQueryTableValidationEvidence(
         Buffer.concat([PARQUET_BODY, Buffer.from("changed")]),

@@ -69,6 +69,7 @@ export type QueryTableValidationEvidence = {
   readonly county: string;
   readonly passed: boolean;
   readonly databaseReconciled: boolean;
+  readonly immutableBaselineReconciled: boolean;
   readonly parquetSha256: string;
 };
 
@@ -168,6 +169,8 @@ export function parseQueryTableValidationEvidence(
     county,
     passed: evidence["passed"],
     databaseReconciled: evidence["databaseReconciled"],
+    immutableBaselineReconciled:
+      evidence["immutableBaselineReconciled"] === true,
     parquetSha256,
   };
 }
@@ -185,9 +188,13 @@ export function assertQueryTableValidationEvidence(
   if (!evidence.passed) {
     throw new Error("Query-table validation report did not pass");
   }
-  if (requireDatabaseReconciliation && !evidence.databaseReconciled) {
+  if (
+    requireDatabaseReconciliation &&
+    !evidence.databaseReconciled &&
+    !evidence.immutableBaselineReconciled
+  ) {
     throw new Error(
-      "Live query-table publication requires database-reconciled validation",
+      "Live query-table publication requires database or immutable-baseline reconciliation",
     );
   }
   if (!SHA256_PATTERN.test(evidence.parquetSha256)) {
