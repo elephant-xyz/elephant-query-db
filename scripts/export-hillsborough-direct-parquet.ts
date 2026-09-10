@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { ParquetWriter } from "@dsnp/parquetjs";
 import AdmZip from "adm-zip";
 
+import { mintAddressIdentity } from "../src/loader/address-signature.js";
 import {
   buildQueryTableParquetSchema,
   type QueryTableRow,
@@ -335,6 +336,15 @@ async function extractQueryTableRowAsync(params: {
 
   const lat = unnormAddr?.latitude ? Number(unnormAddr.latitude) : null;
   const lon = unnormAddr?.longitude ? Number(unnormAddr.longitude) : null;
+  const addressStreet = parsedAddr.street;
+  const addressZip = parsedAddr.postalCode || (p.mailingAddress?.zip ? String(p.mailingAddress.zip).slice(0, 5) : null);
+  const identity = mintAddressIdentity({
+    country: "us",
+    state: "FL",
+    postalCode: addressZip,
+    street: addressStreet,
+    unit: null,
+  });
 
   return {
     property_id: pin,
@@ -344,9 +354,11 @@ async function extractQueryTableRowAsync(params: {
     source_system: "hillsborough_appraiser",
     county_name: "Hillsborough",
     state_code: "FL",
-    address_street: parsedAddr.street,
+    address_street: addressStreet,
     address_city: parsedAddr.city || (unnormAddr?.city ? String(unnormAddr.city) : "Tampa"),
-    address_zip: parsedAddr.postalCode || (p.mailingAddress?.zip ? String(p.mailingAddress.zip).slice(0, 5) : null),
+    address_zip: addressZip,
+    elephant_uuid: identity?.elephantUuid ?? null,
+    elephant_token: identity?.elephantToken ?? null,
     latitude: lat,
     longitude: lon,
     lot_size_acre: lotAcre,
