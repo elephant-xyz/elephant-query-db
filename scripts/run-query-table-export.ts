@@ -70,6 +70,10 @@ export type QueryTableSourceRow = {
   readonly lot_area_sqft: string | null;
   readonly exterior_wall_material: string | null;
   readonly roof_covering_material: string | null;
+  readonly roof_date: string | null;
+  readonly roof_age_years: number | string | null;
+  readonly roof_date_source: string | null;
+  readonly roof_date_lineage: string | null;
   readonly property_type: string | null;
   readonly property_usage_type: string | null;
   readonly built_year: number | null;
@@ -118,6 +122,10 @@ export type QueryTableRow = {
   readonly lot_area_sqft: number | null;
   readonly exterior_wall_material: string | null;
   readonly roof_covering_material: string | null;
+  readonly roof_date: string | null;
+  readonly roof_age_years: number | null;
+  readonly roof_date_source: string | null;
+  readonly roof_date_lineage: string | null;
   readonly property_type: string | null;
   readonly property_usage_type: string | null;
   readonly built_year: number | null;
@@ -264,6 +272,10 @@ export function buildQueryTableRow(row: QueryTableSourceRow, cid: string | null)
     lot_area_sqft: lotAreaSqft,
     exterior_wall_material: toText(row.exterior_wall_material),
     roof_covering_material: toText(row.roof_covering_material),
+    roof_date: toText(row.roof_date),
+    roof_age_years: toInteger(row.roof_age_years),
+    roof_date_source: toText(row.roof_date_source),
+    roof_date_lineage: toText(row.roof_date_lineage),
     property_type: toText(row.property_type),
     property_usage_type: toText(row.property_usage_type),
     built_year: toInteger(row.built_year),
@@ -320,6 +332,10 @@ export function buildQueryTableParquetSchema(): ParquetSchema {
     lot_area_sqft: { type: "DOUBLE", optional: true },
     exterior_wall_material: { type: "UTF8", optional: true },
     roof_covering_material: { type: "UTF8", optional: true },
+    roof_date: { type: "UTF8", optional: true },
+    roof_age_years: { type: "INT64", optional: true },
+    roof_date_source: { type: "UTF8", optional: true },
+    roof_date_lineage: { type: "UTF8", optional: true },
     property_type: { type: "UTF8", optional: true },
     property_usage_type: { type: "UTF8", optional: true },
     built_year: { type: "INT64", optional: true },
@@ -664,10 +680,24 @@ export function buildQueryTableSql(
     ),
     structure_pick AS (
       SELECT DISTINCT ON (s.property_id)
-        s.property_id, s.exterior_wall_material_primary, s.roof_covering_material
+        s.property_id,
+        s.exterior_wall_material_primary,
+        s.roof_covering_material,
+        s.roof_date,
+        s.roof_age_years,
+        s.roof_date_source,
+        s.roof_date_lineage
       FROM structures s
       JOIN county_properties cp ON cp.property_id = s.property_id
-      ORDER BY s.property_id
+      ORDER BY
+        s.property_id,
+        CASE
+          WHEN s.roof_date_source = 'permit' THEN 0
+          WHEN s.roof_date_source = 'parcel' THEN 1
+          WHEN s.roof_date_source = 'derived-from-construction-year' THEN 2
+          ELSE 3
+        END,
+        s.updated_at DESC NULLS LAST
     ),
     lot_pick AS (
       SELECT DISTINCT ON (l.property_id)
@@ -764,6 +794,10 @@ export function buildQueryTableSql(
       ${safeNumeric("lp.lot_area_sqft")} AS lot_area_sqft,
       sp.exterior_wall_material_primary AS exterior_wall_material,
       sp.roof_covering_material AS roof_covering_material,
+      sp.roof_date AS roof_date,
+      sp.roof_age_years AS roof_age_years,
+      sp.roof_date_source AS roof_date_source,
+      sp.roof_date_lineage::text AS roof_date_lineage,
       p.property_type AS property_type,
       p.property_usage_type AS property_usage_type,
       p.property_structure_built_year AS built_year,
