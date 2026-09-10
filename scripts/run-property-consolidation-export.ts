@@ -1057,6 +1057,10 @@ export function assemblePropertyRecord(params: AssembleParams): ConsolidatedProp
   const street = structuredStreet ?? parsed.street;
   const postalCode = address?.postal_code ?? parsed.postalCode;
   const state = address?.state_code ?? null;
+  // Street, postal, and unit all come from this same `addresses` row (owner
+  // mailing when structured columns are populated). Do not mix in a situs
+  // parse for some fields and mailing `unit_identifier` for others — that is
+  // what the query-table publisher must also avoid, via mintSitusAddressIdentity.
   const identity = mintAddressIdentity({
     country: "us",
     state,

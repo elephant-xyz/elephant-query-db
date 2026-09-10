@@ -660,6 +660,49 @@ describe("assemblePropertyRecord", () => {
     );
   });
 
+  it("hashes unit_identifier only with the same mailing street/ZIP, not a situs mix", () => {
+    const withUnit = assemblePropertyRecord({
+      property: mockProperty,
+      parcel: mockParcel,
+      address: {
+        address_id: "addr-opendoor-1",
+        street_number: "11659",
+        street_name: "JONATHAN",
+        street_suffix_type: "RD",
+        unit_identifier: "APT 2",
+        city_name: "JACKSONVILLE",
+        state_code: "FL",
+        postal_code: "32225",
+        latitude: null,
+        longitude: null,
+        unnormalized_address: "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+        normalized_address_key: "11659-jonathan-rd-jacksonville-fl-32225",
+      },
+      taxes: [],
+      salesHistories: [],
+      structures: [],
+      layouts: [],
+      lots: [],
+      floodStorm: [],
+      utilities: [],
+      ownerships: [],
+      deeds: [],
+      files: [],
+      geometries: [],
+      valuations: [],
+      permits: [],
+      sunbizTenants: [],
+      bbbProfiles: [],
+      county: "duval",
+      collectedAt: "2026-09-10T16:00:00.000Z",
+    });
+
+    expect(withUnit.address.street).toBe("11659 JONATHAN RD");
+    expect(withUnit.address.elephantUuid).not.toBe(
+      "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+    );
+  });
+
   it("leaves state null (not a wrong parsed value) when state_code is null", () => {
     const appraisalAddress = {
       address_id: "addr-appraisal-2",

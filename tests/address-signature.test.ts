@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
 import { normalizeAddressText } from "../src/loader/normalizers.js";
-import { mintAddressIdentity } from "../src/loader/address-signature.js";
+import {
+  mintAddressIdentity,
+  mintSitusAddressIdentity,
+} from "../src/loader/address-signature.js";
 
 const GOLDEN_SIGNATURE =
   "address:v1|country:2:us|state:2:fl|postal_code:5:32225|street:17:11659 jonathan rd|unit:0:";
@@ -84,5 +87,38 @@ describe("mintAddressIdentity", () => {
     });
 
     expect(identity?.signature).toContain("|unit:5:apt 2");
+  });
+});
+
+describe("mintSitusAddressIdentity", () => {
+  it("mints the golden fixture with an empty unit", () => {
+    expect(
+      mintSitusAddressIdentity({
+        state: "FL",
+        postalCode: "32225",
+        street: "11659 JONATHAN RD",
+      }),
+    ).toEqual({
+      signature: GOLDEN_SIGNATURE,
+      elephantUuid: GOLDEN_UUID,
+      elephantToken: GOLDEN_TOKEN,
+    });
+  });
+
+  it("does not mint when situs ZIP is missing, even if a mailing ZIP is known", () => {
+    const mailingZip = "10001";
+    expect(
+      mintSitusAddressIdentity({
+        state: "FL",
+        postalCode: null,
+        street: "11659 JONATHAN RD",
+      }),
+    ).toBeNull();
+    expect(
+      mintAddressIdentity({
+        ...goldenInput,
+        postalCode: mailingZip,
+      })?.elephantUuid,
+    ).not.toBe(GOLDEN_UUID);
   });
 });

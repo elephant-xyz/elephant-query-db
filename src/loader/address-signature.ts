@@ -62,9 +62,34 @@ function uuidV5(name: string, namespace: string): string {
 }
 
 /**
+ * Mint identity for a **situs** (property-location) address.
+ *
+ * Always serializes an empty unit. Oracle `addresses.unit_identifier` is the
+ * owner-mailing unit and must not be mixed with situs street/ZIP — that chimera
+ * would disagree with consolidated JSON (which hashes the mailing row) and
+ * with the published query-table street/ZIP.
+ */
+export function mintSitusAddressIdentity(input: {
+  readonly state: string | null | undefined;
+  readonly postalCode: string | null | undefined;
+  readonly street: string | null | undefined;
+}): AddressIdentity | null {
+  return mintAddressIdentity({
+    country: ADDRESS_SIGNATURE_DEFAULT_COUNTRY,
+    state: input.state,
+    postalCode: input.postalCode,
+    street: input.street,
+    unit: null,
+  });
+}
+
+/**
  * Build the canonical `address:v1` signature and derived ids.
  * Returns `null` when country, state, postal_code (ZIP5), or street is empty.
  * Does not mutate `input`.
+ *
+ * Callers must pass street, postal, and unit from the **same** address.
+ * For query-table / Hillsborough situs rows, use `mintSitusAddressIdentity`.
  */
 export function mintAddressIdentity(
   input: AddressSignatureInput,

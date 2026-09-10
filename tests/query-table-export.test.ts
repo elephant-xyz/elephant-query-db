@@ -130,6 +130,28 @@ describe("query table living-area (Sq Ft) sourcing", () => {
       "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
     );
   });
+
+  it("does not mix owner-mailing unit or ZIP into the situs identity", () => {
+    const row = buildQueryTableRow(
+      sourceRow({
+        situs_full_address: "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+        state_code: "FL",
+        street_number: "1",
+        street_name: "MAILING",
+        street_suffix_type: "ST",
+        postal_code: "10001",
+        unit_identifier: "APT 2",
+      }),
+      null,
+    );
+
+    expect(row.address_street).toBe("11659 JONATHAN RD");
+    expect(row.address_zip).toBe("32225");
+    expect(row.elephant_uuid).toBe("c3a982a7-1102-50b8-b2cd-6cb3fca2060f");
+    expect(row.elephant_token).toBe(
+      "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+    );
+  });
 });
 
 describe("query table enrichment scope", () => {
@@ -149,7 +171,7 @@ describe("query table enrichment scope", () => {
     const sql = buildQueryTableSql("chester_appraiser", false, true, null);
     expect(sql).toContain("pa_dos_keys");
     expect(sql).toContain("has_pa_corp_tenant");
-    expect(sql).toContain("a.unit_identifier AS unit_identifier");
+    expect(sql).not.toContain("unit_identifier");
     expect(sql).not.toContain("sunbiz_keys");
   });
 

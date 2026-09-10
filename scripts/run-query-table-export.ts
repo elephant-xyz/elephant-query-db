@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Pool } from "pg";
 import { ParquetSchema, ParquetWriter } from "@dsnp/parquetjs";
 
-import { mintAddressIdentity } from "../src/loader/address-signature.js";
+import { mintSitusAddressIdentity } from "../src/loader/address-signature.js";
 import {
   appraisalSourceForCounty,
   parseUnnormalizedAddress,
@@ -63,6 +63,11 @@ export type QueryTableSourceRow = {
   readonly street_suffix_type: string | null;
   readonly city_name: string | null;
   readonly postal_code: string | null;
+  /**
+   * Owner-mailing unit from `addresses.unit_identifier`. Not a situs field.
+   * `buildQueryTableRow` must not pass this into identity; tests set it to
+   * prove mailing units cannot change the situs uuid/token.
+   */
   readonly unit_identifier: string | null;
   readonly unnormalized_address: string | null;
   readonly situs_full_address: string | null;
@@ -246,12 +251,10 @@ function resolveSitusAddress(row: QueryTableSourceRow): ResolvedAddress {
  */
 export function buildQueryTableRow(row: QueryTableSourceRow, cid: string | null): QueryTableRow {
   const address = resolveSitusAddress(row);
-  const identity = mintAddressIdentity({
-    country: "us",
+  const identity = mintSitusAddressIdentity({
     state: toText(row.state_code),
     postalCode: address.zip,
     street: address.street,
-    unit: toText(row.unit_identifier),
   });
 
   const lotAreaSqft = toNumber(row.lot_area_sqft);
@@ -771,7 +774,6 @@ export function buildQueryTableSql(
       a.street_suffix_type AS street_suffix_type,
       a.city_name AS city_name,
       a.postal_code AS postal_code,
-      a.unit_identifier AS unit_identifier,
       a.unnormalized_address AS unnormalized_address,
       su.full_address AS situs_full_address,
       gp.latitude AS latitude,

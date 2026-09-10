@@ -7,7 +7,7 @@ import { pathToFileURL } from "node:url";
 import { ParquetWriter } from "@dsnp/parquetjs";
 import AdmZip from "adm-zip";
 
-import { mintAddressIdentity } from "../src/loader/address-signature.js";
+import { mintSitusAddressIdentity } from "../src/loader/address-signature.js";
 import {
   buildQueryTableParquetSchema,
   type QueryTableRow,
@@ -337,13 +337,15 @@ async function extractQueryTableRowAsync(params: {
   const lat = unnormAddr?.latitude ? Number(unnormAddr.latitude) : null;
   const lon = unnormAddr?.longitude ? Number(unnormAddr.longitude) : null;
   const addressStreet = parsedAddr.street;
-  const addressZip = parsedAddr.postalCode || (p.mailingAddress?.zip ? String(p.mailingAddress.zip).slice(0, 5) : null);
-  const identity = mintAddressIdentity({
-    country: "us",
+  const situsZip = parsedAddr.postalCode;
+  const addressZip =
+    situsZip || (p.mailingAddress?.zip ? String(p.mailingAddress.zip).slice(0, 5) : null);
+  // Identity is situs-only. Do not fall back to mailing ZIP here — that ZIP
+  // can still populate the published `address_zip` column for display.
+  const identity = mintSitusAddressIdentity({
     state: "FL",
-    postalCode: addressZip,
+    postalCode: situsZip,
     street: addressStreet,
-    unit: null,
   });
 
   return {

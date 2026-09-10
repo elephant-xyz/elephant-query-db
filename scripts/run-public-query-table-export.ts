@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { ParquetWriter } from "@dsnp/parquetjs";
 import { Pool } from "pg";
 
-import { mintAddressIdentity } from "../src/loader/address-signature.js";
+import { mintSitusAddressIdentity } from "../src/loader/address-signature.js";
 import {
   buildQueryTableParquetSchema,
   type QueryTableRow,
@@ -345,12 +345,10 @@ export function buildPublicQueryTableRow(
   );
   const addressStreet = row.address_street ?? parsedSiteAddress.street;
   const addressZip = row.address_zip ?? parsedSiteAddress.postalCode;
-  const identity = mintAddressIdentity({
-    country: "us",
+  const identity = mintSitusAddressIdentity({
     state: row.state_code,
     postalCode: addressZip,
     street: addressStreet,
-    unit: null,
   });
   return {
     property_id: row.property_id,
