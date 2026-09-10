@@ -46,6 +46,7 @@ export const DEFAULT_BATCH_SIZE = 250;
 
 type AddressShape = {
   readonly street: string | null;
+  readonly unit: string | null;
   readonly city: string | null;
   readonly state: string | null;
   readonly postalCode: string | null;
@@ -1071,6 +1072,7 @@ export function assemblePropertyRecord(params: AssembleParams): ConsolidatedProp
 
   const addressShape: AddressShape = {
     street,
+    unit: address?.unit_identifier ?? null,
     city: address?.city_name ?? parsed.city,
     state,
     postalCode,

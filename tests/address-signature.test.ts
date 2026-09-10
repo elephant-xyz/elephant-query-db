@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { normalizeAddressText } from "../src/loader/normalizers.js";
 import {
+  assertAddressIdentity,
   mintAddressIdentity,
   mintSitusAddressIdentity,
 } from "../src/loader/address-signature.js";
@@ -87,6 +88,27 @@ describe("mintAddressIdentity", () => {
     });
 
     expect(identity?.signature).toContain("|unit:5:apt 2");
+  });
+
+  it("fails closed when either published identity is missing or changed", () => {
+    expect(() =>
+      assertAddressIdentity(goldenInput, {
+        elephantUuid: GOLDEN_UUID,
+        elephantToken: GOLDEN_TOKEN,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertAddressIdentity(goldenInput, {
+        elephantUuid: GOLDEN_UUID,
+        elephantToken: null,
+      }),
+    ).toThrow(/does not match/u);
+    expect(() =>
+      assertAddressIdentity(
+        { ...goldenInput, postalCode: null },
+        { elephantUuid: GOLDEN_UUID, elephantToken: GOLDEN_TOKEN },
+      ),
+    ).toThrow(/Ineligible/u);
   });
 });
 

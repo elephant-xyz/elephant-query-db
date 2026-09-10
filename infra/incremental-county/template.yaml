@@ -171,7 +171,7 @@ Resources:
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: load
 
-  # Env-driven publish: COUNTY, VALIDATE_MODE (parquet-only|full), PUBLISH_APPROVED (empty=dry-run)
+  # Env-driven publish: COUNTY and PUBLISH_APPROVED (empty=dry-run, exactly 1=live).
   # arrive via runtime overrides. Uses county-query-table-publish (Parquet → oracle-query-table-<county> IPNS).
   # Filebase creds are pulled from the single JSON publish secret.
   PublishTaskDefinition:
@@ -553,8 +553,7 @@ Resources:
                       "Name": "publish",
                       "Environment": [
                         { "Name": "COUNTY", "Value.$": "$.county" },
-                        { "Name": "PUBLISH_APPROVED", "Value.$": "$.approval.approved" },
-                        { "Name": "VALIDATE_MODE", "Value": "parquet-only" }
+                        { "Name": "PUBLISH_APPROVED", "Value.$": "$.approval.approved" }
                       ]
                     }
                   ]

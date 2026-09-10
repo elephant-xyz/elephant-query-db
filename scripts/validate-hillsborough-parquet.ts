@@ -1,5 +1,9 @@
 import { resolve } from "node:path";
 import { ParquetReader } from "@dsnp/parquetjs";
+import {
+  addressIdentityFailures,
+  readParquetStats,
+} from "./validate-query-table.js";
 
 const PARQUET_PATH = resolve("../oracle-node-hillsborough/downloads/hillsborough/publish/query-table.parquet");
 
@@ -7,6 +11,13 @@ console.log(`Validating Parquet schema and records from ${PARQUET_PATH}...`);
 
 async function main() {
   try {
+    const identityStats = await readParquetStats(PARQUET_PATH);
+    const identityFailures = addressIdentityFailures(identityStats);
+    if (identityFailures.length > 0) {
+      throw new Error(
+        `Address identity validation failed: ${identityFailures.join("; ")}`,
+      );
+    }
     const reader = await ParquetReader.openFile(PARQUET_PATH);
     const rowCount = Number(reader.getRowCount());
     console.log(`Parquet opened successfully. Total rows: ${rowCount.toLocaleString()}`);

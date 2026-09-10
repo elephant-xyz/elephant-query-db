@@ -58,6 +58,11 @@ unset FILEBASE_ACCESS_KEY FILEBASE_SECRET_KEY
 
 cd "$query_db_dir"
 
+npm run verify:publication-envelope -- \
+  --root "$publication_root" \
+  --county "$county" \
+  --expected-watermark "$watermark"
+
 S3_BUCKET="$OPEN_DATA_BUCKET" \
 FILEBASE_IPNS_LABEL="$OPEN_DATA_IPNS_LABEL" \
 npm run publish:ipfs-upload -- \
@@ -69,7 +74,8 @@ S3_BUCKET="$QUERY_TABLE_BUCKET" \
 FILEBASE_QUERY_TABLE_IPNS_LABEL="$QUERY_TABLE_IPNS_LABEL" \
 npm run publish:query-table -- \
   --county "$county" \
-  --parquet "$publication_root/query/$county/query-table.parquet"
+  --parquet "$publication_root/query/$county/query-table.parquet" \
+  --validation-report "$publication_root/validation-report.json"
 
 S3_BUCKET="$COVERAGE_BUCKET" \
 FILEBASE_COVERAGE_IPNS_LABEL="$COVERAGE_IPNS_LABEL" \

@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   assertRockIslandArcGisOutFields,
   assertPublicNonPii,
+  assertPublicPropertyAddressIdentity,
+  buildPublicPropertyAddress,
   parsePublicPropertyOptions,
   sourceSystemForCounty,
 } from "../scripts/run-public-property-export.js";
@@ -37,6 +39,7 @@ import {
   selectPreExportSample,
 } from "../scripts/validate-rock-island-pre-export.js";
 import {
+  assertConsolidatedPropertyAddressIdentity,
   assertPropertyCheckpointCid,
   assertRemoteIndexAgreement,
 } from "../scripts/upload-consolidation-to-filebase.js";
@@ -150,6 +153,70 @@ describe("public property export safety", () => {
       batchSize: 500,
       shardSize: 10_000,
     });
+  });
+
+  it("mints the public address identity from situs fields only", () => {
+    expect(
+      buildPublicPropertyAddress({
+        addressId: "address-1",
+        structuredStreet: "11659 JONATHAN RD",
+        city: "JACKSONVILLE",
+        state: "FL",
+        postalCode: "32225-1234",
+        unnormalizedAddress:
+          "11659 JONATHAN RD, JACKSONVILLE, FL 32225-1234",
+        parcelState: "FL",
+      }),
+    ).toEqual({
+      street: "11659 JONATHAN RD",
+      city: "JACKSONVILLE",
+      state: "FL",
+      postalCode: "32225-1234",
+      unnormalizedAddress:
+        "11659 JONATHAN RD, JACKSONVILLE, FL 32225-1234",
+      elephantUuid: "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+      elephantToken:
+        "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+    });
+  });
+
+  it("leaves both public address ids null when situs ZIP is unavailable", () => {
+    const address =
+      buildPublicPropertyAddress({
+        addressId: "address-1",
+        structuredStreet: "11659 JONATHAN RD",
+        city: "JACKSONVILLE",
+        state: "FL",
+        postalCode: null,
+        unnormalizedAddress: "11659 JONATHAN RD",
+        parcelState: "FL",
+      });
+    expect(address).toMatchObject({
+      elephantUuid: null,
+      elephantToken: null,
+    });
+    expect(() => assertPublicPropertyAddressIdentity(address)).not.toThrow();
+  });
+
+  it("rejects missing or altered public address identity fields", () => {
+    expect(() =>
+      assertPublicPropertyAddressIdentity({
+        street: "11659 JONATHAN RD",
+        state: "FL",
+        postalCode: "32225",
+        elephantUuid: null,
+        elephantToken: null,
+      }),
+    ).toThrow(/does not match/u);
+    expect(() =>
+      assertPublicPropertyAddressIdentity({
+        street: "11659 JONATHAN RD",
+        state: "FL",
+        postalCode: "32225",
+        elephantUuid: "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+        elephantToken: "0".repeat(64),
+      }),
+    ).toThrow(/does not match/u);
   });
 });
 
@@ -635,6 +702,39 @@ describe("pre-export validation helpers", () => {
 });
 
 describe("property upload checkpoints", () => {
+  it("requires an exact address identity before consolidated JSON upload", () => {
+    const valid = Buffer.from(
+      JSON.stringify({
+        address: {
+          street: "11659 JONATHAN RD",
+          unit: null,
+          state: "FL",
+          postalCode: "32225",
+          elephantUuid: "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+          elephantToken:
+            "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+        },
+      }),
+    );
+    expect(() =>
+      assertConsolidatedPropertyAddressIdentity(valid, "properties/1.json"),
+    ).not.toThrow();
+
+    const missing = Buffer.from(
+      JSON.stringify({
+        address: {
+          street: "11659 JONATHAN RD",
+          unit: null,
+          state: "FL",
+          postalCode: "32225",
+        },
+      }),
+    );
+    expect(() =>
+      assertConsolidatedPropertyAddressIdentity(missing, "properties/1.json"),
+    ).toThrow(/Address identity validation failed/u);
+  });
+
   it("fails a stale checkpoint with changed content CID", () => {
     expect(() =>
       assertPropertyCheckpointCid(

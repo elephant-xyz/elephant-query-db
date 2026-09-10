@@ -5,6 +5,7 @@ import { pathToFileURL } from "node:url";
 
 import { Pool } from "pg";
 
+import { mintSitusAddressIdentity } from "../src/loader/address-signature.js";
 import {
   buildManifestEntry,
   buildManifestSummary,
@@ -211,6 +212,12 @@ export type PublicSiteAddress = {
   readonly postalCode: string | null;
 };
 
+export type PublicPropertyAddress = PublicSiteAddress & {
+  readonly unnormalizedAddress: string | null;
+  readonly elephantUuid: string | null;
+  readonly elephantToken: string | null;
+};
+
 /**
  * Recover only Rock Island site-address facts from an unnormalized site address.
  * Owner-mailing fields are deliberately not accepted by this function.
@@ -253,6 +260,70 @@ export function parseRockIslandSiteAddress(
     state: statePostal[1] ?? null,
     postalCode: statePostal[2] ?? null,
   };
+}
+
+/**
+ * Build a public situs address and its deterministic `address:v1` identity.
+ *
+ * Query-table and public-property identities intentionally use the same
+ * situs-only contract. No owner-mailing ZIP or unit is accepted here.
+ *
+ * @param input - Structured fields plus the public unnormalized situs string.
+ * @returns Public address with identity, or null when the property has no address row.
+ */
+export function buildPublicPropertyAddress(input: {
+  readonly addressId: string | null;
+  readonly structuredStreet: string | null;
+  readonly city: string | null;
+  readonly state: string | null;
+  readonly postalCode: string | null;
+  readonly unnormalizedAddress: string | null;
+  readonly parcelState: string | null;
+}): PublicPropertyAddress | null {
+  if (input.addressId === null) return null;
+  const parsed = parseRockIslandSiteAddress(input.unnormalizedAddress);
+  const street = input.structuredStreet ?? parsed.street;
+  const state = input.state ?? parsed.state ?? input.parcelState;
+  const postalCode = input.postalCode ?? parsed.postalCode;
+  const identity = mintSitusAddressIdentity({ state, postalCode, street });
+  return {
+    street,
+    city: input.city ?? parsed.city,
+    state,
+    postalCode,
+    unnormalizedAddress: input.unnormalizedAddress,
+    elephantUuid: identity?.elephantUuid ?? null,
+    elephantToken: identity?.elephantToken ?? null,
+  };
+}
+
+/** Fail closed unless a public address carries its exact situs identity pair. */
+export function assertPublicPropertyAddressIdentity(value: unknown): void {
+  if (value === null) return;
+  if (!isRecord(value)) {
+    throw new Error("Public property address must be an object or null");
+  }
+  const street = typeof value.street === "string" ? value.street : null;
+  const state = typeof value.state === "string" ? value.state : null;
+  const postalCode =
+    typeof value.postalCode === "string" ? value.postalCode : null;
+  const elephantUuid =
+    typeof value.elephantUuid === "string" ? value.elephantUuid : null;
+  const elephantToken =
+    typeof value.elephantToken === "string" ? value.elephantToken : null;
+  const expected = mintSitusAddressIdentity({ state, postalCode, street });
+  if (expected === null) {
+    if (elephantUuid !== null || elephantToken !== null) {
+      throw new Error("Ineligible public address has an identity");
+    }
+    return;
+  }
+  if (
+    elephantUuid !== expected.elephantUuid ||
+    elephantToken !== expected.elephantToken
+  ) {
+    throw new Error("Public address identity does not match address:v1");
+  }
 }
 
 /**
@@ -617,9 +688,16 @@ export async function runPublicPropertyExport(
         ]
           .filter((value): value is string => value !== null && value.length > 0)
           .join(" ");
-        const parsedSiteAddress = parseRockIslandSiteAddress(
-          parent.unnormalized_address,
-        );
+        const publicAddress = buildPublicPropertyAddress({
+          addressId: parent.address_id,
+          structuredStreet:
+            structuredStreet.length > 0 ? structuredStreet : null,
+          city: parent.city_name,
+          state: parent.address_state_code,
+          postalCode: parent.postal_code,
+          unnormalizedAddress: parent.unnormalized_address,
+          parcelState: parent.state_code,
+        });
         const record = {
           schemaVersion: "1",
           parcelId: parent.parcel_id,
@@ -627,23 +705,7 @@ export async function runPublicPropertyExport(
           county: options.county,
           jurisdictionKey: parent.jurisdiction_key,
           sourceSystem: parent.source_system,
-          address:
-            parent.address_id === null
-              ? null
-              : {
-                  street:
-                    structuredStreet.length > 0
-                      ? structuredStreet
-                      : parsedSiteAddress.street,
-                  city: parent.city_name ?? parsedSiteAddress.city,
-                  state:
-                    parent.address_state_code ??
-                    parsedSiteAddress.state ??
-                    parent.state_code,
-                  postalCode:
-                    parent.postal_code ?? parsedSiteAddress.postalCode,
-                  unnormalizedAddress: parent.unnormalized_address,
-                },
+          address: publicAddress,
           property:
             parent.property_id === null
               ? null

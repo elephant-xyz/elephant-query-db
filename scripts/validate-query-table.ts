@@ -1,10 +1,13 @@
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { Pool } from "pg";
 import { ParquetReader } from "@dsnp/parquetjs";
 
+import { mintSitusAddressIdentity } from "../src/loader/address-signature.js";
 import { appraisalSourceForCounty } from "./run-property-consolidation-export.js";
 
 /**
@@ -34,6 +37,7 @@ export type ValidateOptions = {
   readonly county: string;
   readonly envFile: string;
   readonly parquetOnly: boolean;
+  readonly reportPath: string;
 };
 
 export function parseOptions(argv: readonly string[]): ValidateOptions {
@@ -52,11 +56,17 @@ export function parseOptions(argv: readonly string[]): ValidateOptions {
   }
 
   const county = values.get("county") ?? "lee";
+  const parquetPath =
+    values.get("parquet") ??
+    join(".query-table-export", county, "query-table.parquet");
   return {
-    parquetPath: values.get("parquet") ?? join(".query-table-export", county, "query-table.parquet"),
+    parquetPath,
     county,
     envFile: values.get("env-file") ?? ".env.local",
     parquetOnly: values.get("parquet-only") === "true",
+    reportPath:
+      values.get("report") ??
+      join(dirname(parquetPath), "validation-report.json"),
   };
 }
 
@@ -96,17 +106,77 @@ export type ParquetStats = {
   readonly rowCount: number;
   readonly distinctRequestIdentifiers: number;
   readonly nullRequestIdentifiers: number;
+  readonly columns: readonly string[];
+  readonly missingIdentityColumns: readonly string[];
+  readonly eligibleIdentityRows: number;
+  readonly matchingIdentityRows: number;
+  readonly missingIdentityRows: number;
+  readonly ineligibleWithIdentityRows: number;
+  readonly partialIdentityRows: number;
+  readonly invalidUuidRows: number;
+  readonly invalidTokenRows: number;
+  readonly mismatchedIdentityRows: number;
 };
 
-/** Read the parquet and tally row count + distinct/null request_identifier. */
-async function readParquetStats(parquetPath: string): Promise<ParquetStats> {
+export type QueryTableValidationReport = {
+  readonly schemaVersion: "1";
+  readonly kind: "elephant-query-table-validation";
+  readonly county: string;
+  readonly parquetSha256: string;
+  readonly validatedAt: string;
+  readonly passed: boolean;
+  readonly databaseReconciled: boolean;
+  readonly failures: readonly string[];
+  readonly stats: ParquetStats;
+};
+
+const IDENTITY_COLUMNS = [
+  "state_code",
+  "address_street",
+  "address_zip",
+  "elephant_uuid",
+  "elephant_token",
+] as const;
+const UUID_V5_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+
+function optionalText(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const text = String(value);
+  return text.length === 0 ? null : text;
+}
+
+/** Read the parquet and validate every published `address:v1` identity. */
+export async function readParquetStats(
+  parquetPath: string,
+): Promise<ParquetStats> {
   const reader = await ParquetReader.openFile(parquetPath);
+  const columns = Object.keys(reader.getSchema().fields).sort();
+  const availableColumns = new Set(columns);
+  const missingIdentityColumns = IDENTITY_COLUMNS.filter(
+    (column) => !availableColumns.has(column),
+  );
+  const requestedColumns = [
+    "request_identifier",
+    ...IDENTITY_COLUMNS,
+  ].filter((column) => availableColumns.has(column));
   const seen = new Set<string>();
   let rowCount = 0;
   let nulls = 0;
+  let eligibleIdentityRows = 0;
+  let matchingIdentityRows = 0;
+  let missingIdentityRows = 0;
+  let ineligibleWithIdentityRows = 0;
+  let partialIdentityRows = 0;
+  let invalidUuidRows = 0;
+  let invalidTokenRows = 0;
+  let mismatchedIdentityRows = 0;
   try {
-    const cursor = reader.getCursor([["request_identifier"]]);
-    let record = (await cursor.next()) as { request_identifier?: unknown } | null;
+    const cursor = reader.getCursor(
+      requestedColumns.map((column) => [column]),
+    );
+    let record = (await cursor.next()) as Record<string, unknown> | null;
     while (record !== null) {
       rowCount += 1;
       const value = record.request_identifier;
@@ -115,12 +185,114 @@ async function readParquetStats(parquetPath: string): Promise<ParquetStats> {
       } else {
         seen.add(String(value));
       }
-      record = (await cursor.next()) as { request_identifier?: unknown } | null;
+      const elephantUuid = optionalText(record.elephant_uuid);
+      const elephantToken = optionalText(record.elephant_token);
+      const hasUuid = elephantUuid !== null;
+      const hasToken = elephantToken !== null;
+      const expected = mintSitusAddressIdentity({
+        state: optionalText(record.state_code),
+        postalCode: optionalText(record.address_zip),
+        street: optionalText(record.address_street),
+      });
+      if (hasUuid !== hasToken) partialIdentityRows += 1;
+      if (hasUuid && !UUID_V5_PATTERN.test(elephantUuid)) {
+        invalidUuidRows += 1;
+      }
+      if (hasToken && !SHA256_PATTERN.test(elephantToken)) {
+        invalidTokenRows += 1;
+      }
+      if (expected === null) {
+        if (hasUuid || hasToken) ineligibleWithIdentityRows += 1;
+      } else {
+        eligibleIdentityRows += 1;
+        if (!hasUuid && !hasToken) {
+          missingIdentityRows += 1;
+        } else if (
+          elephantUuid !== expected.elephantUuid ||
+          elephantToken !== expected.elephantToken
+        ) {
+          mismatchedIdentityRows += 1;
+        } else {
+          matchingIdentityRows += 1;
+        }
+      }
+      record = (await cursor.next()) as Record<string, unknown> | null;
     }
   } finally {
     await reader.close();
   }
-  return { rowCount, distinctRequestIdentifiers: seen.size, nullRequestIdentifiers: nulls };
+  return {
+    rowCount,
+    distinctRequestIdentifiers: seen.size,
+    nullRequestIdentifiers: nulls,
+    columns,
+    missingIdentityColumns,
+    eligibleIdentityRows,
+    matchingIdentityRows,
+    missingIdentityRows,
+    ineligibleWithIdentityRows,
+    partialIdentityRows,
+    invalidUuidRows,
+    invalidTokenRows,
+    mismatchedIdentityRows,
+  };
+}
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", resolve);
+  });
+  return hash.digest("hex");
+}
+
+async function writeValidationReport(
+  path: string,
+  report: QueryTableValidationReport,
+): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(report, null, 2)}\n`, {
+    mode: 0o600,
+  });
+}
+
+export function addressIdentityFailures(stats: ParquetStats): string[] {
+  const failures: string[] = [];
+  if (stats.missingIdentityColumns.length > 0) {
+    failures.push(
+      `missing address identity columns: ${stats.missingIdentityColumns.join(", ")}`,
+    );
+  }
+  if (stats.partialIdentityRows > 0) {
+    failures.push(
+      `${stats.partialIdentityRows} rows have only one address identity`,
+    );
+  }
+  if (stats.missingIdentityRows > 0) {
+    failures.push(
+      `${stats.missingIdentityRows} eligible address rows have no identity`,
+    );
+  }
+  if (stats.ineligibleWithIdentityRows > 0) {
+    failures.push(
+      `${stats.ineligibleWithIdentityRows} ineligible address rows have an identity`,
+    );
+  }
+  if (stats.invalidUuidRows > 0) {
+    failures.push(`${stats.invalidUuidRows} rows have an invalid UUIDv5`);
+  }
+  if (stats.invalidTokenRows > 0) {
+    failures.push(`${stats.invalidTokenRows} rows have an invalid SHA-256 token`);
+  }
+  if (stats.mismatchedIdentityRows > 0) {
+    failures.push(
+      `${stats.mismatchedIdentityRows} rows do not match address:v1 recomputation`,
+    );
+  }
+  return failures;
 }
 
 /** Distinct folio count in Neon, using the SAME COALESCE key the export dedups on. */
@@ -156,6 +328,8 @@ async function main(): Promise<void> {
   const stats = await readParquetStats(options.parquetPath);
   console.log(JSON.stringify({ event: "parquet_stats", ...stats }));
 
+  failures.push(...addressIdentityFailures(stats));
+
   // Check 1: folio uniqueness — every row is a distinct request_identifier.
   if (stats.nullRequestIdentifiers > 0) {
     failures.push(`${stats.nullRequestIdentifiers} rows have a NULL/empty request_identifier`);
@@ -170,6 +344,7 @@ async function main(): Promise<void> {
 
   // Check 2: reconcile against Neon (skippable without DB access).
   const databaseUrl = process.env["DATABASE_URL"];
+  let databaseReconciled = false;
   if (options.parquetOnly || databaseUrl === undefined || databaseUrl.trim().length === 0) {
     console.warn(
       JSON.stringify({
@@ -194,11 +369,34 @@ async function main(): Promise<void> {
         failures.push(
           `row count ${stats.rowCount} != Neon distinct request_identifier ${expected}`,
         );
+      } else {
+        databaseReconciled = true;
       }
     } finally {
       await pg.end();
     }
   }
+
+  const report: QueryTableValidationReport = {
+    schemaVersion: "1",
+    kind: "elephant-query-table-validation",
+    county: options.county,
+    parquetSha256: await sha256File(options.parquetPath),
+    validatedAt: new Date().toISOString(),
+    passed: failures.length === 0,
+    databaseReconciled,
+    failures,
+    stats,
+  };
+  await writeValidationReport(options.reportPath, report);
+  console.log(
+    JSON.stringify({
+      event: "query_table_validation_report_written",
+      reportPath: options.reportPath,
+      parquetSha256: report.parquetSha256,
+      databaseReconciled,
+    }),
+  );
 
   if (failures.length > 0) {
     console.error(JSON.stringify({ event: "query_table_validation_failed", failures }));

@@ -10,6 +10,7 @@ import { Pool } from "pg";
 import { computeIpfsCid } from "./run-property-consolidation-export.js";
 import {
   assertPublicNonPii,
+  assertPublicPropertyAddressIdentity,
   sourceSystemForCounty,
 } from "./run-public-property-export.js";
 import {
@@ -17,6 +18,10 @@ import {
   isJsonObject,
   readSourcePolygons,
 } from "./public-geometry.js";
+import {
+  addressIdentityFailures,
+  readParquetStats,
+} from "./validate-query-table.js";
 import { PUBLIC_COVERAGE_ENRICHMENT_TRACKS } from "./write-public-coverage-snapshot.js";
 
 /**
@@ -611,6 +616,7 @@ export async function validatePublicationDryRun(
         deniedPiiFindings += 1;
         throw new Error(`Denied PII in folio ${entry.parcelIdentifier}`);
       }
+      assertPublicPropertyAddressIdentity(record.address ?? null);
       if (record.requestIdentifier !== entry.parcelIdentifier) {
         throw new Error(`Manifest identity mismatch for ${entry.parcelIdentifier}`);
       }
@@ -785,6 +791,15 @@ export async function validatePublicationDryRun(
       sample,
       recordsByFolio,
     );
+    const queryTableIdentityStats = await readParquetStats(
+      options.queryTablePath,
+    );
+    const identityFailures = addressIdentityFailures(queryTableIdentityStats);
+    if (identityFailures.length > 0) {
+      throw new Error(
+        `Query-table address identity gate failed: ${identityFailures.join("; ")}`,
+      );
+    }
     const parquetReader = await ParquetReader.openFile(options.queryTablePath);
     let queryTableRows = 0;
     let queryTableNullFolios = 0;
@@ -864,6 +879,9 @@ export async function validatePublicationDryRun(
     const manifestCid = await computeIpfsCid(manifestBody);
     const queryTableBody = await readFile(options.queryTablePath);
     const queryTableCid = await computeIpfsCid(queryTableBody);
+    const queryTableSha256 = createHash("sha256")
+      .update(queryTableBody)
+      .digest("hex");
     const coverageCid = await computeIpfsCid(coverageBody);
     if (
       indexCid === null ||
@@ -906,6 +924,12 @@ export async function validatePublicationDryRun(
       queryTableNullFolios,
       queryTableOwnerValues,
       queryTableUnexpectedEnrichment,
+      queryTableIdentity: {
+        passed: true,
+        databaseReconciled: true,
+        parquetSha256: queryTableSha256,
+        stats: queryTableIdentityStats,
+      },
       sampledArtifactsMatched,
       coverageTracks: Object.fromEntries(
         [...coverageRows].map(([name, row]) => [
@@ -931,6 +955,7 @@ export async function validatePublicationDryRun(
           path: options.queryTablePath,
           bytes: (await stat(options.queryTablePath)).size,
           cid: queryTableCid,
+          sha256: queryTableSha256,
         },
         coverage: {
           path: options.coveragePath,
