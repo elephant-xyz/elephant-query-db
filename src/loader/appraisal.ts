@@ -151,6 +151,8 @@ const STRUCTURE_COLUMNS = [
   "roof_condition",
   "roof_age_years",
   "roof_date",
+  "roof_date_source",
+  "roof_date_lineage",
   "roof_underlayment_type",
   "roof_structure_material",
   "foundation_type",

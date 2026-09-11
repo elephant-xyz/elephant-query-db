@@ -37,6 +37,10 @@ function sourceRow(overrides: Partial<QueryTableSourceRow>): QueryTableSourceRow
     lot_area_sqft: null,
     exterior_wall_material: null,
     roof_covering_material: null,
+    roof_date: null,
+    roof_age_years: null,
+    roof_date_source: null,
+    roof_date_lineage: null,
     property_type: null,
     property_usage_type: null,
     built_year: null,
@@ -151,6 +155,50 @@ describe("query table living-area (Sq Ft) sourcing", () => {
     expect(row.elephant_token).toBe(
       "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
     );
+  });
+});
+
+describe("query table roof-date contract", () => {
+  it("emits roof date, age, source, and lineage as scalar parquet fields", () => {
+    const lineage = JSON.stringify({
+      schemaVersion: "elephant.roof-date-lineage.v1",
+      currentSource: "permit",
+      currentRoofDate: "2023-06-15",
+    });
+    expect(
+      buildQueryTableRow(
+        sourceRow({
+          roof_date: "2023-06-15",
+          roof_age_years: "3",
+          roof_date_source: "permit",
+          roof_date_lineage: lineage,
+        }),
+        null,
+      ),
+    ).toMatchObject({
+      roof_date: "2023-06-15",
+      roof_age_years: 3,
+      roof_date_source: "permit",
+      roof_date_lineage: lineage,
+    });
+
+    const schema = buildQueryTableParquetSchema();
+    expect(schema.schema.roof_date).toMatchObject({ type: "UTF8" });
+    expect(schema.schema.roof_age_years).toMatchObject({ type: "INT64" });
+    expect(schema.schema.roof_date_source).toMatchObject({ type: "UTF8" });
+    expect(schema.schema.roof_date_lineage).toMatchObject({ type: "UTF8" });
+  });
+
+  it("surfaces the canonical roof state already resolved by ingest", () => {
+    const sql = buildQueryTableSql("duval_appraiser", false, false, null);
+    expect(sql).toContain("sp.roof_date AS roof_date");
+    expect(sql).toContain("sp.roof_age_years AS roof_age_years");
+    expect(sql).toContain("sp.roof_date_source AS roof_date_source");
+    expect(sql).toContain(
+      "sp.roof_date_lineage::text AS roof_date_lineage",
+    );
+    expect(sql).not.toContain("age(current_date");
+    expect(sql).not.toContain("LEFT JOIN roof_resolved");
   });
 });
 

@@ -482,6 +482,8 @@ export const structures = pgTable(
     roofCondition: text("roof_condition"),
     roofAgeYears: integer("roof_age_years"),
     roofDate: text("roof_date"),
+    roofDateSource: text("roof_date_source"),
+    roofDateLineage: nullableJsonObjectColumn("roof_date_lineage"),
     roofUnderlaymentType: text("roof_underlayment_type"),
     roofStructureMaterial: text("roof_structure_material"),
     foundationType: text("foundation_type"),

@@ -41,6 +41,10 @@ export type PublicQueryTableSourceRow = {
   readonly lot_area_sqft: string | null;
   readonly exterior_wall_material: string | null;
   readonly roof_covering_material: string | null;
+  readonly roof_date: string | null;
+  readonly roof_age_years: number | string | null;
+  readonly roof_date_source: string | null;
+  readonly roof_date_lineage: string | null;
   readonly property_type: string | null;
   readonly property_usage_type: string | null;
   readonly built_year: number | null;
@@ -217,10 +221,23 @@ async function fetchRows(
         SELECT DISTINCT ON (request_identifier)
           request_identifier,
           exterior_wall_material_primary,
-          roof_covering_material
+          roof_covering_material,
+          roof_date,
+          roof_age_years,
+          roof_date_source,
+          roof_date_lineage
         FROM structures
         WHERE source_system = $1
-        ORDER BY request_identifier, structure_id
+        ORDER BY
+          request_identifier,
+          CASE
+            WHEN roof_date_source = 'permit' THEN 0
+            WHEN roof_date_source = 'parcel' THEN 1
+            WHEN roof_date_source = 'derived-from-construction-year' THEN 2
+            ELSE 3
+          END,
+          updated_at DESC NULLS LAST,
+          structure_id
       ),
       layout_totals AS (
         SELECT
@@ -279,6 +296,10 @@ async function fetchRows(
         lot.lot_area_sqft,
         structure.exterior_wall_material_primary AS exterior_wall_material,
         structure.roof_covering_material,
+        structure.roof_date,
+        structure.roof_age_years,
+        structure.roof_date_source,
+        structure.roof_date_lineage::text AS roof_date_lineage,
         property.property_type,
         property.property_usage_type,
         property.property_structure_built_year AS built_year,
@@ -337,6 +358,10 @@ export function buildPublicQueryTableRow(
   cid: string,
 ): QueryTableRow {
   const lotAreaSqft = numberOrNull(row.lot_area_sqft);
+  const roofAgeYears =
+    row.roof_age_years === null
+      ? null
+      : numberOrNull(String(row.roof_age_years));
   const parsedSiteAddress = parseRockIslandSiteAddress(
     row.address_unnormalized,
   );
@@ -371,6 +396,11 @@ export function buildPublicQueryTableRow(
     lot_area_sqft: lotAreaSqft,
     exterior_wall_material: row.exterior_wall_material,
     roof_covering_material: row.roof_covering_material,
+    roof_date: row.roof_date,
+    roof_age_years:
+      roofAgeYears === null ? null : Math.trunc(roofAgeYears),
+    roof_date_source: row.roof_date_source,
+    roof_date_lineage: row.roof_date_lineage,
     property_type: row.property_type,
     property_usage_type: row.property_usage_type,
     built_year: row.built_year,

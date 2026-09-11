@@ -174,6 +174,11 @@ describe("public query-table redaction", () => {
     lot_area_sqft: "65340",
     exterior_wall_material: null,
     roof_covering_material: null,
+    roof_date: "1980-01-01",
+    roof_age_years: 46,
+    roof_date_source: "derived-from-construction-year",
+    roof_date_lineage:
+      '{"schemaVersion":"elephant.roof-date-lineage.v1","currentSource":"derived-from-construction-year"}',
     property_type: "RESIDENTIAL",
     property_usage_type: "SINGLE_FAMILY",
     built_year: 1980,
@@ -197,6 +202,11 @@ describe("public query-table redaction", () => {
       owner_occupied: null,
       has_permits: false,
       permit_count: 0,
+      roof_date: "1980-01-01",
+      roof_age_years: 46,
+      roof_date_source: "derived-from-construction-year",
+      roof_date_lineage:
+        '{"schemaVersion":"elephant.roof-date-lineage.v1","currentSource":"derived-from-construction-year"}',
       has_sunbiz_tenant: false,
       has_bbb_contractor: false,
     });
