@@ -24,6 +24,7 @@ import { from as copyFrom } from "pg-copy-streams";
 import { Client } from "pg";
 
 import {
+  buildAppraisalSitusAddressContext,
   mapAppraisalTransformedFile,
   mergeBulkStageTable,
   readBulkTableColumns,
@@ -206,28 +207,42 @@ async function loadParcelFast(
 
     if (zipBuf !== null && zipBuf.length > 0) {
       const zip = new AdmZip(zipBuf);
-      const entries = zip.getEntries();
-      for (const entry of entries) {
-        const entryName = entry.entryName;
-        if (
-          entryName.endsWith(".json") &&
-          !entryName.startsWith("relationship_") &&
-          !entry.isDirectory
-        ) {
+      const parsedEntries = zip
+        .getEntries()
+        .filter(
+          (entry) =>
+            entry.entryName.endsWith(".json") &&
+            !entry.entryName.startsWith("relationship_") &&
+            !entry.isDirectory,
+        )
+        .flatMap((entry) => {
           try {
-            const text = entry.getData().toString("utf8");
-            const record = JSON.parse(text) as unknown;
-            const bundle = mapAppraisalTransformedFile({
-              filePath: entryName,
-              record,
-              artifactUri: `file://${parcelDir}/${entryName}`,
-              sourceSystem: options.sourceSystem,
-              countyName: options.countyName,
-              stateCode: options.stateCode,
-            });
-            rows.push(...bundle.rows);
-          } catch {}
-        }
+            return [{
+              entry,
+              filePath: entry.entryName,
+              record: JSON.parse(entry.getData().toString("utf8")) as unknown,
+            }];
+          } catch {
+            return [];
+          }
+        });
+      const situsAddressContext = buildAppraisalSitusAddressContext({
+        entries: parsedEntries,
+        sourceSystem: options.sourceSystem,
+        stateCode: options.stateCode,
+      });
+      for (const { entry, record } of parsedEntries) {
+        const entryName = entry.entryName;
+        const bundle = mapAppraisalTransformedFile({
+          filePath: entryName,
+          record,
+          artifactUri: `file://${parcelDir}/${entryName}`,
+          sourceSystem: options.sourceSystem,
+          countyName: options.countyName,
+          stateCode: options.stateCode,
+          situsAddressContext,
+        });
+        rows.push(...bundle.rows);
       }
       return rows;
     }
@@ -239,6 +254,15 @@ async function loadParcelFast(
       readFile(join(parcelDir, "property_seed.json"), "utf8").catch(() => null),
       readFile(join(parcelDir, "unnormalized_address.json"), "utf8").catch(() => null),
     ]);
+    const unnormalizedAddressRecord =
+      addrText === null ? null : (JSON.parse(addrText) as unknown);
+    const situsAddressContext = buildAppraisalSitusAddressContext({
+      entries: unnormalizedAddressRecord === null
+        ? []
+        : [{ filePath: "unnormalized_address.json", record: unnormalizedAddressRecord }],
+      sourceSystem: options.sourceSystem,
+      stateCode: options.stateCode,
+    });
 
     if (seedText) {
       const b = mapAppraisalTransformedFile({
@@ -248,17 +272,19 @@ async function loadParcelFast(
         sourceSystem: options.sourceSystem,
         countyName: options.countyName,
         stateCode: options.stateCode,
+        situsAddressContext,
       });
       rows.push(...b.rows);
     }
     if (addrText) {
       const b = mapAppraisalTransformedFile({
         filePath: "unnormalized_address.json",
-        record: JSON.parse(addrText) as unknown,
+        record: unnormalizedAddressRecord,
         artifactUri: `file://${join(parcelDir, "unnormalized_address.json")}`,
         sourceSystem: options.sourceSystem,
         countyName: options.countyName,
         stateCode: options.stateCode,
+        situsAddressContext,
       });
       rows.push(...b.rows);
     }
@@ -275,6 +301,7 @@ async function loadParcelFast(
             sourceSystem: options.sourceSystem,
             countyName: options.countyName,
             stateCode: options.stateCode,
+            situsAddressContext,
           });
           return b.rows;
         } catch {

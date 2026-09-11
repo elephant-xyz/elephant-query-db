@@ -26,6 +26,9 @@
 #                                 analytical use).
 #   VALIDATE_MODE     (optional)  parquet-only (default, mid-ingest safe) | full
 #                                 (completeness gate for a FINAL publish).
+#   REQUIRE_ADDRESS_IDENTITY (optional) true => require every mintable address
+#                                 to have a persisted ingestion-time identity,
+#                                 and fail validation on incomplete addresses.
 #   PUBLISH_APPROVED  (optional)  empty (default) => DRY-RUN publish (no upload);
 #                                 non-empty => REAL publish. The PII human-gate.
 #   STEP              (optional)  all (default) | export | validate | publish
@@ -41,6 +44,7 @@ ENV_FILE="${ENV_FILE:-.env.local}"
 PUBLISH_ENV_FILE="${PUBLISH_ENV_FILE:-$ENV_FILE}"
 OUT_DIR="${OUT_DIR:-.query-table-export}"
 VALIDATE_MODE="${VALIDATE_MODE:-parquet-only}"
+REQUIRE_ADDRESS_IDENTITY="${REQUIRE_ADDRESS_IDENTITY:-false}"
 PUBLISH_APPROVED="${PUBLISH_APPROVED:-}"
 
 PARQUET="$OUT_DIR/$COUNTY/query-table.parquet"
@@ -51,7 +55,7 @@ else
   PUBLISH_APPROVED_LOG="false"
 fi
 
-echo "{\"event\":\"query_table_publish_entrypoint_started\",\"county\":\"$COUNTY\",\"step\":\"$STEP\",\"validateMode\":\"$VALIDATE_MODE\",\"publishApproved\":$PUBLISH_APPROVED_LOG}"
+echo "{\"event\":\"query_table_publish_entrypoint_started\",\"county\":\"$COUNTY\",\"step\":\"$STEP\",\"validateMode\":\"$VALIDATE_MODE\",\"requireAddressIdentity\":\"$REQUIRE_ADDRESS_IDENTITY\",\"publishApproved\":$PUBLISH_APPROVED_LOG}"
 
 # Fargate injects DATABASE_URL + Filebase creds via Secrets Manager. Node 22 also
 # treats `--env-file` as a *runtime* flag, so passing it to tsx makes node try to
@@ -71,6 +75,9 @@ run_export() {
   if [ -n "${MANIFEST:-}" ]; then
     EXPORT_ARGS="$EXPORT_ARGS --manifest $MANIFEST"
   fi
+  if [ "$REQUIRE_ADDRESS_IDENTITY" = "true" ]; then
+    EXPORT_ARGS="$EXPORT_ARGS --require-stored-address-identity"
+  fi
   # shellcheck disable=SC2086
   "$TSX" scripts/run-query-table-export.ts $EXPORT_ARGS
 }
@@ -82,6 +89,9 @@ run_validate() {
   fi
   if [ "$VALIDATE_MODE" = "parquet-only" ]; then
     VALIDATE_ARGS="$VALIDATE_ARGS --parquet-only"
+  fi
+  if [ "$REQUIRE_ADDRESS_IDENTITY" = "true" ]; then
+    VALIDATE_ARGS="$VALIDATE_ARGS --require-complete-address-identity"
   fi
   # shellcheck disable=SC2086
   "$TSX" scripts/validate-query-table.ts $VALIDATE_ARGS

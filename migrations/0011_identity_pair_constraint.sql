@@ -1,0 +1,1 @@
+ALTER TABLE "addresses" ADD CONSTRAINT "addresses_elephant_identity_pair_check" CHECK (("addresses"."elephant_uuid" IS NULL) = ("addresses"."elephant_token" IS NULL));

@@ -11,6 +11,7 @@ import {
 } from "../scripts/run-bulk-data-load.js";
 import {
   assertAppraisalPrefixIsScoped,
+  buildAppraisalSitusAddressContext,
   buildAppraisalTransformedArtifactUri,
   buildNormalizedAddressKey,
   buildBulkMergeSql,
@@ -45,6 +46,7 @@ import {
   isSunbizAddressRecordSelected,
   isSunbizClassRecordSelected,
   normalizeParcelIdentifier,
+  mintSitusAddressIdentity,
   parseAppraisalSourcePayloadSidecar,
   parseJsonArtifactRecords,
   preparedRowsContainSelectedParcel,
@@ -1026,6 +1028,129 @@ describe("source mappers", () => {
       "lee_appraiser:36-43-24-00-00001.0000:address:site",
     );
     expect(property.values.property_structure_built_year).toBe(1);
+  });
+
+  it("mints address:v1 identity when the canonical site address is created", () => {
+    const bundle = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/address.json",
+      filePath: "address.json",
+      requestIdentifier: "11659-jonathan",
+      record: {
+        request_identifier: "11659-jonathan",
+        unnormalized_address:
+          "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+      },
+      sourceSystem: "duval_appraiser",
+      countyName: "Duval",
+      stateCode: "FL",
+    });
+    const address = findRow(bundle.rows, "addresses");
+
+    expect(address.values.elephant_uuid).toBe(
+      "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+    );
+    expect(address.values.elephant_token).toBe(
+      "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+    );
+    expect(address.values.city_name).toBe("JACKSONVILLE");
+    expect(address.values.postal_code).toBe("32225");
+  });
+
+  it("uses the authoritative sibling situs record instead of address-row mailing data", () => {
+    const situsAddressContext = buildAppraisalSitusAddressContext({
+      entries: [{
+        filePath: "data/unnormalized_address.json",
+        record: { full_address: "11659 JONATHAN RD, JACKSONVILLE, FL 32225" },
+      }],
+      sourceSystem: "duval_appraiser",
+      stateCode: "FL",
+    });
+    const bundle = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/address.json",
+      filePath: "address.json",
+      requestIdentifier: "11659-jonathan",
+      record: {
+        request_identifier: "11659-jonathan",
+        unnormalized_address: "1 MAILING ST, NEW YORK, NY 10001",
+      },
+      sourceSystem: "duval_appraiser",
+      countyName: "Duval",
+      stateCode: "FL",
+      situsAddressContext,
+    });
+    const address = findRow(bundle.rows, "addresses");
+
+    expect(address.values.elephant_uuid).toBe(
+      "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+    );
+    expect(address.values.elephant_token).toBe(
+      "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+    );
+  });
+
+  it("retains pre- and post-directionals in structured situs fallback", () => {
+    const bundle = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/address.json",
+      filePath: "address.json",
+      requestIdentifier: "directional-site",
+      record: {
+        request_identifier: "directional-site",
+        street_number: "100",
+        street_pre_directional_text: "N",
+        street_name: "MAIN",
+        street_suffix_type: "ST",
+        street_post_directional_text: "E",
+        postal_code: "32225",
+      },
+      sourceSystem: "duval_appraiser",
+      countyName: "Duval",
+      stateCode: "FL",
+    });
+    const expected = mintSitusAddressIdentity({
+      state: "FL",
+      postalCode: "32225",
+      street: "100 N MAIN ST E",
+    });
+
+    expect(findRow(bundle.rows, "addresses").values.elephant_uuid).toBe(
+      expected?.elephantUuid,
+    );
+  });
+
+  it("does not mint property identity for incomplete or mailing addresses", () => {
+    const incompleteSite = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/address.json",
+      filePath: "address.json",
+      requestIdentifier: "incomplete-site",
+      record: {
+        request_identifier: "incomplete-site",
+        unnormalized_address: "123 MAIN ST",
+      },
+      sourceSystem: "duval_appraiser",
+      countyName: "Duval",
+      stateCode: "FL",
+    });
+    const mailing = mapAppraisalTransformedFile({
+      artifactUri: "s3://bucket/appraisal/mailing_address_1.json",
+      filePath: "mailing_address_1.json",
+      requestIdentifier: "11659-jonathan",
+      record: {
+        request_identifier: "11659-jonathan",
+        unnormalized_address: "1 MAILING ST, NEW YORK, NY 10001",
+      },
+      sourceSystem: "duval_appraiser",
+      countyName: "Duval",
+      stateCode: "FL",
+    });
+
+    expect(
+      findRow(incompleteSite.rows, "addresses").values.elephant_uuid,
+    ).toBeNull();
+    expect(
+      findRow(incompleteSite.rows, "addresses").values.elephant_token,
+    ).toBeNull();
+    expect(findRow(mailing.rows, "addresses").values.elephant_uuid).toBeNull();
+    expect(findRow(mailing.rows, "addresses").values.elephant_token).toBeNull();
   });
 
   it("retains a transform source sidecar in Rock Island source_payload", () => {
