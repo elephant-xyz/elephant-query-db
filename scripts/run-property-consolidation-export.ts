@@ -7,7 +7,15 @@ import { pathToFileURL } from "node:url";
 
 import { Pool } from "pg";
 
-import { mintAddressIdentity } from "../src/loader/address-signature.js";
+import {
+  mintAddressIdentity,
+  parseUnnormalizedAddress,
+} from "../src/loader/address-signature.js";
+
+export {
+  parseUnnormalizedAddress,
+  type ParsedUnnormalizedAddress,
+} from "../src/loader/address-signature.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -421,8 +429,10 @@ type ParcelRow = {
 type AddressRow = {
   address_id: string;
   street_number: string | null;
+  street_pre_directional_text?: string | null;
   street_name: string | null;
   street_suffix_type: string | null;
+  street_post_directional_text?: string | null;
   unit_identifier?: string | null;
   city_name: string | null;
   state_code: string | null;
@@ -431,6 +441,8 @@ type AddressRow = {
   longitude: string | null;
   unnormalized_address: string | null;
   normalized_address_key: string | null;
+  elephant_uuid?: string | null;
+  elephant_token?: string | null;
 };
 
 type TaxRow = {
@@ -809,70 +821,6 @@ function normalizeParcelIdentifier(identifier: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Unnormalized address parsing
-// ---------------------------------------------------------------------------
-
-export type ParsedUnnormalizedAddress = {
-  readonly street: string | null;
-  readonly city: string | null;
-  readonly postalCode: string | null;
-};
-
-const TRAILING_STATE_ZIP_RE = /\b[A-Za-z]{2}\s+(\d{5})(?:-\d{4})?\s*$/;
-const TRAILING_ZIP_RE = /\b(\d{5})(?:-\d{4})?\s*$/;
-
-/**
- * Parse a free-text single-line address in the standard US form
- * "STREET, CITY, STATE ZIP" back into discrete street / city / ZIP fields.
- *
- * The lee_appraiser source stores addresses ONLY as this free-text string in
- * `addresses.unnormalized_address`; the structured street_* / city_name columns are
- * null. The NEO app renders street and city as separate fields, so we split them
- * back apart here.
- *
- * State is deliberately NOT returned: the DB `state_code` (only ever 'FL' or null,
- * never a wrong value) is authoritative, and NEO falls back to the parcel's
- * stateCode (FL for 100% of parcels). A parsed state token would inject wrong
- * source values (e.g. "MI", "NC") into the ~37k rows whose state_code is null.
- */
-export function parseUnnormalizedAddress(
-  value: string | null | undefined,
-): ParsedUnnormalizedAddress {
-  const empty: ParsedUnnormalizedAddress = { street: null, city: null, postalCode: null };
-  if (value === null || value === undefined) return empty;
-  const trimmed = value.trim();
-  if (trimmed.length === 0) return empty;
-
-  const segments = trimmed
-    .split(",")
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0);
-  if (segments.length === 0) return empty;
-
-  // Peel a trailing "STATE ZIP" (or bare ZIP) off the final segment.
-  let postalCode: string | null = null;
-  const last = segments[segments.length - 1] ?? "";
-  const stateZip = TRAILING_STATE_ZIP_RE.exec(last);
-  const zipOnly = TRAILING_ZIP_RE.exec(last);
-  if (stateZip?.[1] !== undefined) {
-    postalCode = stateZip[1];
-    const head = last.replace(TRAILING_STATE_ZIP_RE, "").trim();
-    if (head.length > 0) segments[segments.length - 1] = head;
-    else segments.pop();
-  } else if (zipOnly?.[1] !== undefined) {
-    postalCode = zipOnly[1];
-    const head = last.replace(TRAILING_ZIP_RE, "").trim();
-    if (head.length > 0) segments[segments.length - 1] = head;
-    else segments.pop();
-  }
-
-  const street = segments.length > 0 ? (segments[0] ?? null) : null;
-  const cityParts = segments.slice(1);
-  const city = cityParts.length > 0 ? cityParts.join(", ") : null;
-  return { street, city, postalCode };
-}
-
-// ---------------------------------------------------------------------------
 // Contractor name normalization (mirrors catalog commercial-contractor-quality-overlay.mjs)
 // ---------------------------------------------------------------------------
 
@@ -1044,8 +992,14 @@ export function assemblePropertyRecord(params: AssembleParams): ConsolidatedProp
   const { property, parcel, address, county, collectedAt } = params;
 
   const structuredStreet = address !== null
-    ? [address.street_number, address.street_name, address.street_suffix_type]
-        .filter((part): part is string => part !== null && part.length > 0)
+    ? [
+        address.street_number,
+        address.street_pre_directional_text,
+        address.street_name,
+        address.street_suffix_type,
+        address.street_post_directional_text,
+      ]
+        .filter((part): part is string => part !== null && part !== undefined && part.length > 0)
         .join(" ") || null
     : null;
 
@@ -1061,13 +1015,20 @@ export function assemblePropertyRecord(params: AssembleParams): ConsolidatedProp
   // mailing when structured columns are populated). Do not mix in a situs
   // parse for some fields and mailing `unit_identifier` for others — that is
   // what the query-table publisher must also avoid, via mintSitusAddressIdentity.
-  const identity = mintAddressIdentity({
+  const derivedIdentity = mintAddressIdentity({
     country: "us",
     state,
     postalCode,
     street,
     unit: address?.unit_identifier ?? null,
   });
+  const storedUuid = address?.elephant_uuid ?? null;
+  const storedToken = address?.elephant_token ?? null;
+  if ((storedUuid === null) !== (storedToken === null)) {
+    throw new Error(
+      `Stored Elephant identity is incomplete for address ${address?.address_id ?? "unknown"}`,
+    );
+  }
 
   const addressShape: AddressShape = {
     street,
@@ -1076,8 +1037,8 @@ export function assemblePropertyRecord(params: AssembleParams): ConsolidatedProp
     postalCode,
     latitude: address?.latitude ?? null,
     longitude: address?.longitude ?? null,
-    elephantUuid: identity?.elephantUuid ?? null,
-    elephantToken: identity?.elephantToken ?? null,
+    elephantUuid: storedUuid ?? derivedIdentity?.elephantUuid ?? null,
+    elephantToken: storedToken ?? derivedIdentity?.elephantToken ?? null,
   };
 
   const propertyShape: PropertyShape = {
@@ -1575,9 +1536,10 @@ async function fetchParcels(pool: Pool, parcelIds: readonly string[]): Promise<P
 async function fetchAddresses(pool: Pool, addressIds: readonly string[]): Promise<AddressRow[]> {
   if (addressIds.length === 0) return [];
   const result = await pool.query<AddressRow>(
-    `SELECT address_id, street_number, street_name, street_suffix_type,
+    `SELECT address_id, street_number, street_pre_directional_text,
+            street_name, street_suffix_type, street_post_directional_text,
             unit_identifier, city_name, state_code, postal_code, latitude, longitude,
-            unnormalized_address, normalized_address_key
+            unnormalized_address, normalized_address_key, elephant_uuid::text, elephant_token
      FROM addresses WHERE address_id = ANY($1::uuid[])`,
     [addressIds],
   );

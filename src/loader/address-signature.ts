@@ -26,6 +26,15 @@ export type AddressIdentity = {
   readonly elephantUuid: string;
 };
 
+export type ParsedUnnormalizedAddress = {
+  readonly street: string | null;
+  readonly city: string | null;
+  readonly postalCode: string | null;
+};
+
+const TRAILING_STATE_ZIP_RE = /\b[A-Za-z]{2}\s+(\d{5})(?:-\d{4})?\s*$/;
+const TRAILING_ZIP_RE = /\b(\d{5})(?:-\d{4})?\s*$/;
+
 function normalizeField(value: unknown): string {
   if (value === null || value === undefined) return "";
   return String(value)
@@ -59,6 +68,51 @@ function uuidV5(name: string, namespace: string): string {
   digest[8] = ((digest[8] ?? 0) & 0x3f) | 0x80;
   const hex = digest.toString("hex");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/**
+ * Split a free-text US address into the fields required by `address:v1`.
+ * State is deliberately excluded: callers must use authoritative jurisdiction
+ * metadata instead of trusting a possibly stale state token in source text.
+ */
+export function parseUnnormalizedAddress(
+  value: string | null | undefined,
+): ParsedUnnormalizedAddress {
+  const empty: ParsedUnnormalizedAddress = {
+    street: null,
+    city: null,
+    postalCode: null,
+  };
+  if (value === null || value === undefined) return empty;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return empty;
+
+  const segments = trimmed
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  if (segments.length === 0) return empty;
+
+  let postalCode: string | null = null;
+  const last = segments[segments.length - 1] ?? "";
+  const stateZip = TRAILING_STATE_ZIP_RE.exec(last);
+  const zipOnly = TRAILING_ZIP_RE.exec(last);
+  if (stateZip?.[1] !== undefined) {
+    postalCode = stateZip[1];
+    const head = last.replace(TRAILING_STATE_ZIP_RE, "").trim();
+    if (head.length > 0) segments[segments.length - 1] = head;
+    else segments.pop();
+  } else if (zipOnly?.[1] !== undefined) {
+    postalCode = zipOnly[1];
+    const head = last.replace(TRAILING_ZIP_RE, "").trim();
+    if (head.length > 0) segments[segments.length - 1] = head;
+    else segments.pop();
+  }
+
+  const street = segments[0] ?? null;
+  const cityParts = segments.slice(1);
+  const city = cityParts.length > 0 ? cityParts.join(", ") : null;
+  return { street, city, postalCode };
 }
 
 /**

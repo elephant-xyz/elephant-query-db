@@ -59,8 +59,10 @@ export type QueryTableSourceRow = {
   readonly county_name: string | null;
   readonly state_code: string | null;
   readonly street_number: string | null;
+  readonly street_pre_directional_text: string | null;
   readonly street_name: string | null;
   readonly street_suffix_type: string | null;
+  readonly street_post_directional_text: string | null;
   readonly city_name: string | null;
   readonly postal_code: string | null;
   /**
@@ -71,6 +73,8 @@ export type QueryTableSourceRow = {
   readonly unit_identifier: string | null;
   readonly unnormalized_address: string | null;
   readonly situs_full_address: string | null;
+  readonly stored_elephant_uuid: string | null;
+  readonly stored_elephant_token: string | null;
   readonly latitude: string | null;
   readonly longitude: string | null;
   readonly lot_size_acre: string | null;
@@ -157,6 +161,7 @@ export type QueryTableExportOptions = {
   readonly county: string;
   readonly envFile: string;
   readonly manifestPath: string | null;
+  readonly requireStoredAddressIdentity: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -219,7 +224,7 @@ function resolveSitusAddress(row: QueryTableSourceRow): ResolvedAddress {
     (situs.street !== null && /\d/.test(situs.street));
 
   const structuredStreet =
-    [row.street_number, row.street_name, row.street_suffix_type]
+    [row.street_number, row.street_pre_directional_text, row.street_name, row.street_suffix_type, row.street_post_directional_text]
       .filter((part): part is string => part !== null && part.length > 0)
       .join(" ") || null;
   const columnParsed = parseUnnormalizedAddress(row.unnormalized_address);
@@ -249,13 +254,45 @@ function resolveSitusAddress(row: QueryTableSourceRow): ResolvedAddress {
  * land-inflated for Lee (median 13,266 vs 3,424 living) and unreliable as a
  * building measure.
  */
-export function buildQueryTableRow(row: QueryTableSourceRow, cid: string | null): QueryTableRow {
+export function buildQueryTableRow(
+  row: QueryTableSourceRow,
+  cid: string | null,
+  requireStoredAddressIdentity = false,
+): QueryTableRow {
   const address = resolveSitusAddress(row);
-  const identity = mintSitusAddressIdentity({
+  const derivedIdentity = mintSitusAddressIdentity({
     state: toText(row.state_code),
     postalCode: address.zip,
     street: address.street,
   });
+  const storedUuid = toText(row.stored_elephant_uuid);
+  const storedToken = toText(row.stored_elephant_token);
+  if ((storedUuid === null) !== (storedToken === null)) {
+    throw new Error(
+      `Stored Elephant identity is incomplete for property ${row.property_id}`,
+    );
+  }
+  if (
+    requireStoredAddressIdentity &&
+    derivedIdentity !== null &&
+    storedUuid === null
+  ) {
+    throw new Error(
+      `Stored Elephant identity is missing for property ${row.property_id}`,
+    );
+  }
+  if (storedUuid !== null && storedToken !== null) {
+    if (
+      derivedIdentity === null ||
+      storedUuid !== derivedIdentity.elephantUuid ||
+      storedToken !== derivedIdentity.elephantToken
+    ) {
+      throw new Error(
+        `Stored Elephant identity disagrees with address:v1 for property ${row.property_id}`,
+      );
+    }
+  }
+  const identity = derivedIdentity;
 
   const lotAreaSqft = toNumber(row.lot_area_sqft);
   const lotSizeAcre =
@@ -405,6 +442,8 @@ export function parseOptions(argv: readonly string[]): QueryTableExportOptions {
     county: values.get("county") ?? "lee",
     envFile: values.get("env-file") ?? ".env.local",
     manifestPath: manifest !== undefined && manifest !== "true" ? manifest : null,
+    requireStoredAddressIdentity:
+      values.get("require-stored-address-identity") === "true",
   };
 }
 
@@ -770,12 +809,16 @@ export function buildQueryTableSql(
       par.county_name AS county_name,
       par.state_code AS state_code,
       a.street_number AS street_number,
+      a.street_pre_directional_text AS street_pre_directional_text,
       a.street_name AS street_name,
       a.street_suffix_type AS street_suffix_type,
+      a.street_post_directional_text AS street_post_directional_text,
       a.city_name AS city_name,
       a.postal_code AS postal_code,
       a.unnormalized_address AS unnormalized_address,
       su.full_address AS situs_full_address,
+      a.elephant_uuid::text AS stored_elephant_uuid,
+      a.elephant_token AS stored_elephant_token,
       gp.latitude AS latitude,
       gp.longitude AS longitude,
       ${safeNumeric("lp.lot_size_acre")} AS lot_size_acre,
@@ -874,6 +917,7 @@ async function main(): Promise<void> {
       includePaDosEnrichment: includePaDosEnrichmentInQueryTable(options.county),
       limit: options.limit,
       outDir: options.outDir,
+      requireStoredAddressIdentity: options.requireStoredAddressIdentity,
       startedAt,
     }),
   );
@@ -912,7 +956,9 @@ async function main(): Promise<void> {
         if (cid !== null) withCid += 1;
         const sourceRow = applyManifestEnrichment(raw, metadata);
         await writer.appendRow(
-          toParquetRecord(buildQueryTableRow(sourceRow, cid)),
+          toParquetRecord(
+            buildQueryTableRow(sourceRow, cid, options.requireStoredAddressIdentity),
+          ),
         );
         written += 1;
       }

@@ -15,6 +15,7 @@ import {
   BULK_STAGE_COLUMNS,
   addSunbizAddressReferencesToRows,
   assertAppraisalPrefixIsScoped,
+  buildAppraisalSitusAddressContext,
   buildAppraisalTransformedArtifactUri,
   buildScopedLoadSelectionFromManifest,
   createS3ArtifactReader,
@@ -620,10 +621,18 @@ async function stageAppraisal(params: {
           .getEntries()
           .filter((entry) => entry.isDirectory === false && /^data\/.+\.json$/.test(entry.entryName))
           .sort((left, right) => left.entryName.localeCompare(right.entryName));
+        const parsedEntries = entries.map((entry) => ({
+          entry,
+          filePath: entry.entryName,
+          record: JSON.parse(entry.getData().toString("utf8")) as unknown,
+        }));
+        const situsAddressContext = buildAppraisalSitusAddressContext({
+          entries: parsedEntries,
+          sourceSystem: params.options.jurisdictionKey,
+          stateCode: params.options.appraisalStateCode,
+        });
 
-        for (const entry of entries) {
-          const text = entry.getData().toString("utf8");
-          const record: unknown = JSON.parse(text);
+        for (const { entry, record } of parsedEntries) {
           const bundle = mapAppraisalTransformedFile({
             artifactSourcePayload,
             artifactUri: artifact.uri,
@@ -632,6 +641,7 @@ async function stageAppraisal(params: {
             record,
             sourceSystem: params.options.jurisdictionKey,
             stateCode: params.options.appraisalStateCode,
+            situsAddressContext,
           });
           rows.push(...bundle.rows);
           skippedRecords += bundle.skippedRecords.length;
@@ -829,10 +839,18 @@ async function stageAndMergeAppraisalBatched(params: {
             .getEntries()
             .filter((entry) => entry.isDirectory === false && /^data\/.+\.json$/.test(entry.entryName))
             .sort((left, right) => left.entryName.localeCompare(right.entryName));
+          const parsedEntries = entries.map((entry) => ({
+            entry,
+            filePath: entry.entryName,
+            record: JSON.parse(entry.getData().toString("utf8")) as unknown,
+          }));
+          const situsAddressContext = buildAppraisalSitusAddressContext({
+            entries: parsedEntries,
+            sourceSystem: params.options.jurisdictionKey,
+            stateCode: params.options.appraisalStateCode,
+          });
 
-          for (const entry of entries) {
-            const text = entry.getData().toString("utf8");
-            const record: unknown = JSON.parse(text);
+          for (const { entry, record } of parsedEntries) {
             const bundle = mapAppraisalTransformedFile({
               artifactSourcePayload,
               artifactUri: artifact.uri,
@@ -841,6 +859,7 @@ async function stageAndMergeAppraisalBatched(params: {
               record,
               sourceSystem: params.options.jurisdictionKey,
               stateCode: params.options.appraisalStateCode,
+              situsAddressContext,
             });
             rows.push(...bundle.rows);
             skippedRecords += bundle.skippedRecords.length;

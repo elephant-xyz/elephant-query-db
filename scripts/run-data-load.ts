@@ -10,6 +10,7 @@ import { Pool } from "pg";
 import {
   APPRAISAL_SOURCE_PAYLOAD_SIDECAR,
   assertAppraisalPrefixIsScoped,
+  buildAppraisalSitusAddressContext,
   createS3ArtifactReader,
   mapAppraisalTransformedFile,
   mapLeePermitDetail,
@@ -225,15 +226,22 @@ async function loadAppraisal(params: {
         .getEntries()
         .filter((entry) => entry.isDirectory === false && /^data\/.+\.json$/.test(entry.entryName))
         .sort((left, right) => left.entryName.localeCompare(right.entryName));
+      const parsedEntries = entries.map((entry) => ({
+        entry,
+        filePath: entry.entryName,
+        record: JSON.parse(entry.getData().toString("utf8")) as unknown,
+      }));
+      const situsAddressContext = buildAppraisalSitusAddressContext({
+        entries: parsedEntries,
+      });
 
-      for (const entry of entries) {
-        const text = entry.getData().toString("utf8");
-        const record: unknown = JSON.parse(text);
+      for (const { entry, record } of parsedEntries) {
         const bundle = mapAppraisalTransformedFile({
           artifactSourcePayload,
           artifactUri: artifact.uri,
           filePath: entry.entryName,
           record,
+          situsAddressContext,
         });
         rows.push(...bundle.rows);
         skippedRecords += bundle.skippedRecords.length;

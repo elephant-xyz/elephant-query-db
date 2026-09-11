@@ -13,6 +13,10 @@ import {
   readNumber,
   readString,
 } from "./normalizers.js";
+import {
+  mintSitusAddressIdentity,
+  parseUnnormalizedAddress,
+} from "./address-signature.js";
 import { mapAppraisalGeometryRingRows } from "./appraisal-geometry.js";
 import type { JsonObject, LogicalTableName, PreparedRow, PreparedRowBundle, SourceSystem } from "./types.js";
 
@@ -24,6 +28,46 @@ type AppraisalJurisdictionMetadata = {
   readonly countyName: string | null;
   readonly stateCode: string | null;
 };
+
+export type AppraisalArtifactEntry = {
+  readonly filePath: string;
+  readonly record: unknown;
+};
+
+export type AppraisalSitusAddressContext = {
+  readonly fullAddress: string;
+  readonly stateCode: string | null;
+};
+
+/** Resolve the authoritative situs record once per transformed artifact. */
+export function buildAppraisalSitusAddressContext(params: {
+  readonly entries: readonly AppraisalArtifactEntry[];
+  readonly sourceSystem?: string;
+  readonly stateCode?: string | null;
+}): AppraisalSitusAddressContext | null {
+  const entry = params.entries.find(
+    ({ filePath }) =>
+      (filePath.split("/").pop() ?? filePath) === "unnormalized_address.json",
+  );
+  if (entry === undefined || !isJsonObject(entry.record)) return null;
+  const fullAddress =
+    readString(entry.record.full_address) ??
+    readString(entry.record.unnormalized_address);
+  const parsed = parseUnnormalizedAddress(fullAddress);
+  const hasSitusContent =
+    parsed.city !== null ||
+    parsed.postalCode !== null ||
+    (parsed.street !== null && /\d/.test(parsed.street));
+  if (fullAddress === null || !hasSitusContent) return null;
+  const sourceSystem = (params.sourceSystem ??
+    DEFAULT_APPRAISER_SOURCE_SYSTEM) as SourceSystem;
+  return {
+    fullAddress,
+    stateCode:
+      readStateCode(params.stateCode) ??
+      readAppraisalStateCode(entry.record, sourceSystem),
+  };
+}
 
 /**
  * Parse the optional provenance sidecar bundled with an appraisal transform.
@@ -460,6 +504,7 @@ export function mapAppraisalTransformedFile(params: {
   readonly sourceSystem?: string;
   readonly countyName?: string | null;
   readonly stateCode?: string | null;
+  readonly situsAddressContext?: AppraisalSitusAddressContext | null;
 }): PreparedRowBundle {
   if (!isJsonObject(params.record)) {
     return skipped(params, "appraisal transformed file is not a JSON object", { value: params.record });
@@ -504,6 +549,7 @@ export function mapAppraisalTransformedFile(params: {
     params.artifactUri,
     sourceSystem,
     jurisdictionMetadata,
+    params.situsAddressContext ?? null,
   );
   return rows === null
     ? skipped(params, `unrecognized appraisal transformed file: ${fileName}`, params.record)
@@ -517,6 +563,7 @@ function mapKnownAppraisalRecord(
   artifactUri: string | null,
   sourceSystem: SourceSystem,
   jurisdictionMetadata: AppraisalJurisdictionMetadata,
+  situsAddressContext: AppraisalSitusAddressContext | null,
 ): readonly PreparedRow[] | null {
   if (fileName === "property_seed.json") {
     return [
@@ -542,6 +589,7 @@ function mapKnownAppraisalRecord(
         artifactUri,
         sourceSystem,
         jurisdictionMetadata,
+        situsAddressContext,
       ),
     ];
   }
@@ -687,24 +735,64 @@ function mapAddress(
   artifactUri: string | null,
   sourceSystem: SourceSystem,
   jurisdictionMetadata: AppraisalJurisdictionMetadata,
+  situsAddressContext: AppraisalSitusAddressContext | null,
 ): PreparedRow {
   const addressRole = fileName === "address.json" ? "site" : fileName.replace(/\.json$/, "");
   const sourceRecordKey = sourceKey(sourceSystem, requestIdentifier, "address", addressRole);
   const unnormalizedAddress = readString(record.unnormalized_address);
   const normalizedAddressKey = buildNormalizedAddressKey(unnormalizedAddress);
+  const parsedAddress = parseUnnormalizedAddress(unnormalizedAddress);
+  const streetNumber = readString(record.street_number);
+  const streetPreDirectionalText = readString(record.street_pre_directional_text);
+  const streetName = readString(record.street_name);
+  const streetSuffixType = readString(record.street_suffix_type);
+  const streetPostDirectionalText = readString(record.street_post_directional_text);
+  const structuredStreet =
+    [streetNumber, streetPreDirectionalText, streetName, streetSuffixType, streetPostDirectionalText]
+      .filter((part): part is string => part !== null)
+      .join(" ") || null;
+  const authoritativeAddress =
+    addressRole === "site" && situsAddressContext !== null
+      ? parseUnnormalizedAddress(situsAddressContext.fullAddress)
+      : null;
+  const postalCode =
+    authoritativeAddress?.postalCode ??
+    readString(record.postal_code) ??
+    parsedAddress.postalCode ??
+    extractPostalCodeFromAddress(unnormalizedAddress);
+  const stateCode =
+    jurisdictionMetadata.stateCode ??
+    situsAddressContext?.stateCode ??
+    readAppraisalStateCode(record, sourceSystem) ??
+    (/\bFL\b/i.test(unnormalizedAddress ?? "") ? "FL" : null);
+  const identity =
+    addressRole === "site"
+      ? mintSitusAddressIdentity({
+          state: stateCode,
+          postalCode,
+          street: authoritativeAddress?.street ?? structuredStreet ?? parsedAddress.street,
+        })
+      : null;
   const values = compactObject({
     ...metadata(sourceSystem, sourceRecordKey, record, artifactUri),
     request_identifier: requestIdentifier,
+    street_number: streetNumber,
+    street_pre_directional_text: streetPreDirectionalText,
+    street_name: streetName,
+    street_suffix_type: streetSuffixType,
+    street_post_directional_text: streetPostDirectionalText,
+    unit_identifier: readString(record.unit_identifier),
+    city_name: readString(record.city_name) ?? parsedAddress.city,
     unnormalized_address: unnormalizedAddress,
     normalized_address_key: normalizedAddressKey,
     normalized_address_hash: hashNormalizedAddressKey(normalizedAddressKey),
-    postal_code: extractPostalCodeFromAddress(unnormalizedAddress),
-    state_code:
-      jurisdictionMetadata.stateCode ??
-      (/\bFL\b/i.test(unnormalizedAddress ?? "") ? "FL" : null),
+    postal_code: postalCode,
+    state_code: stateCode,
     county_name:
       jurisdictionMetadata.countyName ?? readString(record.county_name),
     country_code: readString(record.country_code) ?? "US",
+    elephant_uuid: identity?.elephantUuid ?? null,
+    elephant_token: identity?.elephantToken ?? null,
     township: readString(record.township),
     range: readString(record.range),
     section: readString(record.section),

@@ -1,5 +1,7 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   date,
   index,
   numeric,
@@ -71,6 +73,8 @@ export const addresses = pgTable(
     unnormalizedAddress: text("unnormalized_address"),
     normalizedAddressKey: text("normalized_address_key"),
     normalizedAddressHash: text("normalized_address_hash"),
+    elephantUuid: uuid("elephant_uuid"),
+    elephantToken: text("elephant_token"),
     sourceHttpRequest: nullableJsonObjectColumn("source_http_request"),
     sourcePayload: jsonObjectColumn("source_payload"),
     ...sourceMetadataColumns(),
@@ -87,6 +91,12 @@ export const addresses = pgTable(
     ),
     index("addresses_normalized_key_idx").on(table.normalizedAddressKey),
     index("addresses_normalized_hash_idx").on(table.normalizedAddressHash),
+    index("addresses_elephant_uuid_idx").on(table.elephantUuid),
+    index("addresses_elephant_token_idx").on(table.elephantToken),
+    check(
+      "addresses_elephant_identity_pair_check",
+      sql`(${table.elephantUuid} IS NULL) = (${table.elephantToken} IS NULL)`,
+    ),
     index("addresses_state_zip_hash_idx").on(
       table.stateCode,
       table.postalCode,

@@ -24,13 +24,17 @@ function sourceRow(overrides: Partial<QueryTableSourceRow>): QueryTableSourceRow
     county_name: "Lee",
     state_code: "FL",
     street_number: null,
+    street_pre_directional_text: null,
     street_name: null,
     street_suffix_type: null,
+    street_post_directional_text: null,
     city_name: null,
     postal_code: null,
     unit_identifier: null,
     unnormalized_address: null,
     situs_full_address: null,
+    stored_elephant_uuid: null,
+    stored_elephant_token: null,
     latitude: null,
     longitude: null,
     lot_size_acre: null,
@@ -151,6 +155,65 @@ describe("query table living-area (Sq Ft) sourcing", () => {
     expect(row.elephant_token).toBe(
       "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
     );
+  });
+
+  it("accepts a persisted identity only when it matches the canonical address", () => {
+    const row = buildQueryTableRow(
+      sourceRow({
+        situs_full_address:
+          "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+        state_code: "FL",
+        stored_elephant_uuid:
+          "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+        stored_elephant_token:
+          "da5b90e067f162ea35eb482befaea835b32df7861adb282c6fb3983f17fa325e",
+      }),
+      null,
+    );
+
+    expect(row.elephant_uuid).toBe(
+      "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+    );
+  });
+
+  it("fails export when persisted identity is incomplete or disagrees", () => {
+    expect(() =>
+      buildQueryTableRow(
+        sourceRow({
+          situs_full_address:
+            "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+          stored_elephant_uuid:
+            "c3a982a7-1102-50b8-b2cd-6cb3fca2060f",
+        }),
+        null,
+      ),
+    ).toThrow(/identity is incomplete/);
+
+    expect(() =>
+      buildQueryTableRow(
+        sourceRow({
+          situs_full_address:
+            "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+          stored_elephant_uuid:
+            "00000000-0000-5000-8000-000000000000",
+          stored_elephant_token: "0".repeat(64),
+        }),
+        null,
+      ),
+    ).toThrow(/disagrees with address:v1/);
+  });
+
+  it("can require ingestion-persisted identity for scoped exports", () => {
+    expect(() =>
+      buildQueryTableRow(
+        sourceRow({
+          situs_full_address:
+            "11659 JONATHAN RD, JACKSONVILLE, FL 32225",
+        }),
+        null,
+        true,
+      ),
+    ).toThrow(/identity is missing/);
   });
 });
 

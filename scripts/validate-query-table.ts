@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Pool } from "pg";
 import { ParquetReader } from "@dsnp/parquetjs";
 
+import { mintSitusAddressIdentity } from "../src/loader/address-signature.js";
 import { appraisalSourceForCounty } from "./run-property-consolidation-export.js";
 
 /**
@@ -34,6 +35,7 @@ export type ValidateOptions = {
   readonly county: string;
   readonly envFile: string;
   readonly parquetOnly: boolean;
+  readonly requireCompleteAddressIdentity: boolean;
 };
 
 export function parseOptions(argv: readonly string[]): ValidateOptions {
@@ -57,6 +59,8 @@ export function parseOptions(argv: readonly string[]): ValidateOptions {
     county,
     envFile: values.get("env-file") ?? ".env.local",
     parquetOnly: values.get("parquet-only") === "true",
+    requireCompleteAddressIdentity:
+      values.get("require-complete-address-identity") === "true",
   };
 }
 
@@ -96,17 +100,79 @@ export type ParquetStats = {
   readonly rowCount: number;
   readonly distinctRequestIdentifiers: number;
   readonly nullRequestIdentifiers: number;
+  readonly eligibleIdentityRows: number;
+  readonly ineligibleIdentityRows: number;
+  readonly missingIdentityRows: number;
+  readonly incompleteIdentityRows: number;
+  readonly mismatchedIdentityRows: number;
 };
 
-/** Read the parquet and tally row count + distinct/null request_identifier. */
+type PublishedIdentityRow = {
+  readonly state_code?: unknown;
+  readonly address_street?: unknown;
+  readonly address_zip?: unknown;
+  readonly elephant_uuid?: unknown;
+  readonly elephant_token?: unknown;
+};
+
+export type IdentityValidation =
+  | "valid"
+  | "ineligible"
+  | "missing"
+  | "incomplete"
+  | "mismatch";
+
+function textOrNull(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+/** Verify one published row against the deterministic `address:v1` contract. */
+export function validatePublishedIdentity(
+  row: PublishedIdentityRow,
+): IdentityValidation {
+  const expected = mintSitusAddressIdentity({
+    state: textOrNull(row.state_code),
+    postalCode: textOrNull(row.address_zip),
+    street: textOrNull(row.address_street),
+  });
+  const uuid = textOrNull(row.elephant_uuid);
+  const token = textOrNull(row.elephant_token);
+
+  if ((uuid === null) !== (token === null)) return "incomplete";
+  if (expected === null) {
+    return uuid === null ? "ineligible" : "mismatch";
+  }
+  if (uuid === null || token === null) return "missing";
+  return uuid === expected.elephantUuid && token === expected.elephantToken
+    ? "valid"
+    : "mismatch";
+}
+
+/** Read the parquet and tally folio and deterministic identity integrity. */
 async function readParquetStats(parquetPath: string): Promise<ParquetStats> {
   const reader = await ParquetReader.openFile(parquetPath);
   const seen = new Set<string>();
   let rowCount = 0;
   let nulls = 0;
+  let eligibleIdentityRows = 0;
+  let ineligibleIdentityRows = 0;
+  let missingIdentityRows = 0;
+  let incompleteIdentityRows = 0;
+  let mismatchedIdentityRows = 0;
   try {
-    const cursor = reader.getCursor([["request_identifier"]]);
-    let record = (await cursor.next()) as { request_identifier?: unknown } | null;
+    const cursor = reader.getCursor([
+      ["request_identifier"],
+      ["state_code"],
+      ["address_street"],
+      ["address_zip"],
+      ["elephant_uuid"],
+      ["elephant_token"],
+    ]);
+    let record = (await cursor.next()) as
+      | ({ request_identifier?: unknown } & PublishedIdentityRow)
+      | null;
     while (record !== null) {
       rowCount += 1;
       const value = record.request_identifier;
@@ -115,12 +181,32 @@ async function readParquetStats(parquetPath: string): Promise<ParquetStats> {
       } else {
         seen.add(String(value));
       }
+      const identityValidation = validatePublishedIdentity(record);
+      if (identityValidation === "valid") eligibleIdentityRows += 1;
+      else if (identityValidation === "ineligible") ineligibleIdentityRows += 1;
+      else if (identityValidation === "missing") {
+        eligibleIdentityRows += 1;
+        missingIdentityRows += 1;
+      } else if (identityValidation === "incomplete") {
+        incompleteIdentityRows += 1;
+      } else {
+        mismatchedIdentityRows += 1;
+      }
       record = (await cursor.next()) as { request_identifier?: unknown } | null;
     }
   } finally {
     await reader.close();
   }
-  return { rowCount, distinctRequestIdentifiers: seen.size, nullRequestIdentifiers: nulls };
+  return {
+    rowCount,
+    distinctRequestIdentifiers: seen.size,
+    nullRequestIdentifiers: nulls,
+    eligibleIdentityRows,
+    ineligibleIdentityRows,
+    missingIdentityRows,
+    incompleteIdentityRows,
+    mismatchedIdentityRows,
+  };
 }
 
 /** Distinct folio count in Neon, using the SAME COALESCE key the export dedups on. */
@@ -148,6 +234,7 @@ async function main(): Promise<void> {
       parquetPath: options.parquetPath,
       county: options.county,
       parquetOnly: options.parquetOnly,
+      requireCompleteAddressIdentity: options.requireCompleteAddressIdentity,
     }),
   );
 
@@ -165,6 +252,29 @@ async function main(): Promise<void> {
       `duplicate folios: rowCount=${stats.rowCount} but distinct+null=${
         stats.distinctRequestIdentifiers + stats.nullRequestIdentifiers
       }`,
+    );
+  }
+  if (stats.missingIdentityRows > 0) {
+    failures.push(
+      `${stats.missingIdentityRows} rows have a complete canonical address but no Elephant identity`,
+    );
+  }
+  if (stats.incompleteIdentityRows > 0) {
+    failures.push(
+      `${stats.incompleteIdentityRows} rows have only one of elephant_uuid/elephant_token`,
+    );
+  }
+  if (stats.mismatchedIdentityRows > 0) {
+    failures.push(
+      `${stats.mismatchedIdentityRows} rows disagree with deterministic address:v1 identity`,
+    );
+  }
+  if (
+    options.requireCompleteAddressIdentity &&
+    stats.ineligibleIdentityRows > 0
+  ) {
+    failures.push(
+      `${stats.ineligibleIdentityRows} rows cannot mint identity because canonical state, ZIP5, or street is missing`,
     );
   }
 
