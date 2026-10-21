@@ -40,6 +40,7 @@
     "appraisal:prepare": "tsx scripts/run-curated-appraisal-prepare.ts",
     "appraisal:transform-data": "tsx scripts/run-lee-appraisal-transform-data-only.ts",
     "load:bulk": "tsx scripts/run-bulk-data-load.ts",
+    "load:bbb-private": "tsx scripts/run-private-bbb-load.ts",
     "load:data": "tsx scripts/run-data-load.ts",
     "load:pa-dos-local": "tsx scripts/run-pa-dos-local-load.ts",
     "load:permits-local": "tsx scripts/run-permits-local-load.ts",

@@ -4,6 +4,7 @@ export * from "./appraisal-geometry.js";
 export * from "./appraisal-source.js";
 export * from "./artifacts.js";
 export * from "./bbb.js";
+export * from "./private-bbb.js";
 export * from "./bulk.js";
 export * from "./curated-sample.js";
 export * from "./illinois-sos-bulk.js";
