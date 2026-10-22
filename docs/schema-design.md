@@ -108,6 +108,14 @@ Why this shape:
 - `business_reputation_external_links`
 - `contractor_quality_scores`
 
+### Private BBB reconciliation tables
+
+The `bbb_*` table family is a separate internal path for checksummed harvest
+coverage, immutable sanitized snapshots, content-hash watermarks, review
+candidates, and official permit-backed property evidence. It does not create
+`companies`, modify permit resolver fields, or feed a public export. See
+[`private-bbb-persistence.md`](private-bbb-persistence.md).
+
 ## Source-to-table mapping
 
 ### Lee appraisal website

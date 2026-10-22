@@ -64,6 +64,12 @@ The initial database is optimized for parcel, address, company, person, permit, 
 
 BBB data is loaded from staged JSON or JSONL profile artifacts. Those artifacts can come from an approved browser harvest produced by `oracle-node/scripts/harvest-bbb-category.mjs` or from a feed/export with a compatible profile shape. The loader maps known BBB sections into `business_reputation_*` child tables and keeps the complete profile JSON in `business_reputation_profiles.source_payload`, so newly discovered BBB fields remain queryable and can be promoted into typed columns later without losing data.
 
+For permit-backed private reputation reconciliation, use the separate
+[`bbb_*` persistence path](docs/private-bbb-persistence.md). It consumes
+checksummed bundles and existing official permit/company edges without
+creating legal identity, writing permit resolver fields, storing raw HTML, or
+changing public Lexicon/Atlas behavior.
+
 Example bulk-stage/load command for BBB-only input:
 
 ```bash

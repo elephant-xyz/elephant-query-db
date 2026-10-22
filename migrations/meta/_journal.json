@@ -57,6 +57,13 @@
       "when": 1789146488372,
       "tag": "0011_identity_pair_constraint",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1792617628787,
+      "tag": "0012_private_bbb_persistence",
+      "breakpoints": true
     }
   ]
 }
