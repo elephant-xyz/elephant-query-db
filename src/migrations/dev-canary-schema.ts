@@ -3,17 +3,161 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { Client } from "pg";
+import { z } from "zod";
 
-export const DEV_CANARY_MIGRATION_TAGS = [
-  "0009_rock_island_geometry_illinois_sos",
-  "0010_address_identity",
-  "0011_identity_pair_constraint",
+export const PINNED_DEV_CANARY_MIGRATIONS = [
+  {
+    tag: "0009_rock_island_geometry_illinois_sos",
+    createdAt: 1786993408143,
+    hash: "bccbaa70e551b00ab2d983e5f82397be00472f4bbca9f80c79b1c476f823a6db",
+  },
+  {
+    tag: "0010_address_identity",
+    createdAt: 1789145530574,
+    hash: "057b4b36b5bb21179fb57786f7771a550a94f0c8708d20a158d751e00728335c",
+  },
+  {
+    tag: "0011_identity_pair_constraint",
+    createdAt: 1789146488372,
+    hash: "b42c48f8b2694e520d3595185bf3d297369ccc14c34d6de4bbba593837ca9a66",
+  },
+  {
+    tag: "0012_private_bbb_persistence",
+    createdAt: 1792617628787,
+    hash: "b8eab46ca1b8acb5b86af9fd749a87577440222b2176dd1c98fd7ec5754de81a",
+  },
 ] as const;
 
-const ADVISORY_LOCK_NAME = "elephant-query-db:dev-canary-schema:0009-0011";
+export const DEV_CANARY_MIGRATION_TAGS = PINNED_DEV_CANARY_MIGRATIONS.map(
+  ({ tag }) => tag,
+) as readonly (typeof PINNED_DEV_CANARY_MIGRATIONS)[number]["tag"][];
+
+export const BBB_PRIVATE_TABLES = [
+  "bbb_artifact_watermarks",
+  "bbb_harvest_categories",
+  "bbb_harvest_runs",
+  "bbb_profile_category_memberships",
+  "bbb_profile_snapshots",
+  "bbb_property_link_evidence",
+  "bbb_reconciliation_matches",
+  "bbb_reconciliation_runs",
+] as const;
+
+const BBB_PRIVATE_FOREIGN_KEY_DDL_NAMES = [
+  "bbb_artifact_watermarks_bbb_harvest_category_id_bbb_harvest_categories_bbb_harvest_category_id_fk",
+  "bbb_harvest_categories_bbb_harvest_run_id_bbb_harvest_runs_bbb_harvest_run_id_fk",
+  "bbb_profile_category_memberships_bbb_harvest_category_id_bbb_harvest_categories_bbb_harvest_category_id_fk",
+  "bbb_profile_category_memberships_bbb_artifact_watermark_id_bbb_artifact_watermarks_bbb_artifact_watermark_id_fk",
+  "bbb_profile_category_memberships_bbb_profile_snapshot_id_bbb_profile_snapshots_bbb_profile_snapshot_id_fk",
+  "bbb_property_link_evidence_bbb_reconciliation_match_id_bbb_reconciliation_matches_bbb_reconciliation_match_id_fk",
+  "bbb_property_link_evidence_property_improvement_id_property_improvements_property_improvement_id_fk",
+  "bbb_property_link_evidence_property_id_properties_property_id_fk",
+  "bbb_property_link_evidence_company_id_companies_company_id_fk",
+  "bbb_reconciliation_matches_bbb_reconciliation_run_id_bbb_reconciliation_runs_bbb_reconciliation_run_id_fk",
+  "bbb_reconciliation_matches_company_id_companies_company_id_fk",
+  "bbb_reconciliation_matches_representative_profile_snapshot_id_bbb_profile_snapshots_bbb_profile_snapshot_id_fk",
+  "bbb_reconciliation_runs_bbb_harvest_run_id_bbb_harvest_runs_bbb_harvest_run_id_fk",
+] as const;
+
+// PostgreSQL stores identifiers at NAMEDATALEN - 1 bytes (63 in supported
+// releases). Drizzle's generated names are deliberately verified after the
+// same deterministic truncation PostgreSQL applies.
+export const BBB_PRIVATE_FOREIGN_KEYS = BBB_PRIVATE_FOREIGN_KEY_DDL_NAMES.map(
+  (name) => name.slice(0, 63),
+);
+
+export const BBB_PRIVATE_INDEXES = [
+  "bbb_artifact_watermarks_category_path_idx",
+  "bbb_artifact_watermarks_hash_idx",
+  "bbb_artifact_watermarks_current_idx",
+  "bbb_harvest_categories_run_category_idx",
+  "bbb_harvest_categories_status_idx",
+  "bbb_harvest_runs_county_run_idx",
+  "bbb_harvest_runs_current_county_idx",
+  "bbb_harvest_runs_status_idx",
+  "bbb_profile_memberships_revision_profile_idx",
+  "bbb_profile_memberships_current_profile_idx",
+  "bbb_profile_memberships_snapshot_idx",
+  "bbb_profile_memberships_current_idx",
+  "bbb_profile_snapshots_identity_hash_idx",
+  "bbb_profile_snapshots_business_idx",
+  "bbb_profile_snapshots_profile_url_idx",
+  "bbb_profile_snapshots_names_gin",
+  "bbb_profile_snapshots_phones_gin",
+  "bbb_profile_snapshots_licenses_gin",
+  "bbb_property_link_evidence_match_permit_idx",
+  "bbb_property_link_evidence_property_idx",
+  "bbb_property_link_evidence_permit_idx",
+  "bbb_property_link_evidence_company_idx",
+  "bbb_property_link_evidence_source_key_idx",
+  "bbb_reconciliation_matches_candidate_idx",
+  "bbb_reconciliation_matches_company_outcome_idx",
+  "bbb_reconciliation_matches_profile_idx",
+  "bbb_reconciliation_matches_business_idx",
+  "bbb_reconciliation_runs_key_idx",
+  "bbb_reconciliation_runs_current_idx",
+  "bbb_reconciliation_runs_status_idx",
+] as const;
+
+const BBB_PRIVATE_PRIMARY_KEYS = BBB_PRIVATE_TABLES.map(
+  (tableName) => `${tableName}_pkey`,
+);
+const ADVISORY_LOCK_NAME = "elephant-query-db:dev-canary-schema:0009-0012";
 const DRIZZLE_SCHEMA = "drizzle";
 const DRIZZLE_TABLE = "__drizzle_migrations";
 const ADDRESS_PAIR_CONSTRAINT = "addresses_elephant_identity_pair_check";
+const BACKUP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const WRITER_PAUSE_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+const CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+const writerPauseProofSchema = z
+  .object({
+    schemaVersion: z.literal("query-db.dev-writer-pause-proof.v1"),
+    environment: z.literal("DEV"),
+    endpointFingerprint: z.string().regex(/^[a-f0-9]{16}$/u),
+    observedAt: z.string().datetime({ offset: true }),
+    inventoryComplete: z.literal(true),
+    inventoryRef: z.string().trim().min(3).max(500),
+    operatorProvided: z.literal(true),
+    writers: z
+      .array(
+        z
+          .object({
+            writerId: z
+              .string()
+              .trim()
+              .min(1)
+              .max(160)
+              .regex(/^[a-z0-9][a-z0-9._:-]*$/iu),
+            kind: z.enum(["step-functions", "ecs", "manual-loader", "other"]),
+            ownerRef: z.string().trim().min(3).max(500),
+            pauseCommand: z.string().trim().min(3).max(4_000),
+            resumeCommand: z.string().trim().min(3).max(4_000),
+            proofRef: z.string().trim().min(3).max(500),
+            paused: z.literal(true),
+          })
+          .strict(),
+      )
+      .min(1),
+  })
+  .strict()
+  .superRefine((proof, context) => {
+    const writerIds = proof.writers.map((writer) => writer.writerId);
+    if (new Set(writerIds).size !== writerIds.length) {
+      context.addIssue({
+        code: "custom",
+        path: ["writers"],
+        message: "writer IDs must be unique",
+      });
+    }
+  });
+
+type WriterPauseProof = z.infer<typeof writerPauseProofSchema>;
+
+interface VerifiedWriterPauseProof {
+  readonly proof: WriterPauseProof;
+  readonly sha256: string;
+}
 
 const TARGET_INDEX_COLUMNS = new Map([
   ["addresses_elephant_uuid_idx", "elephant_uuid"],
@@ -97,12 +241,13 @@ const REQUIRED_INDEXES = {
 } as const;
 
 interface JournalEntry {
+  readonly idx?: number;
   readonly tag: string;
   readonly when: number;
 }
 
 export interface MigrationDescriptor {
-  readonly tag: (typeof DEV_CANARY_MIGRATION_TAGS)[number];
+  readonly tag: (typeof PINNED_DEV_CANARY_MIGRATIONS)[number]["tag"];
   readonly createdAt: number;
   readonly hash: string;
   readonly sql: string;
@@ -144,7 +289,7 @@ interface IndexRow {
 
 interface LedgerRow {
   readonly hash: string;
-  readonly created_at: string;
+  readonly created_at: string | null;
 }
 
 interface IdentityRow {
@@ -159,6 +304,9 @@ interface PermissionRow {
   readonly can_create_schema: boolean;
   readonly can_alter_addresses: boolean;
   readonly can_reference_geometries: boolean;
+  readonly can_reference_companies: boolean;
+  readonly can_reference_properties: boolean;
+  readonly can_reference_property_improvements: boolean;
 }
 
 interface ActivityRow {
@@ -187,7 +335,7 @@ export interface DevCanaryMigrationState {
 
 export interface DevCanaryMigrationReport {
   readonly schemaVersion: "query-db.dev-canary-migration.v1";
-  readonly mode: "plan" | "apply";
+  readonly mode: "plan" | "apply" | "verify";
   readonly environment: {
     readonly name: string;
     readonly endpointFingerprint: string;
@@ -207,6 +355,18 @@ export interface DevCanaryMigrationReport {
     readonly waitingSessions: number;
     readonly targetWriteLocks: number;
     readonly operations: readonly string[];
+    readonly migration0012: {
+      readonly targetTablesPresent: number;
+      readonly expectedTables: 8;
+      readonly expectedForeignKeys: 13;
+      readonly expectedIndexes: 30;
+      readonly existingRows: string;
+      readonly referencedRelations: readonly {
+        readonly tableName: string;
+        readonly estimatedRows: string;
+        readonly totalBytes: string;
+      }[];
+    };
   };
   readonly targetMigrations: readonly {
     readonly tag: string;
@@ -217,16 +377,23 @@ export interface DevCanaryMigrationReport {
   readonly blockers: readonly string[];
   readonly pendingActions: readonly string[];
   readonly completedChecks: readonly string[];
+  readonly authorizationEvidence: {
+    readonly approvalRefCount: number;
+    readonly backupCreatedAt: string;
+    readonly writerPauseProofSha256: string;
+    readonly writerCount: number;
+  } | null;
   readonly ready: boolean;
 }
 
 export interface DevCanaryMigrationOptions {
-  readonly mode: "plan" | "apply";
+  readonly mode: "plan" | "apply" | "verify";
   readonly environment: string;
   readonly expectedEndpointFingerprint?: string;
-  readonly approvalRef?: string;
+  readonly approvalRefs?: readonly string[];
   readonly backupRef?: string;
-  readonly writersPaused?: boolean;
+  readonly backupCreatedAt?: string;
+  readonly writerPauseProofPath?: string;
   readonly migrationsFolder?: string;
 }
 
@@ -280,24 +447,56 @@ export async function loadDevCanaryMigrationDescriptors(
     throw new Error(`Invalid Drizzle journal: ${journalPath}`);
   }
 
+  const tags = journal.entries.map((entry) => entry.tag);
+  if (new Set(tags).size !== tags.length) {
+    throw new Error("Drizzle journal contains duplicate migration tags");
+  }
+  const firstTargetIndex = journal.entries.findIndex(
+    (entry) => entry.tag === PINNED_DEV_CANARY_MIGRATIONS[0].tag,
+  );
+  if (firstTargetIndex < 0) {
+    throw new Error(
+      `Drizzle journal is missing ${PINNED_DEV_CANARY_MIGRATIONS[0].tag}`,
+    );
+  }
+  const targetEra = journal.entries.slice(firstTargetIndex);
+  if (targetEra.length !== PINNED_DEV_CANARY_MIGRATIONS.length) {
+    throw new Error(
+      "Drizzle journal has missing, unknown, or newer entries after migration 0009",
+    );
+  }
+
   const descriptors: MigrationDescriptor[] = [];
   let priorCreatedAt = -1;
-  for (const tag of DEV_CANARY_MIGRATION_TAGS) {
-    const entry = journal.entries.find((candidate) => candidate.tag === tag);
-    if (entry === undefined || !Number.isSafeInteger(entry.when)) {
-      throw new Error(`Drizzle journal is missing ${tag}`);
+  for (let index = 0; index < PINNED_DEV_CANARY_MIGRATIONS.length; index += 1) {
+    const pinned = PINNED_DEV_CANARY_MIGRATIONS[index];
+    const entry = targetEra[index];
+    if (
+      pinned === undefined ||
+      entry === undefined ||
+      entry.tag !== pinned.tag ||
+      !Number.isSafeInteger(entry.when) ||
+      entry.when !== pinned.createdAt
+    ) {
+      throw new Error(
+        `Drizzle journal does not match the pinned 0009-0012 sequence at ${pinned?.tag ?? index}`,
+      );
     }
     if (entry.when <= priorCreatedAt) {
-      throw new Error(`Drizzle journal order is invalid at ${tag}`);
+      throw new Error(`Drizzle journal order is invalid at ${pinned.tag}`);
     }
     const sql = await readFile(
-      path.join(migrationsFolder, `${tag}.sql`),
+      path.join(migrationsFolder, `${pinned.tag}.sql`),
       "utf8",
     );
+    const hash = createHash("sha256").update(sql).digest("hex");
+    if (hash !== pinned.hash) {
+      throw new Error(`Pinned migration hash mismatch for ${pinned.tag}`);
+    }
     descriptors.push({
-      tag,
+      tag: pinned.tag,
       createdAt: entry.when,
-      hash: createHash("sha256").update(sql).digest("hex"),
+      hash,
       sql,
     });
     priorCreatedAt = entry.when;
@@ -330,9 +529,20 @@ async function inspectState(
       AND c.relkind = 'r'
       AND c.relname = ANY(ARRAY[
         'addresses',
+        'companies',
         'geometries',
         'geometry_rings',
-        'illinois_sos_component_records'
+        'illinois_sos_component_records',
+        'properties',
+        'property_improvements',
+        'bbb_artifact_watermarks',
+        'bbb_harvest_categories',
+        'bbb_harvest_runs',
+        'bbb_profile_category_memberships',
+        'bbb_profile_snapshots',
+        'bbb_property_link_evidence',
+        'bbb_reconciliation_matches',
+        'bbb_reconciliation_runs'
       ])
     ORDER BY c.relname
   `);
@@ -362,7 +572,15 @@ async function inspectState(
       AND relation.relname = ANY(ARRAY[
         'addresses',
         'geometry_rings',
-        'illinois_sos_component_records'
+        'illinois_sos_component_records',
+        'bbb_artifact_watermarks',
+        'bbb_harvest_categories',
+        'bbb_harvest_runs',
+        'bbb_profile_category_memberships',
+        'bbb_profile_snapshots',
+        'bbb_property_link_evidence',
+        'bbb_reconciliation_matches',
+        'bbb_reconciliation_runs'
       ])
     ORDER BY relation.relname, constraint_row.conname
   `);
@@ -388,7 +606,15 @@ async function inspectState(
       AND table_row.relname = ANY(ARRAY[
         'addresses',
         'geometry_rings',
-        'illinois_sos_component_records'
+        'illinois_sos_component_records',
+        'bbb_artifact_watermarks',
+        'bbb_harvest_categories',
+        'bbb_harvest_runs',
+        'bbb_profile_category_memberships',
+        'bbb_profile_snapshots',
+        'bbb_property_link_evidence',
+        'bbb_reconciliation_matches',
+        'bbb_reconciliation_runs'
       ])
     ORDER BY table_row.relname, index_row.relname
   `);
@@ -434,8 +660,38 @@ async function inspectState(
       has_schema_privilege(current_user, 'public', 'CREATE') AS can_create_public,
       has_database_privilege(current_user, current_database(), 'CREATE') AS can_create_schema,
       owners.can_alter_addresses,
-      has_table_privilege(current_user, 'public.geometries', 'REFERENCES')
-        AS can_reference_geometries
+      COALESCE(
+        has_table_privilege(
+          current_user,
+          to_regclass('public.geometries'),
+          'REFERENCES'
+        ),
+        false
+      ) AS can_reference_geometries,
+      COALESCE(
+        has_table_privilege(
+          current_user,
+          to_regclass('public.companies'),
+          'REFERENCES'
+        ),
+        false
+      ) AS can_reference_companies,
+      COALESCE(
+        has_table_privilege(
+          current_user,
+          to_regclass('public.properties'),
+          'REFERENCES'
+        ),
+        false
+      ) AS can_reference_properties,
+      COALESCE(
+        has_table_privilege(
+          current_user,
+          to_regclass('public.property_improvements'),
+          'REFERENCES'
+        ),
+        false
+      ) AS can_reference_property_improvements
     FROM owners
   `);
   const activity = await client.query<ActivityRow>(`
@@ -451,7 +707,13 @@ async function inspectState(
         JOIN pg_class relation ON relation.oid = lock_row.relation
         JOIN pg_namespace namespace_row ON namespace_row.oid = relation.relnamespace
         WHERE namespace_row.nspname = 'public'
-          AND relation.relname IN ('addresses', 'geometries')
+          AND relation.relname IN (
+            'addresses',
+            'companies',
+            'geometries',
+            'properties',
+            'property_improvements'
+          )
           AND lock_row.pid <> pg_backend_pid()
           AND lock_row.granted
           AND lock_row.mode IN (
@@ -535,6 +797,81 @@ function validateCreatedTable(
   return issues;
 }
 
+function privateBbbTablePresence(
+  state: DevCanaryMigrationState,
+): readonly boolean[] {
+  return BBB_PRIVATE_TABLES.map((tableName) => state.relations.has(tableName));
+}
+
+function validatePrivateBbbSchema(
+  state: DevCanaryMigrationState,
+): readonly string[] {
+  const issues: string[] = [];
+  const targetTables = new Set<string>(BBB_PRIVATE_TABLES);
+  const expectedIndexNames = new Set<string>([
+    ...BBB_PRIVATE_PRIMARY_KEYS,
+    ...BBB_PRIVATE_INDEXES,
+  ]);
+
+  for (const primaryKeyName of BBB_PRIVATE_PRIMARY_KEYS) {
+    const constraint = state.constraints.find(
+      (candidate) => candidate.conname === primaryKeyName,
+    );
+    if (constraint === undefined || constraint.contype !== "p") {
+      issues.push(`${primaryKeyName} is missing or is not a primary key`);
+    } else if (!constraint.convalidated) {
+      issues.push(`${primaryKeyName} is not validated`);
+    }
+  }
+
+  const foreignKeys = state.constraints.filter(
+    (constraint) =>
+      targetTables.has(constraint.table_name) && constraint.contype === "f",
+  );
+  for (const foreignKeyName of BBB_PRIVATE_FOREIGN_KEYS) {
+    const constraint = foreignKeys.find(
+      (candidate) => candidate.conname === foreignKeyName,
+    );
+    if (constraint === undefined) {
+      issues.push(`${foreignKeyName} is missing`);
+    } else if (!constraint.convalidated) {
+      issues.push(`${foreignKeyName} is not validated`);
+    } else if (!/\bon delete restrict\b/iu.test(constraint.definition)) {
+      issues.push(`${foreignKeyName} does not use ON DELETE RESTRICT`);
+    }
+  }
+  for (const foreignKey of foreignKeys) {
+    if (
+      !BBB_PRIVATE_FOREIGN_KEYS.includes(
+        foreignKey.conname as (typeof BBB_PRIVATE_FOREIGN_KEYS)[number],
+      )
+    ) {
+      issues.push(`unexpected private BBB foreign key ${foreignKey.conname}`);
+    }
+  }
+
+  const indexes = state.indexes.filter((index) =>
+    targetTables.has(index.table_name),
+  );
+  for (const indexName of expectedIndexNames) {
+    const index = indexes.find(
+      (candidate) => candidate.index_name === indexName,
+    );
+    if (index === undefined) {
+      issues.push(`${indexName} is missing`);
+    } else if (!index.is_valid || !index.is_ready) {
+      issues.push(`${indexName} is invalid or not ready`);
+    }
+  }
+  for (const index of indexes) {
+    if (!expectedIndexNames.has(index.index_name)) {
+      issues.push(`unexpected private BBB index ${index.index_name}`);
+    }
+  }
+
+  return issues;
+}
+
 function analyzeState(
   state: DevCanaryMigrationState,
   descriptors: readonly MigrationDescriptor[],
@@ -564,6 +901,17 @@ function analyzeState(
   if (!state.permissions.can_reference_geometries) {
     blockers.push("database role lacks REFERENCES on public.geometries");
   }
+  if (!state.permissions.can_reference_companies) {
+    blockers.push("database role lacks REFERENCES on public.companies");
+  }
+  if (!state.permissions.can_reference_properties) {
+    blockers.push("database role lacks REFERENCES on public.properties");
+  }
+  if (!state.permissions.can_reference_property_improvements) {
+    blockers.push(
+      "database role lacks REFERENCES on public.property_improvements",
+    );
+  }
   if (!state.ledgerTablePresent && !state.permissions.can_create_schema) {
     blockers.push("database role cannot create the Drizzle schema");
   }
@@ -576,6 +924,15 @@ function analyzeState(
   }
   if (!state.relations.has("geometries")) {
     blockers.push("public.geometries is missing");
+  }
+  for (const parentTable of [
+    "companies",
+    "properties",
+    "property_improvements",
+  ]) {
+    if (!state.relations.has(parentTable)) {
+      blockers.push(`public.${parentTable} is missing`);
+    }
   }
   const geometryColumns = groupColumns(state.columns, "geometries");
   const geometryId = geometryColumns.get("geometry_id");
@@ -672,32 +1029,79 @@ function analyzeState(
     }
   }
 
-  const rowsByCreatedAt = new Map(
-    state.ledgerRows.map((row) => [Number(row.created_at), row]),
-  );
+  const bbbPresence = privateBbbTablePresence(state);
+  if (bbbPresence.every((present) => !present)) {
+    pendingActions.push("apply migration 0012 private BBB tables");
+  } else if (bbbPresence.some((present) => !present)) {
+    blockers.push(
+      "migration 0012 is partially present; manual review is required",
+    );
+  } else {
+    const bbbIssues = validatePrivateBbbSchema(state);
+    if (bbbIssues.length === 0) {
+      completedChecks.push(
+        "migration 0012 has eight tables, thirteen restrictive foreign keys, and thirty indexes",
+      );
+    } else {
+      blockers.push(...bbbIssues);
+    }
+  }
+
+  const ledgerRowsByCreatedAt = new Map<number, LedgerRow[]>();
+  for (const row of state.ledgerRows) {
+    if (
+      row.created_at === null ||
+      !Number.isSafeInteger(Number(row.created_at))
+    ) {
+      blockers.push("Drizzle ledger contains a missing or invalid created_at");
+      continue;
+    }
+    const createdAt = Number(row.created_at);
+    const rows = ledgerRowsByCreatedAt.get(createdAt) ?? [];
+    rows.push(row);
+    ledgerRowsByCreatedAt.set(createdAt, rows);
+  }
+  const recordedTargetIndexes: number[] = [];
   for (const descriptor of descriptors) {
-    const row = rowsByCreatedAt.get(descriptor.createdAt);
-    if (row === undefined) {
+    const rows = ledgerRowsByCreatedAt.get(descriptor.createdAt) ?? [];
+    if (rows.length === 0) {
       pendingActions.push(`record ${descriptor.tag} in the Drizzle ledger`);
-    } else if (row.hash !== descriptor.hash) {
+    } else if (rows.length !== 1) {
+      blockers.push(`Drizzle ledger has duplicate rows for ${descriptor.tag}`);
+    } else if (rows[0]?.hash !== descriptor.hash) {
       blockers.push(`Drizzle ledger hash mismatch for ${descriptor.tag}`);
     } else {
+      recordedTargetIndexes.push(
+        descriptors.findIndex(
+          (candidate) => candidate.createdAt === descriptor.createdAt,
+        ),
+      );
       completedChecks.push(`Drizzle ledger records ${descriptor.tag}`);
     }
   }
-  const newestTarget = descriptors.at(-1)?.createdAt;
+  const firstTarget = descriptors[0]?.createdAt;
+  if (firstTarget !== undefined) {
+    for (const [createdAt] of ledgerRowsByCreatedAt) {
+      if (
+        createdAt >= firstTarget &&
+        !descriptors.some((descriptor) => descriptor.createdAt === createdAt)
+      ) {
+        blockers.push(
+          `Drizzle ledger contains an unknown or newer migration at ${createdAt}`,
+        );
+      }
+    }
+  }
+  const sortedRecordedIndexes = [...recordedTargetIndexes].sort(
+    (left, right) => left - right,
+  );
   if (
-    newestTarget !== undefined &&
-    state.ledgerRows.some(
-      (row) =>
-        Number(row.created_at) > newestTarget &&
-        !descriptors.some(
-          (descriptor) => descriptor.createdAt === Number(row.created_at),
-        ),
+    sortedRecordedIndexes.some(
+      (targetIndex, sequenceIndex) => targetIndex !== sequenceIndex,
     )
   ) {
     blockers.push(
-      "Drizzle ledger contains migrations newer than 0011; use the current owner-approved migration path",
+      "Drizzle ledger is missing a predecessor in the recorded 0009-0012 sequence",
     );
   }
 
@@ -705,15 +1109,26 @@ function analyzeState(
 }
 
 function createReport(
-  mode: "plan" | "apply",
+  mode: "plan" | "apply" | "verify",
   environment: string,
   state: DevCanaryMigrationState,
   descriptors: readonly MigrationDescriptor[],
+  authorizationEvidence: DevCanaryMigrationReport["authorizationEvidence"] = null,
 ): DevCanaryMigrationReport {
   const analysis = analyzeState(state, descriptors);
   const address = state.relations.get("addresses");
   const ledgerHashes = new Set(
     state.ledgerRows.map((row) => `${row.created_at}:${row.hash}`),
+  );
+  const privateBbbRelations = BBB_PRIVATE_TABLES.map((tableName) =>
+    state.relations.get(tableName),
+  ).filter((relation): relation is RelationRow => relation !== undefined);
+  const privateBbbExistingRows = privateBbbRelations.reduce(
+    (total, relation) => {
+      const estimate = BigInt(relation.estimated_rows);
+      return total + (estimate > 0n ? estimate : 0n);
+    },
+    0n,
   );
   return {
     schemaVersion: "query-db.dev-canary-migration.v1",
@@ -741,8 +1156,29 @@ function createReport(
         "two concurrent full-table index scans",
         "brief ACCESS EXCLUSIVE lock to add a NOT VALID check",
         "online validation scan under SHARE UPDATE EXCLUSIVE",
-        "additive 0009 table creation and three Drizzle ledger rows",
+        "additive 0009 table creation",
+        "atomic 0012 creation of eight empty tables and thirty empty-table indexes before thirteen restrictive foreign keys",
+        "four pinned Drizzle ledger rows recorded only after final verification",
       ],
+      migration0012: {
+        targetTablesPresent: privateBbbRelations.length,
+        expectedTables: 8,
+        expectedForeignKeys: 13,
+        expectedIndexes: 30,
+        existingRows: privateBbbExistingRows.toString(),
+        referencedRelations: [
+          "companies",
+          "properties",
+          "property_improvements",
+        ].map((tableName) => {
+          const relation = state.relations.get(tableName);
+          return {
+            tableName,
+            estimatedRows: relation?.estimated_rows ?? "0",
+            totalBytes: relation?.total_bytes ?? "0",
+          };
+        }),
+      },
     },
     targetMigrations: descriptors.map((descriptor) => ({
       tag: descriptor.tag,
@@ -753,6 +1189,7 @@ function createReport(
     blockers: analysis.blockers,
     pendingActions: analysis.pendingActions,
     completedChecks: analysis.completedChecks,
+    authorizationEvidence,
     ready: analysis.blockers.length === 0,
   };
 }
@@ -784,6 +1221,56 @@ async function applyMigration0009(
     .filter((statement) => statement.length > 0);
   await inTransaction(client, async () => {
     for (const statement of statements) {
+      await client.query(statement);
+    }
+  });
+}
+
+async function applyMigration0012(
+  client: Client,
+  descriptor: MigrationDescriptor,
+): Promise<void> {
+  const statements = descriptor.sql
+    .split("--> statement-breakpoint")
+    .map((statement) => statement.trim())
+    .filter((statement) => statement.length > 0);
+  const createTables: string[] = [];
+  const createIndexes: string[] = [];
+  const addForeignKeys: string[] = [];
+  for (const statement of statements) {
+    if (/^CREATE TABLE\b/iu.test(statement)) {
+      createTables.push(statement);
+    } else if (/^CREATE (?:UNIQUE )?INDEX\b/iu.test(statement)) {
+      createIndexes.push(statement);
+    } else if (
+      /^ALTER TABLE\b/iu.test(statement) &&
+      /\bFOREIGN KEY\b/iu.test(statement)
+    ) {
+      addForeignKeys.push(statement);
+    } else {
+      throw new Error(
+        "Migration 0012 contains an unsupported statement; review the pinned migration contract",
+      );
+    }
+  }
+  if (
+    createTables.length !== BBB_PRIVATE_TABLES.length ||
+    createIndexes.length !== BBB_PRIVATE_INDEXES.length ||
+    addForeignKeys.length !== BBB_PRIVATE_FOREIGN_KEYS.length
+  ) {
+    throw new Error(
+      "Migration 0012 statement counts do not match the pinned 8-table/13-FK/30-index contract",
+    );
+  }
+
+  await inTransaction(client, async () => {
+    // Build indexes while every target table is still empty. Add foreign keys
+    // last so locks on the existing parent tables are held only until commit.
+    for (const statement of [
+      ...createTables,
+      ...createIndexes,
+      ...addForeignKeys,
+    ]) {
       await client.query(statement);
     }
   });
@@ -880,9 +1367,49 @@ async function recordMigrationLedger(
   });
 }
 
+async function loadWriterPauseProof(
+  proofPath: string,
+): Promise<VerifiedWriterPauseProof> {
+  const body = await readFile(path.resolve(proofPath), "utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body) as unknown;
+  } catch (caught) {
+    const message = caught instanceof Error ? caught.message : String(caught);
+    throw new Error(`Writer-pause proof is not valid JSON: ${message}`);
+  }
+  return {
+    proof: writerPauseProofSchema.parse(parsed),
+    sha256: createHash("sha256").update(body).digest("hex"),
+  };
+}
+
+function assertFreshTimestamp(
+  value: string | undefined,
+  label: string,
+  maximumAgeMs: number,
+  now: number,
+): number {
+  if (value === undefined || value.trim().length === 0) {
+    throw new Error(`${label} is required`);
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    throw new Error(`${label} must be an ISO timestamp`);
+  }
+  if (timestamp > now + CLOCK_SKEW_MS) {
+    throw new Error(`${label} cannot be in the future`);
+  }
+  if (now - timestamp > maximumAgeMs) {
+    throw new Error(`${label} is stale`);
+  }
+  return timestamp;
+}
+
 function assertApplyAuthorization(
   options: DevCanaryMigrationOptions,
   state: DevCanaryMigrationState,
+  writerPause: VerifiedWriterPauseProof,
 ): void {
   if (options.environment !== "DEV") {
     throw new Error("--environment must be exactly DEV");
@@ -901,20 +1428,52 @@ function assertApplyAuthorization(
       "--expected-endpoint-fingerprint must match the reviewed plan",
     );
   }
-  if (options.approvalRef?.trim() === "") {
-    throw new Error("--approval-ref is required");
+  const approvalRefs = (options.approvalRefs ?? []).map((value) =>
+    value.trim(),
+  );
+  if (
+    approvalRefs.length === 0 ||
+    approvalRefs.some((value) => value.length < 3) ||
+    new Set(approvalRefs).size !== approvalRefs.length
+  ) {
+    throw new Error("at least one unique, concrete --approval-ref is required");
   }
-  if (options.approvalRef === undefined) {
-    throw new Error("--approval-ref is required");
-  }
-  if (options.backupRef?.trim() === "") {
+  if (options.backupRef === undefined || options.backupRef.trim().length < 3) {
     throw new Error("--backup-ref is required");
   }
-  if (options.backupRef === undefined) {
-    throw new Error("--backup-ref is required");
+  const now = Date.now();
+  assertFreshTimestamp(
+    options.backupCreatedAt,
+    "--backup-created-at",
+    BACKUP_MAX_AGE_MS,
+    now,
+  );
+  assertFreshTimestamp(
+    writerPause.proof.observedAt,
+    "writer-pause proof observedAt",
+    WRITER_PAUSE_MAX_AGE_MS,
+    now,
+  );
+  if (
+    writerPause.proof.environment !== "DEV" ||
+    writerPause.proof.endpointFingerprint !== state.endpointFingerprint
+  ) {
+    throw new Error(
+      "writer-pause proof must match the DEV endpoint fingerprint",
+    );
   }
-  if (options.writersPaused !== true) {
-    throw new Error("--writers-paused is required");
+  if (
+    writerPause.proof.writers.some(
+      (writer) =>
+        writer.pauseCommand.trim().length === 0 ||
+        writer.resumeCommand.trim().length === 0 ||
+        writer.proofRef.trim().length < 3 ||
+        writer.paused !== true,
+    )
+  ) {
+    throw new Error(
+      "writer-pause proof must include concrete pause/resume commands and pause evidence for every writer",
+    );
   }
   if (state.activity.target_write_locks > 0) {
     throw new Error("target tables still have a granted write lock");
@@ -927,6 +1486,17 @@ function assertApplyAuthorization(
   }
   if (!state.permissions.can_reference_geometries) {
     throw new Error("database role lacks REFERENCES on public.geometries");
+  }
+  if (!state.permissions.can_reference_companies) {
+    throw new Error("database role lacks REFERENCES on public.companies");
+  }
+  if (!state.permissions.can_reference_properties) {
+    throw new Error("database role lacks REFERENCES on public.properties");
+  }
+  if (!state.permissions.can_reference_property_improvements) {
+    throw new Error(
+      "database role lacks REFERENCES on public.property_improvements",
+    );
   }
   if (!state.ledgerTablePresent && !state.permissions.can_create_schema) {
     throw new Error("database role cannot create the Drizzle schema if needed");
@@ -950,18 +1520,39 @@ export async function runDevCanarySchemaMigration(
   await client.connect();
   let advisoryLockHeld = false;
   try {
-    if (options.mode === "plan") {
+    if (options.mode === "plan" || options.mode === "verify") {
       await client.query("BEGIN READ ONLY");
       try {
         await client.query("SET LOCAL statement_timeout = '15s'");
         const state = await inspectState(client, databaseUrl);
         await client.query("COMMIT");
-        return createReport(
+        if (
+          options.mode === "verify" &&
+          (options.expectedEndpointFingerprint === undefined ||
+            options.expectedEndpointFingerprint !== state.endpointFingerprint)
+        ) {
+          throw new Error(
+            "--expected-endpoint-fingerprint must match the reviewed plan",
+          );
+        }
+        const report = createReport(
           options.mode,
           options.environment,
           state,
           descriptors,
         );
+        if (
+          options.mode === "verify" &&
+          (report.blockers.length > 0 || report.pendingActions.length > 0)
+        ) {
+          throw new Error(
+            `Verification failed: ${[
+              ...report.blockers,
+              ...report.pendingActions,
+            ].join("; ")}`,
+          );
+        }
+        return report;
       } catch (error) {
         await client.query("ROLLBACK").catch(() => undefined);
         throw error;
@@ -974,11 +1565,17 @@ export async function runDevCanarySchemaMigration(
     );
     advisoryLockHeld = lock.rows[0]?.acquired === true;
     if (!advisoryLockHeld) {
-      throw new Error("another 0009-0011 migration session holds the lock");
+      throw new Error("another 0009-0012 migration session holds the lock");
     }
 
     let state = await inspectState(client, databaseUrl);
-    assertApplyAuthorization(options, state);
+    if (options.writerPauseProofPath === undefined) {
+      throw new Error("--writer-pause-proof is required");
+    }
+    const writerPauseProof = await loadWriterPauseProof(
+      options.writerPauseProofPath,
+    );
+    assertApplyAuthorization(options, state, writerPauseProof);
     const initial = analyzeState(state, descriptors);
     if (initial.blockers.length > 0) {
       throw new Error(
@@ -1027,6 +1624,18 @@ export async function runDevCanarySchemaMigration(
       state = await inspectState(client, databaseUrl);
     }
 
+    const bbbPresence = privateBbbTablePresence(state);
+    if (bbbPresence.every((present) => !present)) {
+      const migration0012 = descriptors.find(
+        (descriptor) => descriptor.tag === "0012_private_bbb_persistence",
+      );
+      if (migration0012 === undefined) {
+        throw new Error("Migration 0012 descriptor is unavailable");
+      }
+      await applyMigration0012(client, migration0012);
+      state = await inspectState(client, databaseUrl);
+    }
+
     const beforeLedger = analyzeState(state, descriptors);
     const nonLedgerPending = beforeLedger.pendingActions.filter(
       (action) => !action.startsWith("record "),
@@ -1047,6 +1656,12 @@ export async function runDevCanarySchemaMigration(
       options.environment,
       state,
       descriptors,
+      {
+        approvalRefCount: options.approvalRefs?.length ?? 0,
+        backupCreatedAt: options.backupCreatedAt ?? "",
+        writerPauseProofSha256: writerPauseProof.sha256,
+        writerCount: writerPauseProof.proof.writers.length,
+      },
     );
     if (
       finalReport.blockers.length > 0 ||

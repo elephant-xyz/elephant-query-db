@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 10
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgis/postgis:17-3.5-alpine
         env:
           POSTGRES_DB: querydb
           POSTGRES_PASSWORD: postgres
@@ -28,6 +28,7 @@ jobs:
           --health-retries 10
     env:
       TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/querydb
+      PRIVATE_BBB_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/querydb_bbb_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,6 +36,7 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci --ignore-scripts
+      - run: PGPASSWORD=postgres createdb -h 127.0.0.1 -U postgres querydb_bbb_test
       - run: npm run format:check:migration-contract
       - run: npm run typecheck
       - run: npm test

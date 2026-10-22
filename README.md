@@ -15,7 +15,7 @@ The schema is Postgres-first, lexicon-aligned, and intentionally **logical-table
 - [`docs/schema-design.md`](docs/schema-design.md) — logical table families, rerun/idempotency model, and Vercel access pattern
 - [`docs/lexicon-alignment.md`](docs/lexicon-alignment.md) — how local lexicon classes map into typed tables and direct foreign keys
 - [`docs/open-lexicon-gaps.md`](docs/open-lexicon-gaps.md) — permit/Sunbiz/appraisal facts that should later be promoted into the lexicon
-- [`docs/dev-query-db-canary-migration.md`](docs/dev-query-db-canary-migration.md) — reviewed DEV checkpoint and recovery path for migrations `0009`–`0011`
+- [`docs/dev-query-db-canary-migration.md`](docs/dev-query-db-canary-migration.md) — reviewed DEV checkpoint and recovery path for migrations `0009`–`0012`
 - [`src/schema`](src/schema) — Drizzle schema-as-code source of truth
 - [`migrations`](migrations) — generated SQL migrations from Drizzle; do not hand-edit unless a migration needs a deliberate SQL-only operation
 - [`src/lexicon/generated.ts`](src/lexicon/generated.ts) — generated compile-time class/relationship metadata from `../lexicon/src/data/lexicon.json`
@@ -48,7 +48,7 @@ npm run migrate:dev-canary -- --plan --environment DEV
 
 Regenerate migrations from the TypeScript schema with `npm run generate:migrations`; checked-in migration files are artifacts, not the schema source of truth.
 Generation does not apply migrations. Follow the DEV canary migration runbook
-for the owner-approved `0009`–`0011` checkpoint; do not run the generated SQL
+for the owner-approved `0009`–`0012` checkpoint; do not run the generated SQL
 directly against the live DEV `addresses` table.
 
 ## Current scope
@@ -77,3 +77,7 @@ npm run load:bulk -- \
   --tracks bbb \
   --bbb-prefix permit-harvest/bbb/category-data/browser-harvest-v1/profiles/
 ```
+
+For the private permit-backed path, prepare the external Oracle handoff and run
+the documented read-only plan before the explicit `load:bbb-private -- --apply`
+command; see [`docs/private-bbb-persistence.md`](docs/private-bbb-persistence.md).
