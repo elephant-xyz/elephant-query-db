@@ -20,6 +20,10 @@ import type { JsonObject } from "./types.js";
 const BUNDLE_SCHEMA_VERSION = "elephant.bbb-private-persistence-bundle.v1";
 const OFFICIAL_EVIDENCE_SCHEMA_VERSION =
   "elephant.bbb-official-permit-company-evidence.v1";
+const OFFICIAL_EVIDENCE_SCHEMA_VERSION_V2 =
+  "elephant.bbb-official-permit-company-evidence.v2";
+const ADAPTER_RECEIPT_SCHEMA_VERSION =
+  "elephant.bbb-private-bundle-adapter-receipt.v1";
 const HARVEST_SCHEMA_VERSION = "elephant.bbb-category-harvest.v1";
 const RECONCILIATION_SCHEMA_VERSION = "elephant.bbb-reconciliation.v1";
 const MATCH_POLICY_VERSION = "bbb-private-exact-cascade-v1";
@@ -92,6 +96,13 @@ const privateBbbBundleSchema = z
       )
       .min(1),
     officialPermitCompanyEvidence: relativePathSchema,
+    oracleAdapterReceipt: z
+      .object({
+        relativePath: relativePathSchema,
+        sha256: sha256Schema,
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((bundle, context) => {
@@ -105,7 +116,17 @@ const privateBbbBundleSchema = z
     }
   });
 
-const officialEvidenceSchema = z
+const contractorEvidenceSchema = z
+  .object({
+    name: z.string().min(1).max(500).nullable().optional(),
+    legalName: z.string().min(1).max(500).nullable().optional(),
+    alternateNames: z.array(z.string().min(1).max(500)).default([]),
+    phones: z.array(z.string().min(1).max(100)).default([]),
+    licenseIdentifiers: z.array(z.string().min(1).max(100)).default([]),
+  })
+  .strict();
+
+const officialEvidenceSchemaV1 = z
   .object({
     schemaVersion: z.literal(OFFICIAL_EVIDENCE_SCHEMA_VERSION),
     evidenceKey: z.string().min(1).max(300).regex(SAFE_KEY_PATTERN),
@@ -121,15 +142,7 @@ const officialEvidenceSchema = z
         sourceRecordKey: z.string().min(1).max(500),
       })
       .strict(),
-    contractor: z
-      .object({
-        name: z.string().min(1).max(500).nullable().optional(),
-        legalName: z.string().min(1).max(500).nullable().optional(),
-        alternateNames: z.array(z.string().min(1).max(500)).default([]),
-        phones: z.array(z.string().min(1).max(100)).default([]),
-        licenseIdentifiers: z.array(z.string().min(1).max(100)).default([]),
-      })
-      .strict(),
+    contractor: contractorEvidenceSchema,
     asOf: timestampSchema,
   })
   .strict()
@@ -154,6 +167,45 @@ const officialEvidenceSchema = z
       });
     }
   });
+
+const officialEvidenceSchemaV2 = z
+  .object({
+    schemaVersion: z.literal(OFFICIAL_EVIDENCE_SCHEMA_VERSION_V2),
+    evidenceKey: z.string().min(1).max(300).regex(SAFE_KEY_PATTERN),
+    permit: z
+      .object({
+        propertyImprovementId: z.string().uuid(),
+        propertyId: z.string().uuid(),
+      })
+      .strict(),
+    company: z
+      .object({
+        requestIdentifier: z.string().min(1).max(500),
+      })
+      .strict(),
+    contractor: contractorEvidenceSchema,
+    expectedMatch: z
+      .object({
+        providerBusinessKey: z.string().min(1).max(500),
+        providerProfileKeys: z.array(z.string().min(1).max(500)).min(1),
+        method: z.enum([
+          "exact_state_license",
+          "exact_standardized_phone",
+          "unique_exact_normalized_business_name",
+        ]),
+        confidence: z.number().min(0).max(1),
+      })
+      .strict()
+      .optional(),
+    asOf: timestampSchema,
+    sourceEvidenceSha256: sha256Schema,
+  })
+  .strict();
+
+const officialEvidenceSchema = z.discriminatedUnion("schemaVersion", [
+  officialEvidenceSchemaV1,
+  officialEvidenceSchemaV2,
+]);
 
 const partReceiptSchema = z
   .object({
@@ -225,8 +277,48 @@ const reconciliationManifestSchema = z
   })
   .passthrough();
 
+const adapterReceiptSchema = z
+  .object({
+    schemaVersion: z.literal(ADAPTER_RECEIPT_SCHEMA_VERSION),
+    countyKey: countyKeySchema,
+    runId: z.string().min(8).max(160),
+    sourceManifestSha256: sha256Schema,
+    reconciliationManifestSha256: sha256Schema,
+    profilesSha256: sha256Schema,
+    permitCoverageSha256: sha256Schema,
+    permitCompanyEvidenceSha256: sha256Schema,
+    acceptedLinksSha256: sha256Schema,
+    officialEvidenceSha256: sha256Schema,
+    permitWatermarkDigest: sha256Schema,
+    sourceAccessComplete: z.literal(true),
+    profileCount: z.number().int().positive(),
+    officialIdentityCount: z.number().int().positive(),
+    officialCompanyCount: z.number().int().positive(),
+    categories: z.array(
+      z
+        .object({
+          categoryKey: countyKeySchema,
+          summarySha256: sha256Schema,
+          profileCount: z.number().int().positive(),
+        })
+        .strict(),
+    ),
+    acceptedPropertyLinkCount: z.number().int().positive(),
+    reviewCandidateCount: z.literal(0),
+    fuzzyAcceptedCount: z.literal(0),
+    matchMethodCounts: z
+      .object({
+        exact_state_license: z.number().int().nonnegative(),
+        exact_standardized_phone: z.number().int().nonnegative(),
+        unique_exact_normalized_business_name: z.number().int().nonnegative(),
+      })
+      .strict(),
+  })
+  .strict();
+
 type PrivateBbbBundle = z.infer<typeof privateBbbBundleSchema>;
 type OfficialEvidence = z.infer<typeof officialEvidenceSchema>;
+type AdapterReceipt = z.infer<typeof adapterReceiptSchema>;
 type CategorySummary = z.infer<typeof categorySummarySchema>;
 type PartReceipt = z.infer<typeof partReceiptSchema>;
 
@@ -286,6 +378,7 @@ type PreparedBundle = {
   readonly categories: readonly PreparedCategory[];
   readonly officialEvidence: readonly OfficialEvidence[];
   readonly officialEvidenceSha256: string;
+  readonly adapterReceipt: AdapterReceipt | null;
   readonly sourceAccessStatus: "accessible" | "blocked" | "incomplete";
   readonly sourceAccessComplete: boolean;
   readonly startedAt: string;
@@ -300,6 +393,10 @@ type ResolvedEvidence = {
   readonly companyName: string | null;
   readonly propertyImprovementId: string;
   readonly propertyId: string;
+  readonly permitSourceSystem: string;
+  readonly permitSourceRecordKey: string;
+  readonly companySourceSystem: string;
+  readonly companySourceRecordKey: string;
 };
 
 type OfficialCompanyIdentity = {
@@ -371,6 +468,23 @@ export type PrivateBbbLoadResult = {
   readonly replayed: boolean;
 };
 
+export type PrivateBbbPlanResult = {
+  readonly mode: "plan";
+  readonly countyKey: string;
+  readonly runId: string;
+  readonly bundleSha256: string;
+  readonly officialEvidenceSha256: string;
+  readonly sourceAccessStatus: "accessible" | "blocked" | "incomplete";
+  readonly sourceAccessComplete: boolean;
+  readonly profileCount: number;
+  readonly acceptedMatchCount: number;
+  readonly reviewCandidateCount: number;
+  readonly ambiguousCandidateCount: number;
+  readonly unmatchedCount: number;
+  readonly acceptedPropertyLinkCount: number;
+  readonly ready: true;
+};
+
 interface IdRow extends QueryResultRow {
   readonly id: string;
 }
@@ -402,14 +516,90 @@ interface ExistingMembershipRow extends QueryResultRow {
 interface ResolvedEvidenceRow extends QueryResultRow {
   readonly company_id: string;
   readonly company_name: string | null;
+  readonly company_source_system: string;
+  readonly company_source_record_key: string;
   readonly property_improvement_id: string;
   readonly property_id: string | null;
+  readonly permit_source_system: string;
+  readonly permit_source_record_key: string;
   readonly officially_linked: boolean;
 }
 
 interface ReconciliationRunRow extends QueryResultRow {
   readonly id: string;
   readonly is_current: boolean;
+}
+
+/**
+ * Resolve all private evidence and predict the exact-tier outcome inside a
+ * read-only transaction. This performs no schema or row mutation.
+ */
+export async function planPrivateBbbBundle(params: {
+  readonly pool: Pool;
+  readonly bundlePath: string;
+}): Promise<PrivateBbbPlanResult> {
+  const prepared = await preparePrivateBbbBundle(params.bundlePath);
+  const client = await params.pool.connect();
+  try {
+    await client.query("BEGIN READ ONLY");
+    const resolvedEvidence = await resolveOfficialEvidence(
+      client,
+      prepared.officialEvidence,
+    );
+    const companies = buildOfficialCompanyIdentities(resolvedEvidence);
+    const businesses = buildBbbBusinessIdentities(prepared.snapshots);
+    const matchPlans = prepared.sourceAccessComplete
+      ? buildPrivateBbbMatchPlan(companies, businesses)
+      : buildIncompleteSourceMatchPlan(companies);
+    assertAdapterMatchExpectations(prepared, matchPlans);
+    await client.query("COMMIT");
+    return {
+      mode: "plan",
+      countyKey: prepared.bundle.countyKey,
+      runId: prepared.bundle.runId,
+      bundleSha256: prepared.bundleSha256,
+      officialEvidenceSha256: prepared.officialEvidenceSha256,
+      sourceAccessStatus: prepared.sourceAccessStatus,
+      sourceAccessComplete: prepared.sourceAccessComplete,
+      profileCount: prepared.reconciliation.uniqueProfileCount,
+      ...countMatchPlans(matchPlans),
+      acceptedPropertyLinkCount: countAcceptedPropertyLinks(matchPlans),
+      ready: true,
+    };
+  } catch (caught) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw caught;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Verify that the exact bundle and official-evidence digests are current.
+ * The check runs in a read-only transaction and never attempts a load.
+ */
+export async function verifyPrivateBbbBundle(params: {
+  readonly pool: Pool;
+  readonly bundlePath: string;
+}): Promise<PrivateBbbLoadResult> {
+  const prepared = await preparePrivateBbbBundle(params.bundlePath);
+  const client = await params.pool.connect();
+  try {
+    await client.query("BEGIN READ ONLY");
+    const existing = await findReplay(client, prepared);
+    if (existing === null) {
+      throw new Error(
+        "The exact BBB bundle and official-evidence digest are not current",
+      );
+    }
+    await client.query("COMMIT");
+    return replayResult(prepared, existing);
+  } catch (caught) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw caught;
+  } finally {
+    client.release();
+  }
 }
 
 /**
@@ -485,6 +675,7 @@ export async function loadPrivateBbbBundle(params: {
     const matchPlans = prepared.sourceAccessComplete
       ? buildPrivateBbbMatchPlan(companies, businesses)
       : buildIncompleteSourceMatchPlan(companies);
+    assertAdapterMatchExpectations(prepared, matchPlans);
     const reconciliationKey = hashString(
       [
         prepared.bundleSha256,
@@ -798,6 +989,55 @@ async function preparePrivateBbbBundle(
   const officialEvidenceBody = await readFile(officialEvidencePath, "utf8");
   const officialEvidence = parseOfficialEvidence(officialEvidenceBody);
   const officialEvidenceSha256 = sha256(officialEvidenceBody);
+  let adapterReceipt: AdapterReceipt | null = null;
+  if (bundle.oracleAdapterReceipt !== undefined) {
+    const receiptPath = resolveInside(
+      bundleRoot,
+      bundle.oracleAdapterReceipt.relativePath,
+    );
+    const receiptBody = await readFile(receiptPath, "utf8");
+    if (sha256(receiptBody) !== bundle.oracleAdapterReceipt.sha256) {
+      throw new Error("BBB Oracle adapter receipt digest mismatch");
+    }
+    adapterReceipt = adapterReceiptSchema.parse(
+      parseJson(receiptBody, receiptPath),
+    );
+    const receiptCategories = [...adapterReceipt.categories].sort(
+      (left, right) => left.categoryKey.localeCompare(right.categoryKey),
+    );
+    const actualCategories = categories
+      .map((category) => ({
+        categoryKey: category.summary.categoryKey,
+        summarySha256: category.summarySha256,
+        profileCount: category.summary.profilesHarvested,
+      }))
+      .sort((left, right) => left.categoryKey.localeCompare(right.categoryKey));
+    if (
+      adapterReceipt.countyKey !== bundle.countyKey ||
+      adapterReceipt.runId !== bundle.runId ||
+      adapterReceipt.reconciliationManifestSha256 !==
+        sha256(reconciliationBody) ||
+      adapterReceipt.profilesSha256 !== reconciliation.profilesSha256 ||
+      adapterReceipt.profileCount !== reconciliation.uniqueProfileCount ||
+      adapterReceipt.officialIdentityCount !== officialEvidence.length ||
+      adapterReceipt.officialEvidenceSha256 !== officialEvidenceSha256 ||
+      stableJsonStringify(receiptCategories) !==
+        stableJsonStringify(actualCategories)
+    ) {
+      throw new Error("BBB Oracle adapter receipt does not match the bundle");
+    }
+  }
+  if (
+    officialEvidence.some(
+      (evidence) =>
+        evidence.schemaVersion === OFFICIAL_EVIDENCE_SCHEMA_VERSION_V2,
+    ) &&
+    adapterReceipt === null
+  ) {
+    throw new Error(
+      "BBB v2 official evidence requires an Oracle adapter receipt",
+    );
+  }
   const sourceAccessStatus = deriveSourceAccessStatus(categories);
   const sourceAccessComplete =
     sourceAccessStatus === "accessible" &&
@@ -842,6 +1082,7 @@ async function preparePrivateBbbBundle(
     categories,
     officialEvidence,
     officialEvidenceSha256,
+    adapterReceipt,
     sourceAccessStatus,
     sourceAccessComplete,
     startedAt: minimumTimestamp(
@@ -1744,35 +1985,77 @@ async function resolveOfficialEvidence(
 ): Promise<readonly ResolvedEvidence[]> {
   const resolved: ResolvedEvidence[] = [];
   for (const evidence of evidenceRows) {
-    const result = await client.query<ResolvedEvidenceRow>(
-      `SELECT
-         company."company_id",
-         company."name" AS "company_name",
-         improvement."property_improvement_id",
-         improvement."property_id",
-         (
-           improvement."contractor_company_id" = company."company_id"
-           OR EXISTS (
-             SELECT 1
-             FROM "permit_contacts" contact
-             WHERE contact."property_improvement_id" =
-                   improvement."property_improvement_id"
-               AND contact."company_id" = company."company_id"
-           )
-         ) AS "officially_linked"
-       FROM "companies" company
-       CROSS JOIN "property_improvements" improvement
-       WHERE company."source_system" = $1
-         AND company."source_record_key" = $2
-         AND improvement."source_system" = $3
-         AND improvement."source_record_key" = $4`,
-      [
-        evidence.company.sourceSystem,
-        evidence.company.sourceRecordKey,
-        evidence.permit.sourceSystem,
-        evidence.permit.sourceRecordKey,
-      ],
-    );
+    const result =
+      evidence.schemaVersion === OFFICIAL_EVIDENCE_SCHEMA_VERSION
+        ? await client.query<ResolvedEvidenceRow>(
+            `SELECT
+               company."company_id",
+               company."name" AS "company_name",
+               company."source_system" AS "company_source_system",
+               company."source_record_key" AS "company_source_record_key",
+               improvement."property_improvement_id",
+               improvement."property_id",
+               improvement."source_system" AS "permit_source_system",
+               improvement."source_record_key" AS "permit_source_record_key",
+               (
+                 improvement."contractor_company_id" = company."company_id"
+                 OR EXISTS (
+                   SELECT 1
+                   FROM "permit_contacts" contact
+                   WHERE contact."property_improvement_id" =
+                         improvement."property_improvement_id"
+                     AND contact."company_id" = company."company_id"
+                 )
+               ) AS "officially_linked"
+             FROM "companies" company
+             CROSS JOIN "property_improvements" improvement
+             WHERE company."source_system" = $1
+               AND company."source_record_key" = $2
+               AND improvement."source_system" = $3
+               AND improvement."source_record_key" = $4`,
+            [
+              evidence.company.sourceSystem,
+              evidence.company.sourceRecordKey,
+              evidence.permit.sourceSystem,
+              evidence.permit.sourceRecordKey,
+            ],
+          )
+        : await client.query<ResolvedEvidenceRow>(
+            `SELECT
+               company."company_id",
+               company."name" AS "company_name",
+               company."source_system" AS "company_source_system",
+               company."source_record_key" AS "company_source_record_key",
+               improvement."property_improvement_id",
+               improvement."property_id",
+               improvement."source_system" AS "permit_source_system",
+               improvement."source_record_key" AS "permit_source_record_key",
+               (
+                 improvement."contractor_company_id" = company."company_id"
+                 OR EXISTS (
+                   SELECT 1
+                   FROM "permit_contacts" contact
+                   WHERE contact."property_improvement_id" =
+                         improvement."property_improvement_id"
+                     AND contact."company_id" = company."company_id"
+                 )
+               ) AS "officially_linked"
+             FROM "companies" company
+             CROSS JOIN "property_improvements" improvement
+             WHERE company."request_identifier" = $1
+               AND improvement."property_improvement_id" = $2
+               AND improvement."property_id" = $3`,
+            [
+              evidence.company.requestIdentifier,
+              evidence.permit.propertyImprovementId,
+              evidence.permit.propertyId,
+            ],
+          );
+    if (result.rows.length !== 1) {
+      throw new Error(
+        `Official BBB evidence must resolve exactly one existing company and permit: ${evidence.evidenceKey}`,
+      );
+    }
     const row = result.rows[0];
     if (row === undefined) {
       throw new Error(
@@ -1796,6 +2079,10 @@ async function resolveOfficialEvidence(
       companyName: row.company_name,
       propertyImprovementId: row.property_improvement_id,
       propertyId: row.property_id,
+      permitSourceSystem: row.permit_source_system,
+      permitSourceRecordKey: row.permit_source_record_key,
+      companySourceSystem: row.company_source_system,
+      companySourceRecordKey: row.company_source_record_key,
     });
   }
   return resolved;
@@ -1814,7 +2101,7 @@ function buildOfficialCompanyIdentities(
     const identityKeys = uniqueSorted(
       evidence.map(
         (entry) =>
-          `${entry.evidence.company.sourceSystem}:${entry.evidence.company.sourceRecordKey}`,
+          `${entry.companySourceSystem}:${entry.companySourceRecordKey}`,
       ),
     );
     const names = uniqueSorted(
@@ -2258,8 +2545,8 @@ async function persistMatchPlan(params: {
           evidence.propertyImprovementId,
           evidence.propertyId,
           evidence.companyId,
-          evidence.evidence.permit.sourceSystem,
-          evidence.evidence.permit.sourceRecordKey,
+          evidence.permitSourceSystem,
+          evidence.permitSourceRecordKey,
           evidence.evidence.evidenceKey,
           evidence.evidenceSha256,
           snapshotAsOf,
@@ -2299,6 +2586,72 @@ function countAcceptedPropertyLinks(plans: readonly MatchPlan[]): number {
     }
   }
   return keys.size;
+}
+
+function assertAdapterMatchExpectations(
+  prepared: PreparedBundle,
+  plans: readonly MatchPlan[],
+): void {
+  const receipt = prepared.adapterReceipt;
+  if (receipt === null) return;
+  const counts = countMatchPlans(plans);
+  const methodCounts = {
+    exact_state_license: plans.filter(
+      (plan) =>
+        plan.outcome === "accepted" &&
+        plan.matchMethod === "exact_state_license",
+    ).length,
+    exact_standardized_phone: plans.filter(
+      (plan) =>
+        plan.outcome === "accepted" &&
+        plan.matchMethod === "exact_standardized_phone",
+    ).length,
+    unique_exact_normalized_business_name: plans.filter(
+      (plan) =>
+        plan.outcome === "accepted" &&
+        plan.matchMethod === "unique_exact_normalized_business_name",
+    ).length,
+  };
+  if (
+    countAcceptedPropertyLinks(plans) !== receipt.acceptedPropertyLinkCount ||
+    new Set(plans.map((plan) => plan.company.companyId)).size !==
+      receipt.officialCompanyCount ||
+    counts.reviewCandidateCount !== receipt.reviewCandidateCount ||
+    stableJsonStringify(methodCounts) !==
+      stableJsonStringify(receipt.matchMethodCounts)
+  ) {
+    throw new Error(
+      "BBB loader prediction does not match the Oracle adapter receipt",
+    );
+  }
+  for (const plan of plans) {
+    for (const resolved of plan.company.evidence) {
+      const evidence = resolved.evidence;
+      if (evidence.schemaVersion !== OFFICIAL_EVIDENCE_SCHEMA_VERSION_V2) {
+        continue;
+      }
+      if (evidence.expectedMatch === undefined) continue;
+      const actualProfileKeys = new Set(
+        plan.business?.snapshots.map(
+          (snapshot) => snapshot.providerProfileKey,
+        ) ?? [],
+      );
+      if (
+        plan.outcome !== "accepted" ||
+        plan.business?.providerBusinessKey !==
+          evidence.expectedMatch.providerBusinessKey ||
+        plan.matchMethod !== evidence.expectedMatch.method ||
+        plan.confidence !== evidence.expectedMatch.confidence ||
+        evidence.expectedMatch.providerProfileKeys.some(
+          (profileKey) => !actualProfileKeys.has(profileKey),
+        )
+      ) {
+        throw new Error(
+          `BBB exact-tier prediction mismatch for ${evidence.evidenceKey}`,
+        );
+      }
+    }
+  }
 }
 
 function deriveSourceAccessStatus(

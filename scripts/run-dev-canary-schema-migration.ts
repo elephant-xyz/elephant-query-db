@@ -20,27 +20,34 @@ function readValue(
 export function parseDevCanaryMigrationArgs(
   args: readonly string[],
 ): DevCanaryMigrationOptions {
-  let mode: "plan" | "apply" | undefined;
+  let mode: "plan" | "apply" | "verify" | undefined;
   let environment: string | undefined;
   let expectedEndpointFingerprint: string | undefined;
-  let approvalRef: string | undefined;
+  const approvalRefs: string[] = [];
   let backupRef: string | undefined;
-  let writersPaused = false;
+  let backupCreatedAt: string | undefined;
+  let writerPauseProofPath: string | undefined;
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     switch (argument) {
       case "--plan":
         if (mode !== undefined) {
-          throw new Error("Choose exactly one of --plan or --apply");
+          throw new Error("Choose exactly one of --plan, --apply, or --verify");
         }
         mode = "plan";
         break;
       case "--apply":
         if (mode !== undefined) {
-          throw new Error("Choose exactly one of --plan or --apply");
+          throw new Error("Choose exactly one of --plan, --apply, or --verify");
         }
         mode = "apply";
+        break;
+      case "--verify":
+        if (mode !== undefined) {
+          throw new Error("Choose exactly one of --plan, --apply, or --verify");
+        }
+        mode = "verify";
         break;
       case "--environment":
         environment = readValue(args, index, argument);
@@ -51,15 +58,20 @@ export function parseDevCanaryMigrationArgs(
         index += 1;
         break;
       case "--approval-ref":
-        approvalRef = readValue(args, index, argument);
+        approvalRefs.push(readValue(args, index, argument));
         index += 1;
         break;
       case "--backup-ref":
         backupRef = readValue(args, index, argument);
         index += 1;
         break;
-      case "--writers-paused":
-        writersPaused = true;
+      case "--backup-created-at":
+        backupCreatedAt = readValue(args, index, argument);
+        index += 1;
+        break;
+      case "--writer-pause-proof":
+        writerPauseProofPath = readValue(args, index, argument);
+        index += 1;
         break;
       default:
         throw new Error(`Unknown argument: ${String(argument)}`);
@@ -67,7 +79,7 @@ export function parseDevCanaryMigrationArgs(
   }
 
   if (mode === undefined) {
-    throw new Error("Choose exactly one of --plan or --apply");
+    throw new Error("Choose exactly one of --plan, --apply, or --verify");
   }
   if (environment === undefined) {
     throw new Error("--environment is required");
@@ -79,9 +91,10 @@ export function parseDevCanaryMigrationArgs(
     ...(expectedEndpointFingerprint === undefined
       ? {}
       : { expectedEndpointFingerprint }),
-    ...(approvalRef === undefined ? {} : { approvalRef }),
+    ...(approvalRefs.length === 0 ? {} : { approvalRefs }),
     ...(backupRef === undefined ? {} : { backupRef }),
-    writersPaused,
+    ...(backupCreatedAt === undefined ? {} : { backupCreatedAt }),
+    ...(writerPauseProofPath === undefined ? {} : { writerPauseProofPath }),
   };
 }
 

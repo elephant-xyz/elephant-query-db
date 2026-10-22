@@ -13,7 +13,12 @@ import path from "node:path";
 import { Pool } from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { loadPrivateBbbBundle } from "../src/loader/private-bbb.js";
+import { adaptOraclePrivateBbbHandoff } from "../src/loader/private-bbb-adapter.js";
+import {
+  loadPrivateBbbBundle,
+  planPrivateBbbBundle,
+  verifyPrivateBbbBundle,
+} from "../src/loader/private-bbb.js";
 
 const TEST_DATABASE_URL = process.env.PRIVATE_BBB_TEST_DATABASE_URL;
 const describePostgres =
@@ -54,6 +59,7 @@ type FixtureIds = {
   readonly companyCount: number;
   readonly resolverState: readonly Record<string, unknown>[];
   readonly evidence: readonly Record<string, unknown>[];
+  readonly oracleAcceptedLinks: readonly Record<string, unknown>[];
 };
 
 const fixtureDirectories: string[] = [];
@@ -80,6 +86,62 @@ describePostgres("private BBB Postgres persistence", () => {
         .map((directory) => rm(directory, { recursive: true, force: true })),
     );
   });
+
+  it("plans, loads, verifies, and replays the synthetic Lake 37-profile adapter bundle", async () => {
+    const handoff = await writeOracleAdapterHandoff(
+      fixture.oracleAcceptedLinks,
+    );
+    const adapted = await adaptOraclePrivateBbbHandoff({
+      handoffPath: handoff.handoffPath,
+      outputDirectory: handoff.outputDirectory,
+    });
+    const plan = await planPrivateBbbBundle({
+      pool,
+      bundlePath: adapted.bundlePath,
+    });
+    expect(plan).toMatchObject({
+      mode: "plan",
+      profileCount: 37,
+      acceptedMatchCount: 3,
+      reviewCandidateCount: 0,
+      ambiguousCandidateCount: 0,
+      unmatchedCount: 0,
+      acceptedPropertyLinkCount: 3,
+      ready: true,
+    });
+    expect(
+      await scalarCount(pool, `SELECT count(*) FROM "bbb_harvest_runs"`),
+    ).toBe(0);
+
+    const loaded = await loadPrivateBbbBundle({
+      pool,
+      bundlePath: adapted.bundlePath,
+      now: FIXED_TIME,
+    });
+    expect(loaded).toMatchObject({
+      profileCount: 37,
+      acceptedMatchCount: 3,
+      acceptedPropertyLinkCount: 3,
+      replayed: false,
+    });
+    const verified = await verifyPrivateBbbBundle({
+      pool,
+      bundlePath: adapted.bundlePath,
+    });
+    expect(verified).toMatchObject({
+      changedRows: 0,
+      replayed: true,
+      profileCount: 37,
+      acceptedPropertyLinkCount: 3,
+    });
+    const replay = await loadPrivateBbbBundle({
+      pool,
+      bundlePath: adapted.bundlePath,
+      now: FIXED_TIME,
+    });
+    expect(replay).toMatchObject({ changedRows: 0, replayed: true });
+    await clearPrivateBbbRows(pool);
+  }, 120_000);
 
   it("loads, replays, corrects, tombstones, and fails closed on blocked coverage", async () => {
     const profiles = syntheticProfiles();
@@ -516,15 +578,17 @@ async function seedOfficialPermitEvidence(target: Pool): Promise<FixtureIds> {
     },
   ] as const;
   const evidence: Record<string, unknown>[] = [];
+  const oracleAcceptedLinks: Record<string, unknown>[] = [];
   let acceptedCompanyId = "";
   for (const [index, value] of cases.entries()) {
     const company = await target.query<{ readonly company_id: string }>(
       `INSERT INTO "companies" (
-         "name", "normalized_name", "source_payload", "source_system",
-         "source_record_key", "source_record_hash"
-       ) VALUES ($1, $2, '{}'::jsonb, 'dbpr', $3, $4)
+         "request_identifier", "name", "normalized_name", "source_payload",
+         "source_system", "source_record_key", "source_record_hash"
+       ) VALUES ($1, $2, $3, '{}'::jsonb, 'dbpr', $4, $5)
        RETURNING "company_id"`,
       [
+        `synthetic-company-${index + 1}`,
         value.companyName,
         value.companyName.toUpperCase(),
         `dbpr:${value.key}:company`,
@@ -597,6 +661,25 @@ async function seedOfficialPermitEvidence(target: Pool): Promise<FixtureIds> {
       },
       asOf: FIXED_TIME,
     });
+    if (index < 3) {
+      oracleAcceptedLinks.push({
+        schemaVersion: "oracle.bbb-official-permit-link.v1",
+        county: "lake",
+        property_id: property.rows[0]!.property_id,
+        property_improvement_id: improvement.rows[0]!.property_improvement_id,
+        official_company_request_identifier: `synthetic-company-${index + 1}`,
+        official_license_identifiers: [],
+        bbb_business_id: `0733:oracle-accepted-${index + 1}`,
+        bbb_profile_ids: [`0733:oracle-accepted-${index + 1}`],
+        bbb_profile_urls: [
+          `https://www.bbb.org/us/fl/leesburg/profile/contractor/oracle-accepted-${index + 1}`,
+        ],
+        match_method: "unique_exact_normalized_business_name",
+        confidence: 0.8,
+        legal_identity_source: "synthetic-dbpr-permit-edge",
+        bbb_establishes_legal_identity: false,
+      });
+    }
   }
   const resolverState = (
     await target.query<Record<string, unknown>>(
@@ -616,6 +699,7 @@ async function seedOfficialPermitEvidence(target: Pool): Promise<FixtureIds> {
     companyCount: cases.length,
     resolverState,
     evidence,
+    oracleAcceptedLinks,
   };
 }
 
@@ -825,6 +909,277 @@ async function writeBundle(params: {
   const bundlePath = path.join(root, "bundle.json");
   await writeFile(bundlePath, `${JSON.stringify(bundle, null, 2)}\n`);
   return bundlePath;
+}
+
+async function writeOracleAdapterHandoff(
+  acceptedLinks: readonly Record<string, unknown>[],
+): Promise<{
+  readonly handoffPath: string;
+  readonly outputDirectory: string;
+}> {
+  const root = await mkdtemp(path.join(tmpdir(), "query-db-bbb-oracle-"));
+  fixtureDirectories.push(root);
+  const inputRoot = path.join(root, "input");
+  const outputDirectory = path.join(root, "adapted");
+  const acceptedNames = [
+    "Official License Holdings LLC",
+    "Official Phone Holdings LLC",
+    "Exact Roofing LLC",
+  ];
+  const profiles = Array.from({ length: 37 }, (_, index) =>
+    profile({
+      businessId:
+        index < acceptedNames.length
+          ? `oracle-accepted-${index + 1}`
+          : `oracle-unmatched-${index + 1}`,
+      name:
+        acceptedNames[index] ?? `Oracle Unmatched Synthetic ${index + 1} LLC`,
+    }),
+  );
+  const categoryDefinitions = [
+    {
+      key: "roofing-contractors",
+      profiles: profiles.slice(0, 18),
+    },
+    {
+      key: "air-conditioning-repair",
+      profiles: profiles.slice(18),
+    },
+  ];
+  const categoryConfigs: {
+    readonly categoryKey: string;
+    readonly harvestDirectory: string;
+    readonly summarySha256: string;
+    readonly profileCount: number;
+  }[] = [];
+  const reconciledLines: string[] = [];
+  for (const category of categoryDefinitions) {
+    const harvestDirectory = path.join("harvest", category.key);
+    const absoluteDirectory = path.join(inputRoot, harvestDirectory);
+    const profileBody = `${category.profiles
+      .map((value) => JSON.stringify(value))
+      .join("\n")}\n`;
+    reconciledLines.push(...profileBody.trim().split("\n"));
+    const part = {
+      relativePath: "profiles/profiles-part-0001.jsonl",
+      recordCount: category.profiles.length,
+      bytes: Buffer.byteLength(profileBody),
+      sha256: sha256(profileBody),
+    };
+    await mkdir(path.join(absoluteDirectory, "profiles"), { recursive: true });
+    await writeFile(
+      path.join(absoluteDirectory, part.relativePath),
+      profileBody,
+    );
+    const summary = {
+      schemaVersion: "elephant.bbb-category-harvest.v1",
+      jobId: `oracle-${category.key}`,
+      county: "lake",
+      source: "bbb-public-browser",
+      categoryKey: category.key,
+      categoryUrl: `https://www.bbb.org/us/fl/leesburg/category/${category.key}`,
+      startedAt: FIXED_TIME,
+      finishedAt: FIXED_TIME,
+      advertisedResults: category.profiles.length,
+      categoryPagesVisited: 1,
+      profileUrlsDiscovered: category.profiles.length,
+      profilesSelected: category.profiles.length,
+      profilesHarvested: category.profiles.length,
+      profilesFailedPermanent: 0,
+      requestSha256: sha256(`oracle-request:${category.key}`),
+      completeWithinBounds: true,
+      sourceAccessStatus: "accessible",
+      profileParts: [part],
+      failurePart: null,
+    };
+    const summaryBody = `${JSON.stringify(summary, null, 2)}\n`;
+    await mkdir(path.join(absoluteDirectory, "manifest"), { recursive: true });
+    await writeFile(
+      path.join(absoluteDirectory, "manifest", "summary.json"),
+      summaryBody,
+    );
+    categoryConfigs.push({
+      categoryKey: category.key,
+      harvestDirectory,
+      summarySha256: sha256(summaryBody),
+      profileCount: category.profiles.length,
+    });
+  }
+  const reconciledBody = `${reconciledLines.join("\n")}\n`;
+  const reconciliation = {
+    schemaVersion: "elephant.bbb-reconciliation.v1",
+    county: "lake",
+    reconciledAt: FIXED_TIME,
+    categoryCount: 2,
+    categories: categoryDefinitions.map((category) => ({
+      categoryKey: category.key,
+      profilesSelected: category.profiles.length,
+      profilesHarvested: category.profiles.length,
+      profilesFailedPermanent: 0,
+      requestSha256: sha256(`oracle-request:${category.key}`),
+      sourceAccessStatus: "accessible",
+    })),
+    rawProfileCount: 37,
+    uniqueProfileCount: 37,
+    duplicateProfileCount: 0,
+    sourceAccessStatus: "accessible",
+    sourceAccessComplete: true,
+    profilesBytes: Buffer.byteLength(reconciledBody),
+    profilesSha256: sha256(reconciledBody),
+    permanentFailureCount: 0,
+  };
+  const reconciliationBody = `${JSON.stringify(reconciliation, null, 2)}\n`;
+  await mkdir(path.join(inputRoot, "reconciled"), { recursive: true });
+  await writeFile(
+    path.join(inputRoot, "reconciled", "manifest.json"),
+    reconciliationBody,
+  );
+
+  const permitCompanyBody = `${acceptedLinks
+    .map((link, index) =>
+      JSON.stringify({
+        schemaVersion: "oracle.bbb-permit-company-evidence.v1",
+        evidence_key: `synthetic-oracle-evidence-${index + 1}`,
+        county: "lake",
+        property_id: link.property_id,
+        property_improvement_id: link.property_improvement_id,
+        official_company_request_identifier:
+          link.official_company_request_identifier,
+        official_company_name: acceptedNames[index],
+        official_alternate_names: [],
+        official_phone_identifiers: [],
+        official_license_identifiers: [],
+        as_of: FIXED_TIME,
+      }),
+    )
+    .join("\n")}\n`;
+  const linksBody = `${acceptedLinks
+    .map((value) => JSON.stringify(value))
+    .join("\n")}\n`;
+  await mkdir(path.join(inputRoot, "private"), { recursive: true });
+  await writeFile(
+    path.join(inputRoot, "private", "permit-company.jsonl"),
+    permitCompanyBody,
+  );
+  await writeFile(
+    path.join(inputRoot, "private", "accepted-links.jsonl"),
+    linksBody,
+  );
+  const coverage = {
+    county: "lake",
+    exportedAt: FIXED_TIME,
+    scope: "synthetic_oracle_adapter",
+    datasets: [
+      {
+        county: "lake",
+        source: "permits",
+        expected_count: 3,
+        ingested_count: 3,
+        linked_property_count: 3,
+        valid_unlinked_permit_count: 0,
+        excluded_source_record_count: 0,
+        watermark_digest: "3".repeat(64),
+      },
+    ],
+  };
+  const coverageBody = `${JSON.stringify(coverage, null, 2)}\n`;
+  await writeFile(path.join(inputRoot, "coverage.json"), coverageBody);
+  const sourceManifest = {
+    schemaVersion: "oracle.bbb-official-permit-linkage.v1",
+    county: "lake",
+    linkedAt: FIXED_TIME,
+    sourceAccessStatus: "accessible",
+    sourceAccessComplete: true,
+    categoryCount: 2,
+    uniqueProfileCount: 37,
+    officialIdentitySetCount: 3,
+    officialCompanyCount: 3,
+    acceptedCompanyMatchCount: 3,
+    acceptedPermitLinkCount: 3,
+    acceptedPropertyCount: 3,
+    reviewCandidateCount: 0,
+    fuzzyAcceptedCount: 0,
+    matchMethodCounts: {
+      unique_exact_normalized_business_name: 3,
+    },
+    everyAcceptedPropertyHasOfficialLinkedPermit: true,
+    bbbEstablishesLegalIdentity: false,
+    inputs: {
+      bbbProfilesSha256: reconciliation.profilesSha256,
+      permitContractorEvidenceSha256: sha256(permitCompanyBody),
+      permitWatermarkDigest: "3".repeat(64),
+    },
+    artifacts: {
+      acceptedLinks: {
+        records: 3,
+        bytes: Buffer.byteLength(linksBody),
+        sha256: sha256(linksBody),
+      },
+    },
+  };
+  const sourceManifestBody = `${JSON.stringify(sourceManifest, null, 2)}\n`;
+  await writeFile(
+    path.join(inputRoot, "source-manifest.json"),
+    sourceManifestBody,
+  );
+  const makeReceipt = (relativePath: string, body: string) => ({
+    relativePath,
+    bytes: Buffer.byteLength(body),
+    sha256: sha256(body),
+  });
+  const handoff = {
+    schemaVersion: "oracle.bbb-private-loader-handoff.v1",
+    countyKey: "lake",
+    runId: "lake-bbb-full-synthetic-postgres-v1",
+    sourceManifest: makeReceipt("source-manifest.json", sourceManifestBody),
+    reconciliationManifest: makeReceipt(
+      "reconciled/manifest.json",
+      reconciliationBody,
+    ),
+    permitCoverage: makeReceipt("coverage.json", coverageBody),
+    permitCompanyEvidence: {
+      ...makeReceipt("private/permit-company.jsonl", permitCompanyBody),
+      records: 3,
+    },
+    acceptedLinks: {
+      ...makeReceipt("private/accepted-links.jsonl", linksBody),
+      records: 3,
+    },
+    categories: categoryConfigs,
+    expectations: {
+      sourceAccessComplete: true,
+      profileCount: 37,
+      officialIdentityCount: 3,
+      officialCompanyCount: 3,
+      profilesSha256: reconciliation.profilesSha256,
+      acceptedPropertyLinkCount: 3,
+      reviewCandidateCount: 0,
+      fuzzyAcceptedCount: 0,
+      matchMethodCounts: {
+        exact_state_license: 0,
+        exact_standardized_phone: 0,
+        unique_exact_normalized_business_name: 3,
+      },
+      permitWatermarkDigest: "3".repeat(64),
+    },
+  };
+  const handoffPath = path.join(inputRoot, "handoff.json");
+  await writeFile(handoffPath, `${JSON.stringify(handoff, null, 2)}\n`);
+  return { handoffPath, outputDirectory };
+}
+
+async function clearPrivateBbbRows(target: Pool): Promise<void> {
+  await target.query(`
+    TRUNCATE TABLE
+      "bbb_property_link_evidence",
+      "bbb_reconciliation_matches",
+      "bbb_reconciliation_runs",
+      "bbb_profile_category_memberships",
+      "bbb_profile_snapshots",
+      "bbb_artifact_watermarks",
+      "bbb_harvest_categories",
+      "bbb_harvest_runs"
+  `);
 }
 
 async function scalarCount(
