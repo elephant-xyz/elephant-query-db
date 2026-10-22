@@ -34,6 +34,7 @@
   "scripts": {
     "generate:lexicon": "tsx scripts/generate-lexicon-metadata.ts",
     "generate:migrations": "drizzle-kit generate",
+    "migrate:dev-canary": "tsx scripts/run-dev-canary-schema-migration.ts",
     "appraisal:alternate-search-seeds": "tsx scripts/build-curated-appraisal-alternate-search-seeds.ts",
     "appraisal:detail-seeds": "tsx scripts/build-curated-appraisal-detail-seeds.ts",
     "appraisal:media": "tsx scripts/enrich-appraisal-media-files.ts",
@@ -76,6 +77,8 @@
     "publish:coverage": "tsx scripts/upload-coverage-to-filebase.ts",
     "publish:permit-table": "tsx scripts/upload-permit-table-to-filebase.ts",
     "publish:places-table": "tsx scripts/upload-places-table-to-filebase.ts",
+    "format:check:migration-contract": "prettier --check src/migrations/dev-canary-schema.ts scripts/run-dev-canary-schema-migration.ts tests/dev-canary-schema-migration.test.ts tests/dev-canary-schema-migration.integration.test.ts package.json README.md docs/dev-query-db-canary-migration.md .github/workflows/migration-contract.yml",
+    "test:migration-contract": "vitest run tests/dev-canary-schema-migration.test.ts tests/dev-canary-schema-migration.integration.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
@@ -98,6 +101,7 @@
     "@types/pg": "^8.20.0",
     "drizzle-kit": "^0.31.7",
     "ipfs-only-hash": "^4.0.0",
+    "prettier": "^3.9.10",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vitest": "^4.0.14"
